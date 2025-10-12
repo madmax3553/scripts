@@ -1,0 +1,265 @@
+#!/bin/bash
+
+# Repository Status Checker
+# Finds all git repos, shows their status, and allows launching lazygit
+
+set -e
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Status indicators
+CLEAN="🟢"
+DIRTY="🟡"
+AHEAD="🔵"
+BEHIND="🟠"
+DIVERGED="🔴"
+
+get_repo_status() {
+    local repo_dir="$1"
+    cd "$repo_dir"
+    
+    # Get repo name
+    local repo_name=$(basename "$repo_dir")
+    
+    # Check if there are uncommitted changes
+    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+        echo "dirty"
+        return
+    fi
+    
+    # Check for untracked files
+    if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+        echo "dirty"
+        return
+    fi
+    
+    # Check if ahead/behind/diverged from remote
+    local upstream=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null)
+    if [ -n "$upstream" ]; then
+        local local_commit=$(git rev-parse @ 2>/dev/null)
+        local remote_commit=$(git rev-parse @{u} 2>/dev/null)
+        local base_commit=$(git merge-base @ @{u} 2>/dev/null)
+        
+        if [ "$local_commit" = "$remote_commit" ]; then
+            echo "clean"
+        elif [ "$local_commit" = "$base_commit" ]; then
+            echo "behind"
+        elif [ "$remote_commit" = "$base_commit" ]; then
+            echo "ahead"
+        else
+            echo "diverged"
+        fi
+    else
+        echo "clean"
+    fi
+}
+
+get_status_icon() {
+    case "$1" in
+        clean)   echo -e "${GREEN}${CLEAN}${NC}" ;;
+        dirty)   echo -e "${YELLOW}${DIRTY}${NC}" ;;
+        ahead)   echo -e "${BLUE}${AHEAD}${NC}" ;;
+        behind)  echo -e "${YELLOW}${BEHIND}${NC}" ;;
+        diverged) echo -e "${RED}${DIVERGED}${NC}" ;;
+        *)       echo -e "${NC}⚪${NC}" ;;
+    esac
+}
+
+get_worst_status() {
+    local worst="clean"
+    for status in "$@"; do
+        case "$status" in
+            diverged) worst="diverged"; break ;;
+            dirty) worst="dirty" ;;
+            behind) [ "$worst" != "dirty" ] && worst="behind" ;;
+            ahead) [ "$worst" != "dirty" ] && [ "$worst" != "behind" ] && worst="ahead" ;;
+        esac
+    done
+    echo "$worst"
+}
+
+get_parent_dir() {
+    local path="$1"
+    local parent=$(dirname "$path")
+    local parent_name=$(basename "$parent")
+    
+    # Check if it's directly in home
+    if [ "$parent" = "$HOME" ]; then
+        echo "~/$parent_name"
+    else
+        # Get the first level directory under home
+        local rel_path="${path#$HOME/}"
+        local first_dir=$(echo "$rel_path" | cut -d'/' -f1)
+        echo "~/$first_dir"
+    fi
+}
+
+# Find all git repositories in home directory
+echo -e "${BLUE}Scanning for git repositories...${NC}"
+echo ""
+
+declare -a repos
+declare -a statuses
+declare -a paths
+
+# Directories to exclude
+EXCLUDE_DIRS=(
+    ".local"
+    ".cache"
+    ".cargo"
+    ".npm"
+    ".nvm"
+    ".rustup"
+    "node_modules"
+    ".venv"
+    "venv"
+    ".virtualenv"
+)
+
+# Build find exclusion string
+EXCLUDE_FIND=""
+for dir in "${EXCLUDE_DIRS[@]}"; do
+    EXCLUDE_FIND="$EXCLUDE_FIND -path '*/$dir' -prune -o"
+done
+
+# Find all .git directories (excluding common directories)
+while IFS= read -r -d '' git_dir; do
+    repo_dir=$(dirname "$git_dir")
+    
+    # Skip if inside another git repo
+    if [[ "$repo_dir" == *"/.git/"* ]]; then
+        continue
+    fi
+    
+    status=$(get_repo_status "$repo_dir")
+    repo_name=$(basename "$repo_dir")
+    
+    repos+=("$repo_name")
+    statuses+=("$status")
+    paths+=("$repo_dir")
+done < <(eval "find ~ $EXCLUDE_FIND -name '.git' -type d -prune -print0 2>/dev/null" | head -z -n 50)
+
+if [ ${#repos[@]} -eq 0 ]; then
+    echo -e "${YELLOW}No git repositories found in home directory${NC}"
+    exit 0
+fi
+
+# Group repositories by parent directory
+declare -A dir_repos
+declare -A dir_statuses
+
+for i in "${!repos[@]}"; do
+    parent=$(get_parent_dir "${paths[$i]}")
+    
+    if [ -z "${dir_repos[$parent]}" ]; then
+        dir_repos[$parent]="$i"
+        dir_statuses[$parent]="${statuses[$i]}"
+    else
+        dir_repos[$parent]="${dir_repos[$parent]},$i"
+        # Update worst status
+        current_worst="${dir_statuses[$parent]}"
+        new_worst=$(get_worst_status "$current_worst" "${statuses[$i]}")
+        dir_statuses[$parent]="$new_worst"
+    fi
+done
+
+# Main loop
+while true; do
+    clear
+    echo -e "${BLUE}=== Git Repository Status ===${NC}"
+    echo ""
+    echo -e "${BLUE}Legend:${NC}"
+    echo -e "  ${GREEN}${CLEAN}${NC} Clean   ${YELLOW}${DIRTY}${NC} Dirty   ${BLUE}${AHEAD}${NC} Ahead   ${YELLOW}${BEHIND}${NC} Behind   ${RED}${DIVERGED}${NC} Diverged"
+    echo ""
+    echo -e "${BLUE}=== Directories ===${NC}"
+    echo ""
+    
+    declare -a dir_list=()
+    for dir in "${!dir_repos[@]}"; do
+        dir_list+=("$dir")
+    done
+    
+    # Sort directories
+    IFS=$'\n' dir_list=($(sort <<<"${dir_list[*]}"))
+    unset IFS
+    
+    # Display directories with summary
+    for i in "${!dir_list[@]}"; do
+        dir="${dir_list[$i]}"
+        icon=$(get_status_icon "${dir_statuses[$dir]}")
+        repo_count=$(echo "${dir_repos[$dir]}" | tr ',' '\n' | wc -l)
+        printf "%2d) %s  %-30s (%d repos)\n" "$((i+1))" "$icon" "$dir" "$repo_count"
+    done
+    
+    echo ""
+    read -p "Select directory to expand, or 'q' to quit: " choice
+    
+    if [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
+        exit 0
+    fi
+    
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#dir_list[@]}" ]; then
+        echo -e "${RED}Invalid selection${NC}"
+        sleep 1
+        continue
+    fi
+    
+    selected_dir_idx=$((choice - 1))
+    selected_dir="${dir_list[$selected_dir_idx]}"
+    
+    # Show repos in selected directory
+    clear
+    echo -e "${BLUE}=== Repositories in $selected_dir ===${NC}"
+    echo ""
+    
+    IFS=',' read -ra repo_indices <<< "${dir_repos[$selected_dir]}"
+    
+    for i in "${!repo_indices[@]}"; do
+        idx="${repo_indices[$i]}"
+        icon=$(get_status_icon "${statuses[$idx]}")
+        printf "%2d) %s  %-40s\n" "$((i+1))" "$icon" "${repos[$idx]}"
+        echo -e "    ${BLUE}${paths[$idx]}${NC}"
+    done
+    
+    echo ""
+    echo "b) Back to directory list"
+    echo "q) Quit"
+    read -p "Select repo to open in lazygit: " repo_choice
+    
+    if [ "$repo_choice" = "q" ] || [ "$repo_choice" = "Q" ]; then
+        exit 0
+    fi
+    
+    if [ "$repo_choice" = "b" ] || [ "$repo_choice" = "B" ]; then
+        continue
+    fi
+    
+    if ! [[ "$repo_choice" =~ ^[0-9]+$ ]] || [ "$repo_choice" -lt 1 ] || [ "$repo_choice" -gt "${#repo_indices[@]}" ]; then
+        echo -e "${RED}Invalid selection${NC}"
+        sleep 1
+        continue
+    fi
+    
+    selected_repo_idx="${repo_indices[$((repo_choice - 1))]}"
+    selected_path="${paths[$selected_repo_idx]}"
+    
+    echo -e "${GREEN}Launching lazygit in: ${selected_path}${NC}"
+    cd "$selected_path"
+    
+    if command -v lazygit &> /dev/null; then
+        lazygit
+        # After lazygit exits, rescan repos
+        echo ""
+        read -p "Press enter to rescan repositories..." 
+        exec "$0"
+    else
+        echo -e "${RED}lazygit not found.${NC}"
+        echo -e "${BLUE}Install with: sudo pacman -S lazygit${NC}"
+        sleep 2
+    fi
+done

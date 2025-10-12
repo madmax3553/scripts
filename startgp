@@ -14,14 +14,18 @@ NC='\033[0m' # No Color
 
 print_usage() {
     echo -e "${BLUE}Usage:${NC}"
-    echo "  $0 [path]              - Initialize git in existing folder or create new project"
+    echo "  $0                     - Interactive mode"
+    echo "  $0 [path]              - Initialize git in existing folder"
     echo "  $0 -n <name> [path]    - Create new project with specified name"
+    echo "  $0 -d [path]           - Delete git repo (local only or with remote)"
     echo ""
     echo -e "${BLUE}Examples:${NC}"
-    echo "  $0                     - Initialize git in current directory"
+    echo "  $0                     - Interactive mode with menu"
     echo "  $0 ~/projects/myapp    - Initialize git in existing folder"
     echo "  $0 -n myapp            - Create new project in ~/projects/myapp"
     echo "  $0 -n myapp ~/dev      - Create new project in ~/dev/myapp"
+    echo "  $0 -d                  - Delete git from current directory"
+    echo "  $0 -d ~/projects/test  - Delete git from specified directory"
 }
 
 init_git_repo() {
@@ -119,20 +123,18 @@ EOF
         repo_name="${custom_name:-$repo_name}"
         
         echo ""
-        echo -e "${BLUE}Visibility:${NC}"
-        echo "  1) Public"
-        echo "  2) Private"
-        read -p "Choose (1/2, default: 2): " visibility_choice
+        read -p "Make repository public? (y/N): " -n 1 public_choice
+        echo
         
         local visibility_flag="--private"
-        if [ "$visibility_choice" = "1" ]; then
+        if [[ $public_choice =~ ^[Yy]$ ]]; then
             visibility_flag="--public"
         fi
         
-        read -p "Description (optional): " repo_desc
+        read -p "Description (optional, press enter to skip): " repo_desc
         
         echo ""
-        echo -e "${BLUE}Creating GitHub repository...${NC}"
+        echo -e "${BLUE}Creating ${visibility_flag/--/} GitHub repository...${NC}"
         
         # Build the gh command
         local gh_cmd="gh repo create \"$repo_name\" $visibility_flag --source=. --push"
@@ -178,6 +180,90 @@ create_new_project() {
     echo -e "${GREEN}Creating new project: ${project_path}${NC}"
     mkdir -p "$project_path"
     init_git_repo "$project_path"
+}
+
+delete_git_repo() {
+    local dir="${1:-$(pwd)}"
+    
+    cd "$dir"
+    
+    # Check if it's a git repo
+    if [ ! -d .git ]; then
+        echo -e "${RED}Not a git repository: ${dir}${NC}"
+        exit 1
+    fi
+    
+    echo -e "${YELLOW}WARNING: Delete git repository from: ${dir}${NC}"
+    echo ""
+    
+    # Check if there's a remote
+    local remote_url=$(git remote get-url origin 2>/dev/null)
+    local has_remote=$?
+    
+    if [ $has_remote -eq 0 ]; then
+        echo -e "${BLUE}Remote found: ${remote_url}${NC}"
+        echo ""
+        echo "Options:"
+        echo "  1) Delete local git only (keep remote on GitHub)"
+        echo "  2) Delete BOTH local AND remote on GitHub"
+        echo "  3) Cancel"
+        read -p "Choose (1/2/3): " delete_choice
+        
+        case $delete_choice in
+            1)
+                read -p "Delete local .git directory? Type 'yes' to confirm: " confirm
+                if [ "$confirm" = "yes" ]; then
+                    rm -rf .git
+                    echo -e "${GREEN}✓ Local git repository deleted${NC}"
+                else
+                    echo -e "${BLUE}Cancelled${NC}"
+                fi
+                ;;
+            2)
+                read -p "Delete BOTH local and remote? Type 'DELETE' to confirm: " confirm
+                if [ "$confirm" = "DELETE" ]; then
+                    # Get repo name from remote URL
+                    local repo_name=$(basename "$remote_url" .git)
+                    local repo_owner=$(echo "$remote_url" | sed -E 's/.*[:/]([^/]+)\/[^/]+\.git/\1/')
+                    
+                    if command -v gh &> /dev/null; then
+                        echo -e "${BLUE}Deleting remote repository...${NC}"
+                        if gh repo delete "${repo_owner}/${repo_name}" --yes; then
+                            echo -e "${GREEN}✓ Remote repository deleted${NC}"
+                        else
+                            echo -e "${RED}Failed to delete remote${NC}"
+                            read -p "Continue deleting local? (y/n) " -n 1 -r
+                            echo
+                            if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+                                exit 1
+                            fi
+                        fi
+                    else
+                        echo -e "${YELLOW}gh CLI not found, skipping remote delete${NC}"
+                        echo -e "${BLUE}Delete manually: https://github.com/${repo_owner}/${repo_name}/settings${NC}"
+                    fi
+                    
+                    echo -e "${BLUE}Deleting local .git directory...${NC}"
+                    rm -rf .git
+                    echo -e "${GREEN}✓ Local git repository deleted${NC}"
+                else
+                    echo -e "${BLUE}Cancelled${NC}"
+                fi
+                ;;
+            *)
+                echo -e "${BLUE}Cancelled${NC}"
+                ;;
+        esac
+    else
+        # No remote, just delete local
+        read -p "Delete local .git directory? Type 'yes' to confirm: " confirm
+        if [ "$confirm" = "yes" ]; then
+            rm -rf .git
+            echo -e "${GREEN}✓ Local git repository deleted${NC}"
+        else
+            echo -e "${BLUE}Cancelled${NC}"
+        fi
+    fi
 }
 
 interactive_mode() {
@@ -278,6 +364,13 @@ case "$1" in
     -h|--help)
         print_usage
         exit 0
+        ;;
+    -d|--delete)
+        if [ -z "$2" ]; then
+            delete_git_repo "$(pwd)"
+        else
+            delete_git_repo "$2"
+        fi
         ;;
     -n|--new)
         if [ -z "$2" ]; then
