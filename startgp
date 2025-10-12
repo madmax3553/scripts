@@ -1,0 +1,310 @@
+#!/bin/bash
+
+# Git Project Setup Script
+# Handles both initializing existing folders and creating new projects
+
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+print_usage() {
+    echo -e "${BLUE}Usage:${NC}"
+    echo "  $0 [path]              - Initialize git in existing folder or create new project"
+    echo "  $0 -n <name> [path]    - Create new project with specified name"
+    echo ""
+    echo -e "${BLUE}Examples:${NC}"
+    echo "  $0                     - Initialize git in current directory"
+    echo "  $0 ~/projects/myapp    - Initialize git in existing folder"
+    echo "  $0 -n myapp            - Create new project in ~/projects/myapp"
+    echo "  $0 -n myapp ~/dev      - Create new project in ~/dev/myapp"
+}
+
+init_git_repo() {
+    local dir="$1"
+    
+    cd "$dir"
+    
+    # Check if already a git repo
+    if [ -d .git ]; then
+        echo -e "${YELLOW}Already a git repository!${NC}"
+        git status
+        return 0
+    fi
+    
+    # Safety check for home directory
+    if [ "$dir" = "$HOME" ] || [ "$dir" = "~" ]; then
+        echo -e "${RED}WARNING: You're about to initialize git in your HOME directory!${NC}"
+        echo -e "${YELLOW}This is usually not what you want.${NC}"
+        read -p "Are you SURE you want to continue? (yes/no) " -r
+        echo
+        if [[ ! $REPLY = "yes" ]]; then
+            echo -e "${BLUE}Aborted. Consider using: $0 -n <project-name>${NC}"
+            exit 1
+        fi
+    fi
+    
+    echo -e "${GREEN}Initializing git repository in: ${dir}${NC}"
+    git init -b master
+    
+    # Create basic .gitignore if it doesn't exist
+    if [ ! -f .gitignore ]; then
+        echo -e "${BLUE}Creating .gitignore...${NC}"
+        cat > .gitignore << 'EOF'
+# Common ignores
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
+__pycache__/
+*.pyc
+node_modules/
+.env
+.venv/
+venv/
+EOF
+    fi
+    
+    # Create README if it doesn't exist
+    if [ ! -f README.md ]; then
+        local repo_name=$(basename "$dir")
+        echo -e "${BLUE}Creating README.md...${NC}"
+        cat > README.md << EOF
+# ${repo_name}
+
+## Description
+
+TODO: Add project description
+
+## Setup
+
+TODO: Add setup instructions
+
+## Usage
+
+TODO: Add usage instructions
+EOF
+    fi
+    
+    # Initial commit (Batman - because it has no parents)
+    echo -e "${BLUE}Creating initial commit...${NC}"
+    git add .
+    git commit -m "Batman (initial commit - has no parents)"
+    
+    echo -e "${GREEN}✓ Git repository initialized!${NC}"
+    echo ""
+    
+    # Ask if user wants to add remote and push
+    read -p "Create GitHub repo and push? (y/n) " -n 1 -r
+    echo
+    if [[ $REPLY =~ ^[Yy]$ ]]; then
+        # Check if gh is available
+        if ! command -v gh &> /dev/null; then
+            echo -e "${RED}GitHub CLI (gh) not found${NC}"
+            echo -e "${BLUE}Manual steps:${NC}"
+            echo "1. Install gh: sudo pacman -S github-cli"
+            echo "2. Authenticate: gh auth login"
+            echo "3. Create repo: gh repo create"
+            return 0
+        fi
+        
+        local repo_name=$(basename "$dir")
+        echo ""
+        read -p "Repository name (default: ${repo_name}): " custom_name
+        repo_name="${custom_name:-$repo_name}"
+        
+        echo ""
+        echo -e "${BLUE}Visibility:${NC}"
+        echo "  1) Public"
+        echo "  2) Private"
+        read -p "Choose (1/2, default: 2): " visibility_choice
+        
+        local visibility_flag="--private"
+        if [ "$visibility_choice" = "1" ]; then
+            visibility_flag="--public"
+        fi
+        
+        read -p "Description (optional): " repo_desc
+        
+        echo ""
+        echo -e "${BLUE}Creating GitHub repository...${NC}"
+        
+        # Build the gh command
+        local gh_cmd="gh repo create \"$repo_name\" $visibility_flag --source=. --push"
+        if [ -n "$repo_desc" ]; then
+            gh_cmd="$gh_cmd --description \"$repo_desc\""
+        fi
+        
+        # Check if remote already exists
+        if git remote get-url origin &> /dev/null; then
+            echo -e "${YELLOW}Remote 'origin' already exists, using --remote flag${NC}"
+            gh_cmd="${gh_cmd/--source=./--source=. --remote=upstream}"
+            if eval $gh_cmd; then
+                echo -e "${GREEN}✓ Repository created and pushed!${NC}"
+                git remote rename upstream origin 2>/dev/null || true
+            fi
+        else
+            if eval $gh_cmd; then
+                echo -e "${GREEN}✓ Repository created and pushed!${NC}"
+            else
+                echo -e "${RED}Failed. Try manually: gh repo create${NC}"
+            fi
+        fi
+    else
+        echo -e "${BLUE}Later you can run: gh repo create${NC}"
+    fi
+}
+
+create_new_project() {
+    local name="$1"
+    local base_path="${2:-$HOME/projects}"
+    local project_path="$base_path/$name"
+    
+    if [ -d "$project_path" ]; then
+        echo -e "${YELLOW}Directory already exists: ${project_path}${NC}"
+        read -p "Initialize git in existing directory? (y/n) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            init_git_repo "$project_path"
+        fi
+        return 0
+    fi
+    
+    echo -e "${GREEN}Creating new project: ${project_path}${NC}"
+    mkdir -p "$project_path"
+    init_git_repo "$project_path"
+}
+
+interactive_mode() {
+    echo -e "${BLUE}=== Git Project Setup ===${NC}"
+    echo ""
+    
+    # Option 1: Current directory
+    echo -e "${GREEN}1)${NC} Current directory: ${YELLOW}$(pwd)${NC}"
+    
+    # Option 2: Scan ~/projects for non-git folders
+    local projects_dir="$HOME/projects"
+    local non_git_dirs=()
+    local option_num=2
+    
+    if [ -d "$projects_dir" ]; then
+        echo -e "${GREEN}2-?)${NC} Found folders in ~/projects without git:"
+        while IFS= read -r -d '' dir; do
+            if [ ! -d "$dir/.git" ]; then
+                non_git_dirs+=("$dir")
+                echo -e "  ${GREEN}${option_num})${NC} $(basename "$dir")"
+                ((option_num++))
+            fi
+        done < <(find "$projects_dir" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z)
+        
+        if [ ${#non_git_dirs[@]} -eq 0 ]; then
+            echo -e "  ${YELLOW}(none found)${NC}"
+        fi
+    fi
+    
+    # Option for custom path
+    local custom_option=$option_num
+    echo -e "${GREEN}${custom_option})${NC} Enter custom path"
+    echo ""
+    
+    # Option to create new project
+    local new_option=$((custom_option + 1))
+    echo -e "${GREEN}${new_option})${NC} Create new project"
+    echo ""
+    
+    read -p "Select option (1-${new_option}): " choice
+    
+    case $choice in
+        1)
+            init_git_repo "$(pwd)"
+            ;;
+        ${custom_option})
+            read -p "Enter path: " custom_path
+            if [ -z "$custom_path" ]; then
+                echo -e "${RED}Error: No path provided${NC}"
+                exit 1
+            fi
+            # Expand tilde
+            custom_path="${custom_path/#\~/$HOME}"
+            if [ ! -d "$custom_path" ]; then
+                read -p "Directory doesn't exist. Create it? (y/n) " -n 1 -r
+                echo
+                if [[ $REPLY =~ ^[Yy]$ ]]; then
+                    mkdir -p "$custom_path"
+                    init_git_repo "$custom_path"
+                else
+                    exit 1
+                fi
+            else
+                init_git_repo "$custom_path"
+            fi
+            ;;
+        ${new_option})
+            read -p "Enter project name: " project_name
+            if [ -z "$project_name" ]; then
+                echo -e "${RED}Error: No project name provided${NC}"
+                exit 1
+            fi
+            read -p "Base path (default: ~/projects): " base_path
+            base_path="${base_path:-$HOME/projects}"
+            base_path="${base_path/#\~/$HOME}"
+            create_new_project "$project_name" "$base_path"
+            ;;
+        *)
+            # Check if it's a valid numbered option for non-git dirs
+            if [ "$choice" -ge 2 ] && [ "$choice" -lt "$custom_option" ]; then
+                local idx=$((choice - 2))
+                if [ "$idx" -lt "${#non_git_dirs[@]}" ]; then
+                    init_git_repo "${non_git_dirs[$idx]}"
+                else
+                    echo -e "${RED}Invalid option${NC}"
+                    exit 1
+                fi
+            else
+                echo -e "${RED}Invalid option${NC}"
+                exit 1
+            fi
+            ;;
+    esac
+}
+
+# Main script logic
+case "$1" in
+    -h|--help)
+        print_usage
+        exit 0
+        ;;
+    -n|--new)
+        if [ -z "$2" ]; then
+            echo -e "${RED}Error: Project name required${NC}"
+            print_usage
+            exit 1
+        fi
+        create_new_project "$2" "$3"
+        ;;
+    "")
+        # No arguments - start interactive mode
+        interactive_mode
+        ;;
+    *)
+        # Path provided - use it
+        if [ ! -d "$1" ]; then
+            echo -e "${RED}Error: Directory does not exist: $1${NC}"
+            read -p "Create it? (y/n) " -n 1 -r
+            echo
+            if [[ $REPLY =~ ^[Yy]$ ]]; then
+                mkdir -p "$1"
+                init_git_repo "$1"
+            else
+                exit 1
+            fi
+        else
+            init_git_repo "$1"
+        fi
+        ;;
+esac
