@@ -1,0 +1,45 @@
+#!/bin/bash
+# Quick vimwiki helper - combines review and daily plan
+
+echo "╔════════════════════════════════════════╗"
+echo "║      Vimwiki Daily Helper              ║"
+echo "╚════════════════════════════════════════╝"
+echo ""
+
+# Run daily plan first
+~/bin/wiki-daily-plan
+
+echo ""
+echo "═══════════════════════════════════════════"
+echo ""
+
+# Show TODO review
+~/bin/wiki-review-todos
+
+echo ""
+echo "═══════════════════════════════════════════"
+echo "Options:"
+echo "  1. Open today's diary"
+echo "  2. Open TODO list"
+echo "  3. Review TODOs only"
+echo "  4. Exit"
+echo ""
+read -p "Choose an option (1-4): " choice
+
+case $choice in
+    1)
+        nvim "$HOME/journal/diary/$(date +%Y-%m-%d).md"
+        ;;
+    2)
+        nvim "$HOME/journal/TODO.md"
+        ;;
+    3)
+        ~/bin/wiki-review-todos | less
+        ;;
+    4)
+        exit 0
+        ;;
+    *)
+        echo "Invalid option"
+        ;;
+esac

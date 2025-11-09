@@ -1,0 +1,70 @@
+#!/bin/bash
+# Generate daily summary and plan for vimwiki
+
+JOURNAL_DIR="$HOME/journal"
+DIARY_DIR="$JOURNAL_DIR/diary"
+TODAY=$(date +%Y-%m-%d)
+YESTERDAY=$(date -d "yesterday" +%Y-%m-%d)
+TODAY_FILE="$DIARY_DIR/$TODAY.md"
+YESTERDAY_FILE="$DIARY_DIR/$YESTERDAY.md"
+
+# Create today's file if it doesn't exist
+if [ ! -f "$TODAY_FILE" ]; then
+    cat > "$TODAY_FILE" << EOF
+# Daily Log - $TODAY
+
+## Summary of Yesterday
+
+EOF
+
+    # Add yesterday's summary if file exists
+    if [ -f "$YESTERDAY_FILE" ]; then
+        echo "### Completed Tasks" >> "$TODAY_FILE"
+        grep -E '^\s*[-*]\s*\[✓X\]' "$YESTERDAY_FILE" | sed 's/^//' >> "$TODAY_FILE" || echo "- No completed tasks found" >> "$TODAY_FILE"
+        echo "" >> "$TODAY_FILE"
+        
+        echo "### Outstanding from Yesterday" >> "$TODAY_FILE"
+        grep -E '^\s*[-*]\s*\[[ ○◐●]\]' "$YESTERDAY_FILE" | grep -v '\[✓\]' | grep -v '\[X\]' | sed 's/^//' >> "$TODAY_FILE" || echo "- No outstanding tasks" >> "$TODAY_FILE"
+        echo "" >> "$TODAY_FILE"
+    else
+        echo "- No previous day entry found" >> "$TODAY_FILE"
+        echo "" >> "$TODAY_FILE"
+    fi
+
+    cat >> "$TODAY_FILE" << EOF
+
+## Today's Plan
+
+### High Priority
+- [ ] 
+
+### Tasks
+- [ ] 
+
+### Notes
+
+
+## Morning
+
+
+## Afternoon
+
+
+## Evening
+
+
+## Reflections
+
+
+[[TODO]]
+EOF
+    
+    echo "✓ Created today's diary entry: $TODAY_FILE"
+else
+    echo "✓ Today's diary entry already exists: $TODAY_FILE"
+fi
+
+# Open in nvim if requested
+if [ "$1" == "--open" ] || [ "$1" == "-o" ]; then
+    nvim "$TODAY_FILE"
+fi
