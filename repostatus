@@ -23,6 +23,9 @@ get_repo_status() {
     local repo_dir="$1"
     cd "$repo_dir"
     
+    # Fetch from remote to get up-to-date status
+    git fetch --all --quiet 2>/dev/null || true
+    
     # Get repo name
     local repo_name=$(basename "$repo_dir")
     
@@ -99,6 +102,43 @@ get_parent_dir() {
     fi
 }
 
+sync_repos() {
+    local repos_to_sync=("$@")
+    
+    echo -e "${BLUE}Starting repository sync...${NC}"
+    echo ""
+    
+    for repo_path in "${repos_to_sync[@]}"; do
+        cd "$repo_path"
+        local repo_name=$(basename "$repo_path")
+        local status=$(get_repo_status "$repo_path")
+        
+        case "$status" in
+            behind)
+                echo -e "${BLUE}Syncing ${repo_name}...${NC}"
+                if git pull --quiet; then
+                    echo -e "${GREEN}✓ Synced successfully${NC}"
+                else
+                    echo -e "${RED}✗ Failed to sync${NC}"
+                fi
+                ;;
+            dirty)
+                echo -e "${YELLOW}✗ Skipping ${repo_name} (has local changes)${NC}"
+                ;;
+            diverged)
+                echo -e "${RED}✗ Skipping ${repo_name} (diverged from remote)${NC}"
+                ;;
+            clean|ahead)
+                # No action needed
+                ;;
+        esac
+    done
+    
+    echo ""
+    echo -e "${BLUE}Sync complete.${NC}"
+    read -p "Press enter to continue..."
+}
+
 # Find all git repositories in home directory
 echo -e "${BLUE}Scanning for git repositories...${NC}"
 echo ""
@@ -168,6 +208,12 @@ for i in "${!repos[@]}"; do
     fi
 done
 
+# Handle command-line arguments
+if [ "$1" = "--sync" ] || [ "$1" = "-s" ]; then
+    sync_repos "${paths[@]}"
+    exit 0
+fi
+
 # Main loop
 while true; do
     clear
@@ -197,10 +243,16 @@ while true; do
     done
     
     echo ""
-    read -p "Select directory to expand, or 'q' to quit: " choice
+    echo "s) Sync All Repos"
+    read -p "Select directory to expand, 's' to sync, or 'q' to quit: " choice
     
     if [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
         exit 0
+    fi
+
+    if [ "$choice" = "s" ] || [ "$choice" = "S" ]; then
+        sync_repos "${paths[@]}"
+        exec "$0"
     fi
     
     if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#dir_list[@]}" ]; then
@@ -227,9 +279,10 @@ while true; do
     done
     
     echo ""
+    echo "s) Sync all in this directory"
     echo "b) Back to directory list"
     echo "q) Quit"
-    read -p "Select repo to open in lazygit: " repo_choice
+    read -p "Select repo to open in lazygit, 's' to sync, 'b' to go back, or 'q' to quit: " repo_choice
     
     if [ "$repo_choice" = "q" ] || [ "$repo_choice" = "Q" ]; then
         exit 0
@@ -237,6 +290,15 @@ while true; do
     
     if [ "$repo_choice" = "b" ] || [ "$repo_choice" = "B" ]; then
         continue
+    fi
+
+    if [ "$repo_choice" = "s" ] || [ "$repo_choice" = "S" ]; then
+        declare -a repos_to_sync_in_dir
+        for i in "${!repo_indices[@]}"; do
+            repos_to_sync_in_dir+=("${paths[${repo_indices[$i]}]}")
+        done
+        sync_repos "${repos_to_sync_in_dir[@]}"
+        exec "$0"
     fi
     
     if ! [[ "$repo_choice" =~ ^[0-9]+$ ]] || [ "$repo_choice" -lt 1 ] || [ "$repo_choice" -gt "${#repo_indices[@]}" ]; then
