@@ -12,25 +12,40 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/repostatus"
+FETCH_LOG="$CACHE_DIR/fetch.log"
+mkdir -p "$CACHE_DIR"
+: > "$FETCH_LOG"
+
 # Status indicators
 CLEAN="🟢"
 DIRTY="🟡"
 AHEAD="🔵"
 BEHIND="🟠"
 DIVERGED="🔴"
+UNINITIALIZED="⚪"
+FETCH_FAILED="⛔"
+
+FETCH_INTERVAL=${REPOSTATUS_FETCH_INTERVAL:-300}
+FORCE_FETCH=${REPOSTATUS_FORCE_FETCH:-0}
+DISABLE_FETCH=${REPOSTATUS_DISABLE_FETCH:-0}
+LAST_FETCH_FILE="$CACHE_DIR/last_fetch"
 
 get_repo_status() {
     local repo_dir="$1"
     cd "$repo_dir"
     
-    # Fetch from remote to get up-to-date status
-    git fetch --all --quiet 2>/dev/null || true
-    
+    # Check if there are any remote branches
+    if [ -z "$(git branch -r)" ]; then
+        echo "uninitialized"
+        return
+    fi
+
     # Get repo name
     local repo_name=$(basename "$repo_dir")
     
     # Check if there are uncommitted changes
-    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+    if ! (git diff-index --quiet HEAD -- 2>/dev/null); then
         echo "dirty"
         return
     fi
@@ -42,12 +57,19 @@ get_repo_status() {
     fi
     
     # Check if ahead/behind/diverged from remote
-    local upstream=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null)
+    local upstream=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
     if [ -n "$upstream" ]; then
-        local local_commit=$(git rev-parse @ 2>/dev/null)
-        local remote_commit=$(git rev-parse @{u} 2>/dev/null)
-        local base_commit=$(git merge-base @ @{u} 2>/dev/null)
+        local local_commit=$(git rev-parse @ 2>/dev/null || true)
+        local remote_commit=$(git rev-parse @{u} 2>/dev/null || true)
+        local base_commit=$(git merge-base @ @{u} 2>/dev/null || true)
         
+        if [ -z "$local_commit" ] || [ -z "$remote_commit" ] || [ -z "$base_commit" ]; then
+            # If any of the commits are not found, the repo is likely in a weird state
+            # (e.g. empty, no upstream). We'll just call it clean and move on.
+            echo "clean"
+            return
+        fi
+
         if [ "$local_commit" = "$remote_commit" ]; then
             echo "clean"
         elif [ "$local_commit" = "$base_commit" ]; then
@@ -69,7 +91,9 @@ get_status_icon() {
         ahead)   echo -e "${BLUE}${AHEAD}${NC}" ;;
         behind)  echo -e "${YELLOW}${BEHIND}${NC}" ;;
         diverged) echo -e "${RED}${DIVERGED}${NC}" ;;
-        *)       echo -e "${NC}⚪${NC}" ;;
+        uninitialized) echo -e "${NC}${UNINITIALIZED}${NC}" ;;
+        fetch_failed) echo -e "${RED}${FETCH_FAILED}${NC}" ;;
+        *)       echo -e "${NC}❓${NC}" ;;
     esac
 }
 
@@ -78,9 +102,10 @@ get_worst_status() {
     for status in "$@"; do
         case "$status" in
             diverged) worst="diverged"; break ;;
-            dirty) worst="dirty" ;;
-            behind) [ "$worst" != "dirty" ] && worst="behind" ;;
-            ahead) [ "$worst" != "dirty" ] && [ "$worst" != "behind" ] && worst="ahead" ;;
+            fetch_failed) worst="fetch_failed" ;;
+            dirty|uninitialized) [ "$worst" != "fetch_failed" ] && worst="dirty" ;;
+            behind) [ "$worst" != "dirty" ] && [ "$worst" != "fetch_failed" ] && worst="behind" ;;
+            ahead) [ "$worst" != "dirty" ] && [ "$worst" != "behind" ] && [ "$worst" != "fetch_failed" ] && worst="ahead" ;;
         esac
     done
     echo "$worst"
@@ -139,13 +164,31 @@ sync_repos() {
     read -p "Press enter to continue..."
 }
 
+fetch_all_repos() {
+    for i in "${!paths[@]}"; do
+        repo_path="${paths[$i]}"
+        set +e
+        output=$(git -C "$repo_path" fetch --quiet 2>&1)
+        exit_code=$?
+        set -e
+        if [ $exit_code -ne 0 ]; then
+            statuses[$i]="fetch_failed"
+            fetch_error_msgs[$i]="$output"
+            {
+                echo "[$(date --iso-8601=seconds)] ${repo_path}"
+                echo "$output"
+                echo ""
+            } >> "$FETCH_LOG"
+        fi
+    done
+}
+
 # Find all git repositories in home directory
-echo -e "${BLUE}Scanning for git repositories...${NC}"
-echo ""
 
 declare -a repos
 declare -a statuses
 declare -a paths
+declare -a fetch_error_msgs
 
 # Directories to exclude
 EXCLUDE_DIRS=(
@@ -189,6 +232,22 @@ if [ ${#repos[@]} -eq 0 ]; then
     exit 0
 fi
 
+should_fetch=1
+if [ "$DISABLE_FETCH" -eq 1 ]; then
+    should_fetch=0
+elif [ "$FORCE_FETCH" -eq 0 ] && [ "$FETCH_INTERVAL" -gt 0 ] && [ -f "$LAST_FETCH_FILE" ]; then
+    now=$(date +%s)
+    last_fetch=$(cat "$LAST_FETCH_FILE" 2>/dev/null || echo 0)
+    if [ $((now - last_fetch)) -lt "$FETCH_INTERVAL" ]; then
+        should_fetch=0
+    fi
+fi
+
+if [ "$should_fetch" -eq 1 ]; then
+    fetch_all_repos
+    date +%s > "$LAST_FETCH_FILE"
+fi
+
 # Group repositories by parent directory
 declare -A dir_repos
 declare -A dir_statuses
@@ -209,10 +268,53 @@ for i in "${!repos[@]}"; do
 done
 
 # Handle command-line arguments
-if [ "$1" = "--sync" ] || [ "$1" = "-s" ]; then
-    sync_repos "${paths[@]}"
-    exit 0
-fi
+case "$1" in
+    --sync|-s)
+        sync_repos "${paths[@]}"
+        exit 0
+        ;;
+    --json-summary)
+        overall_status=$(get_worst_status "${statuses[@]}")
+        
+        declare -A status_counts=(
+            [clean]=0
+            [dirty]=0
+            [ahead]=0
+            [behind]=0
+            [diverged]=0
+            [uninitialized]=0
+            [fetch_failed]=0
+        )
+        for status in "${statuses[@]}"; do
+            if [ -n "$status" ]; then
+                status_counts[$status]=$((${status_counts[$status]} + 1))
+            fi
+        done
+
+        json_output="{\"overall_status\": \"$overall_status\", \"status_counts\": {\"clean\": ${status_counts[clean]}, \"dirty\": ${status_counts[dirty]}, \"ahead\": ${status_counts[ahead]}, \"behind\": ${status_counts[behind]}, \"diverged\": ${status_counts[diverged]}, \"uninitialized\": ${status_counts[uninitialized]}, \"fetch_failed\": ${status_counts[fetch_failed]}}, \"repos\": ["
+        
+        first=true
+        for i in "${!repos[@]}"; do
+            if [ "${statuses[$i]}" != "clean" ]; then
+                if [ "$first" = true ]; then
+                    first=false
+                else
+                    json_output="$json_output,"
+                fi
+                
+                repo_name_escaped=$(echo "${repos[$i]}" | sed 's/"/\\"/g')
+                repo_path_escaped=$(echo "${paths[$i]}" | sed 's/"/\\"/g')
+
+                json_output="$json_output{\"name\": \"$repo_name_escaped\", \"path\": \"$repo_path_escaped\", \"status\": \"${statuses[$i]}\"}"
+            fi
+        done
+        
+        json_output="$json_output]}"
+        
+        echo "$json_output"
+        exit 0
+        ;;
+esac
 
 # Main loop
 while true; do
@@ -220,7 +322,7 @@ while true; do
     echo -e "${BLUE}=== Git Repository Status ===${NC}"
     echo ""
     echo -e "${BLUE}Legend:${NC}"
-    echo -e "  ${GREEN}${CLEAN}${NC} Clean   ${YELLOW}${DIRTY}${NC} Dirty   ${BLUE}${AHEAD}${NC} Ahead   ${YELLOW}${BEHIND}${NC} Behind   ${RED}${DIVERGED}${NC} Diverged"
+    echo -e "  ${GREEN}${CLEAN}${NC} Clean   ${YELLOW}${DIRTY}${NC} Dirty   ${BLUE}${AHEAD}${NC} Ahead   ${YELLOW}${BEHIND}${NC} Behind   ${RED}${DIVERGED}${NC} Diverged   ${NC}${UNINITIALIZED}${NC} Uninitialized   ${RED}${FETCH_FAILED}${NC} Fetch failed"
     echo ""
     echo -e "${BLUE}=== Directories ===${NC}"
     echo ""
@@ -276,6 +378,9 @@ while true; do
         icon=$(get_status_icon "${statuses[$idx]}")
         printf "%2d) %s  %-40s\n" "$((i+1))" "$icon" "${repos[$idx]}"
         echo -e "    ${BLUE}${paths[$idx]}${NC}"
+        if [ "${statuses[$idx]}" = "fetch_failed" ]; then
+            echo -e "    ${RED}Last fetch failed. See ${FETCH_LOG}${NC}"
+        fi
     done
     
     echo ""
