@@ -3,11 +3,11 @@
 # Waybar script for git repository status
 
 # Get the JSON data from repostatus
-json_data=$(/home/groot/projects/scripts/repostatus --json-summary)
+json_data=$(repostatus --json-summary)
 
 # Check if jq is installed
 if ! command -v jq &> /dev/null; then
-    echo "{"text": "Error: jq is not installed", "class": "error"}"
+    echo '{"text": "Error: jq is not installed", "class": "error"}'
     exit 1
 fi
 
@@ -29,10 +29,10 @@ uninitialized_count=$(echo "$status_counts" | jq -r '.uninitialized // 0')
 green_color="#a6e3a1"
 yellow_color="#f9e2af"
 red_color="#f38ba8"
-grey_color="#6c7086" # Catppuccin "subtext0"
+grey_color="#6c7086"
 
-# Build the text for Waybar using Pango markup
-text="<span color='$green_color'></span> $good_count <span color='$yellow_color'></span> $dirty_count <span color='$red_color'></span> $bad_count <span color='$grey_color'></span> $uninitialized_count"
+# Build the text for Waybar using Pango markup with simple filled circles
+text="<span foreground='$green_color'>●</span> $good_count <span foreground='$yellow_color'>●</span> $dirty_count <span foreground='$red_color'>●</span> $bad_count <span foreground='$grey_color'>●</span> $uninitialized_count"
 
 # Build the tooltip
 tooltip=""

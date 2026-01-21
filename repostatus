@@ -5,7 +5,87 @@
 
 set -e
 
-# Colors
+# Dark theme for dialog
+export DIALOGRC=""
+export DIALOG_COLOR="on"
+
+# Create dark theme config
+DIALOG_THEME=$(mktemp)
+cat > "$DIALOG_THEME" << 'EOF'
+# Dark theme for dialog - minimal bright elements
+aspect = 0
+separate_widget = ""
+tab_len = 0
+visit_items = OFF
+use_shadow = ON
+use_colors = ON
+
+# Main screen - cyan text, terminal default background, NOT bold
+screen_color = (CYAN,DEFAULT,OFF)
+shadow_color = (DEFAULT,DEFAULT,OFF)
+
+# Dialog box - cyan text, default bg, NOT bold to avoid white
+dialog_color = (CYAN,DEFAULT,OFF)
+title_color = (CYAN,DEFAULT,ON)
+border_color = (CYAN,DEFAULT,OFF)
+border2_color = (CYAN,DEFAULT,OFF)
+
+# Buttons - inverted cyan when active
+button_active_color = (BLACK,CYAN,OFF)
+button_inactive_color = (CYAN,DEFAULT,OFF)
+button_key_active_color = (BLACK,CYAN,OFF)
+button_key_inactive_color = (CYAN,DEFAULT,OFF)
+button_label_active_color = (BLACK,CYAN,OFF)
+button_label_inactive_color = (CYAN,DEFAULT,OFF)
+
+# Input/search boxes
+inputbox_color = (CYAN,DEFAULT,OFF)
+inputbox_border_color = (CYAN,DEFAULT,OFF)
+inputbox_border2_color = (CYAN,DEFAULT,OFF)
+searchbox_color = (CYAN,DEFAULT,OFF)
+searchbox_title_color = (CYAN,DEFAULT,ON)
+searchbox_border_color = (CYAN,DEFAULT,OFF)
+searchbox_border2_color = (CYAN,DEFAULT,OFF)
+
+# Menu
+menubox_color = (CYAN,DEFAULT,OFF)
+menubox_border_color = (CYAN,DEFAULT,OFF)
+menubox_border2_color = (CYAN,DEFAULT,OFF)
+item_color = (CYAN,DEFAULT,OFF)
+item_selected_color = (BLACK,CYAN,OFF)
+
+# Tags (the numbers/letters in menu)
+tag_color = (CYAN,DEFAULT,OFF)
+tag_selected_color = (BLACK,CYAN,OFF)
+tag_key_color = (CYAN,DEFAULT,OFF)
+tag_key_selected_color = (BLACK,CYAN,OFF)
+
+# Checkboxes
+check_color = (CYAN,DEFAULT,OFF)
+check_selected_color = (BLACK,CYAN,OFF)
+
+# Scroll arrows
+uarrow_color = (CYAN,DEFAULT,OFF)
+darrow_color = (CYAN,DEFAULT,OFF)
+
+# Position indicator
+position_indicator_color = (CYAN,DEFAULT,OFF)
+
+# Help text
+itemhelp_color = (CYAN,DEFAULT,OFF)
+
+# Forms
+form_active_text_color = (BLACK,CYAN,OFF)
+form_text_color = (CYAN,DEFAULT,OFF)
+form_item_readonly_color = (CYAN,DEFAULT,OFF)
+
+# Gauge
+gauge_color = (CYAN,DEFAULT,OFF)
+EOF
+export DIALOGRC="$DIALOG_THEME"
+trap 'rm -f "$DIALOG_THEME"' EXIT
+
+# Colors for non-dialog output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -34,7 +114,7 @@ LAST_FETCH_FILE="$CACHE_DIR/last_fetch"
 get_repo_status() {
     local repo_dir="$1"
     cd "$repo_dir"
-    
+
     # Check if there are any remote branches
     if [ -z "$(git branch -r)" ]; then
         echo "uninitialized"
@@ -43,26 +123,26 @@ get_repo_status() {
 
     # Get repo name
     local repo_name=$(basename "$repo_dir")
-    
+
     # Check if there are uncommitted changes
     if ! (git diff-index --quiet HEAD -- 2>/dev/null); then
         echo "dirty"
         return
     fi
-    
+
     # Check for untracked files
     if [ -n "$(git ls-files --others --exclude-standard)" ]; then
         echo "dirty"
         return
     fi
-    
+
     # Check if ahead/behind/diverged from remote
     local upstream=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
     if [ -n "$upstream" ]; then
         local local_commit=$(git rev-parse @ 2>/dev/null || true)
         local remote_commit=$(git rev-parse @{u} 2>/dev/null || true)
         local base_commit=$(git merge-base @ @{u} 2>/dev/null || true)
-        
+
         if [ -z "$local_commit" ] || [ -z "$remote_commit" ] || [ -z "$base_commit" ]; then
             # If any of the commits are not found, the repo is likely in a weird state
             # (e.g. empty, no upstream). We'll just call it clean and move on.
@@ -97,6 +177,20 @@ get_status_icon() {
     esac
 }
 
+# Plain text icons for dialog (no ANSI colors)
+get_status_icon_plain() {
+    case "$1" in
+        clean)   echo "$CLEAN" ;;
+        dirty)   echo "$DIRTY" ;;
+        ahead)   echo "$AHEAD" ;;
+        behind)  echo "$BEHIND" ;;
+        diverged) echo "$DIVERGED" ;;
+        uninitialized) echo "$UNINITIALIZED" ;;
+        fetch_failed) echo "$FETCH_FAILED" ;;
+        *)       echo "❓" ;;
+    esac
+}
+
 get_worst_status() {
     local worst="clean"
     for status in "$@"; do
@@ -115,7 +209,7 @@ get_parent_dir() {
     local path="$1"
     local parent=$(dirname "$path")
     local parent_name=$(basename "$parent")
-    
+
     # Check if it's directly in home
     if [ "$parent" = "$HOME" ]; then
         echo "~/$parent_name"
@@ -129,44 +223,93 @@ get_parent_dir() {
 
 sync_repos() {
     local repos_to_sync=("$@")
-    
-    echo -e "${BLUE}Starting repository sync...${NC}"
-    echo ""
-    
+    local synced=0
+    local up_to_date=0
+    local failed=()
+    local skipped_dirty=()
+    local skipped_diverged=()
+    local total=${#repos_to_sync[@]}
+    local current=0
+
     for repo_path in "${repos_to_sync[@]}"; do
         cd "$repo_path"
         local repo_name=$(basename "$repo_path")
         local status=$(get_repo_status "$repo_path")
-        
+
+        current=$((current + 1))
+        percent=$((current * 100 / total))
+        echo "$percent" | dialog --title "Syncing Repositories" \
+            --gauge "Syncing: $repo_name" 8 60 "$percent"
+
         case "$status" in
             behind)
-                echo -e "${BLUE}Syncing ${repo_name}...${NC}"
-                if git pull --quiet; then
-                    echo -e "${GREEN}✓ Synced successfully${NC}"
+                if git pull --quiet 2>/dev/null; then
+                    synced=$((synced + 1))
                 else
-                    echo -e "${RED}✗ Failed to sync${NC}"
+                    failed+=("$repo_name")
                 fi
                 ;;
             dirty)
-                echo -e "${YELLOW}✗ Skipping ${repo_name} (has local changes)${NC}"
+                skipped_dirty+=("$repo_name")
                 ;;
             diverged)
-                echo -e "${RED}✗ Skipping ${repo_name} (diverged from remote)${NC}"
+                skipped_diverged+=("$repo_name")
                 ;;
             clean|ahead)
-                # No action needed
+                up_to_date=$((up_to_date + 1))
                 ;;
         esac
     done
-    
-    echo ""
-    echo -e "${BLUE}Sync complete.${NC}"
-    read -p "Press enter to continue..."
+
+    # Build summary
+    local summary="━━━ Summary ━━━\n"
+    summary+="✓ Synced: $synced\n"
+    summary+="✓ Already up to date: $up_to_date\n"
+
+    # Only show problem details if there are any
+    if [ ${#failed[@]} -gt 0 ] || [ ${#skipped_dirty[@]} -gt 0 ] || [ ${#skipped_diverged[@]} -gt 0 ]; then
+        summary+="\n━━━ Issues ━━━\n"
+
+        if [ ${#failed[@]} -gt 0 ]; then
+            summary+="✗ Failed (${#failed[@]}):\n"
+            for repo in "${failed[@]}"; do
+                summary+="  • $repo\n"
+            done
+        fi
+
+        if [ ${#skipped_dirty[@]} -gt 0 ]; then
+            summary+="⊘ Skipped - local changes (${#skipped_dirty[@]}):\n"
+            for repo in "${skipped_dirty[@]}"; do
+                summary+="  • $repo\n"
+            done
+        fi
+
+        if [ ${#skipped_diverged[@]} -gt 0 ]; then
+            summary+="⊘ Skipped - diverged (${#skipped_diverged[@]}):\n"
+            for repo in "${skipped_diverged[@]}"; do
+                summary+="  • $repo\n"
+            done
+        fi
+    fi
+
+    dialog --title "Sync Complete" --msgbox "$summary" 20 50
 }
 
 fetch_all_repos() {
+    local total=${#paths[@]}
+    local current=0
+
     for i in "${!paths[@]}"; do
         repo_path="${paths[$i]}"
+        repo_name=$(basename "$repo_path")
+        current=$((current + 1))
+        percent=$((current * 100 / total))
+
+        if [ "$JSON_MODE" -eq 0 ]; then
+            echo "$percent" | dialog --title "Fetching Remote Updates" \
+                --gauge "Fetching: $repo_name" 8 60 "$percent"
+        fi
+
         set +e
         output=$(git -C "$repo_path" fetch --quiet 2>&1)
         exit_code=$?
@@ -210,25 +353,66 @@ for dir in "${EXCLUDE_DIRS[@]}"; do
     EXCLUDE_FIND="$EXCLUDE_FIND -path '*/$dir' -prune -o"
 done
 
-# Find all .git directories (excluding common directories)
+# Check if we should run in JSON mode (will be handled after repo scan)
+JSON_MODE=0
+if [ "$1" = "--json-summary" ]; then
+    JSON_MODE=1
+fi
+
+# Check for sync mode (handle separately from JSON)
+if [ "$1" = "--sync" ] || [ "$1" = "-s" ]; then
+    # Need to scan repos first
+    :
+fi
+
+# Show initial scanning message (only if not in JSON mode)
+if [ "$JSON_MODE" -eq 0 ]; then
+    dialog --title "Repository Status" --infobox "Scanning for git repositories..." 5 45
+fi
+
+# First pass: find all repos (fast)
+declare -a git_dirs
 while IFS= read -r -d '' git_dir; do
+    git_dirs+=("$git_dir")
+done < <(eval "find ~ $EXCLUDE_FIND -name '.git' -type d -prune -print0 2>/dev/null" | head -z -n 50)
+
+total_repos=${#git_dirs[@]}
+
+if [ "$total_repos" -eq 0 ]; then
+    dialog --title "Repository Status" --msgbox "No git repositories found in home directory" 6 50
+    clear
+    exit 0
+fi
+
+# Second pass: get status for each repo with progress
+current=0
+for git_dir in "${git_dirs[@]}"; do
     repo_dir=$(dirname "$git_dir")
-    
+
     # Skip if inside another git repo
     if [[ "$repo_dir" == *"/.git/"* ]]; then
         continue
     fi
-    
-    status=$(get_repo_status "$repo_dir")
+
     repo_name=$(basename "$repo_dir")
-    
+    current=$((current + 1))
+    percent=$((current * 100 / total_repos))
+
+    if [ "$JSON_MODE" -eq 0 ]; then
+        echo "$percent" | dialog --title "Scanning Repositories" \
+            --gauge "Checking: $repo_name" 8 60 "$percent"
+    fi
+
+    status=$(get_repo_status "$repo_dir")
+
     repos+=("$repo_name")
     statuses+=("$status")
     paths+=("$repo_dir")
-done < <(eval "find ~ $EXCLUDE_FIND -name '.git' -type d -prune -print0 2>/dev/null" | head -z -n 50)
+done
 
 if [ ${#repos[@]} -eq 0 ]; then
-    echo -e "${YELLOW}No git repositories found in home directory${NC}"
+    dialog --title "Repository Status" --msgbox "No git repositories found in home directory" 6 50
+    clear
     exit 0
 fi
 
@@ -248,13 +432,62 @@ if [ "$should_fetch" -eq 1 ]; then
     date +%s > "$LAST_FETCH_FILE"
 fi
 
+# Handle JSON mode output
+if [ "$JSON_MODE" -eq 1 ]; then
+    overall_status=$(get_worst_status "${statuses[@]}")
+
+    declare -A status_counts=(
+        [clean]=0
+        [dirty]=0
+        [ahead]=0
+        [behind]=0
+        [diverged]=0
+        [uninitialized]=0
+        [fetch_failed]=0
+    )
+    for status in "${statuses[@]}"; do
+        if [ -n "$status" ]; then
+            status_counts[$status]=$((${status_counts[$status]} + 1))
+        fi
+    done
+
+    json_output="{\"overall_status\": \"$overall_status\", \"status_counts\": {\"clean\": ${status_counts[clean]}, \"dirty\": ${status_counts[dirty]}, \"ahead\": ${status_counts[ahead]}, \"behind\": ${status_counts[behind]}, \"diverged\": ${status_counts[diverged]}, \"uninitialized\": ${status_counts[uninitialized]}, \"fetch_failed\": ${status_counts[fetch_failed]}}, \"repos\": ["
+
+    first=true
+    for i in "${!repos[@]}"; do
+        if [ "${statuses[$i]}" != "clean" ]; then
+            if [ "$first" = true ]; then
+                first=false
+            else
+                json_output="$json_output,"
+            fi
+
+            repo_name_escaped=$(echo "${repos[$i]}" | sed 's/"/\\"/g')
+            repo_path_escaped=$(echo "${paths[$i]}" | sed 's/"/\\"/g')
+
+            json_output="$json_output{\"name\": \"$repo_name_escaped\", \"path\": \"$repo_path_escaped\", \"status\": \"${statuses[$i]}\"}"
+        fi
+    done
+
+    json_output="$json_output]}"
+
+    echo "$json_output"
+    exit 0
+fi
+
+# Handle sync mode
+if [ "$1" = "--sync" ] || [ "$1" = "-s" ]; then
+    sync_repos "${paths[@]}"
+    exit 0
+fi
+
 # Group repositories by parent directory
 declare -A dir_repos
 declare -A dir_statuses
 
 for i in "${!repos[@]}"; do
     parent=$(get_parent_dir "${paths[$i]}")
-    
+
     if [ -z "${dir_repos[$parent]}" ]; then
         dir_repos[$parent]="$i"
         dir_statuses[$parent]="${statuses[$i]}"
@@ -267,166 +500,121 @@ for i in "${!repos[@]}"; do
     fi
 done
 
-# Handle command-line arguments
-case "$1" in
-    --sync|-s)
-        sync_repos "${paths[@]}"
-        exit 0
-        ;;
-    --json-summary)
-        overall_status=$(get_worst_status "${statuses[@]}")
-        
-        declare -A status_counts=(
-            [clean]=0
-            [dirty]=0
-            [ahead]=0
-            [behind]=0
-            [diverged]=0
-            [uninitialized]=0
-            [fetch_failed]=0
-        )
-        for status in "${statuses[@]}"; do
-            if [ -n "$status" ]; then
-                status_counts[$status]=$((${status_counts[$status]} + 1))
-            fi
+# Main loop with dialog
+show_main_menu() {
+    while true; do
+        # Build menu items for directories
+        local menu_items=()
+        local dir_list=()
+        for dir in "${!dir_repos[@]}"; do
+            dir_list+=("$dir")
         done
 
-        json_output="{\"overall_status\": \"$overall_status\", \"status_counts\": {\"clean\": ${status_counts[clean]}, \"dirty\": ${status_counts[dirty]}, \"ahead\": ${status_counts[ahead]}, \"behind\": ${status_counts[behind]}, \"diverged\": ${status_counts[diverged]}, \"uninitialized\": ${status_counts[uninitialized]}, \"fetch_failed\": ${status_counts[fetch_failed]}}, \"repos\": ["
-        
-        first=true
-        for i in "${!repos[@]}"; do
-            if [ "${statuses[$i]}" != "clean" ]; then
-                if [ "$first" = true ]; then
-                    first=false
-                else
-                    json_output="$json_output,"
-                fi
-                
-                repo_name_escaped=$(echo "${repos[$i]}" | sed 's/"/\\"/g')
-                repo_path_escaped=$(echo "${paths[$i]}" | sed 's/"/\\"/g')
+        # Sort directories
+        IFS=$'\n' dir_list=($(sort <<<"${dir_list[*]}"))
+        unset IFS
 
-                json_output="$json_output{\"name\": \"$repo_name_escaped\", \"path\": \"$repo_path_escaped\", \"status\": \"${statuses[$i]}\"}"
-            fi
+        for i in "${!dir_list[@]}"; do
+            dir="${dir_list[$i]}"
+            icon=$(get_status_icon_plain "${dir_statuses[$dir]}")
+            repo_count=$(echo "${dir_repos[$dir]}" | tr ',' '\n' | wc -l)
+            menu_items+=("$((i+1))" "$icon $dir ($repo_count repos)")
         done
-        
-        json_output="$json_output]}"
-        
-        echo "$json_output"
-        exit 0
-        ;;
-esac
+        menu_items+=("S" "🔄 Sync All Repos")
+        menu_items+=("L" "📖 Legend")
 
-# Main loop
-while true; do
-    clear
-    echo -e "${BLUE}=== Git Repository Status ===${NC}"
-    echo ""
-    echo -e "${BLUE}Legend:${NC}"
-    echo -e "  ${GREEN}${CLEAN}${NC} Clean   ${YELLOW}${DIRTY}${NC} Dirty   ${BLUE}${AHEAD}${NC} Ahead   ${YELLOW}${BEHIND}${NC} Behind   ${RED}${DIVERGED}${NC} Diverged   ${NC}${UNINITIALIZED}${NC} Uninitialized   ${RED}${FETCH_FAILED}${NC} Fetch failed"
-    echo ""
-    echo -e "${BLUE}=== Directories ===${NC}"
-    echo ""
-    
-    declare -a dir_list=()
-    for dir in "${!dir_repos[@]}"; do
-        dir_list+=("$dir")
-    done
-    
-    # Sort directories
-    IFS=$'\n' dir_list=($(sort <<<"${dir_list[*]}"))
-    unset IFS
-    
-    # Display directories with summary
-    for i in "${!dir_list[@]}"; do
-        dir="${dir_list[$i]}"
-        icon=$(get_status_icon "${dir_statuses[$dir]}")
-        repo_count=$(echo "${dir_repos[$dir]}" | tr ',' '\n' | wc -l)
-        printf "%2d) %s  %-30s (%d repos)\n" "$((i+1))" "$icon" "$dir" "$repo_count"
-    done
-    
-    echo ""
-    echo "s) Sync All Repos"
-    read -p "Select directory to expand, 's' to sync, or 'q' to quit: " choice
-    
-    if [ "$choice" = "q" ] || [ "$choice" = "Q" ]; then
-        exit 0
-    fi
+        local choice
+        choice=$(dialog --title "Git Repository Status" \
+            --menu "Select a directory to view repositories:" \
+            20 70 14 \
+            "${menu_items[@]}" \
+            2>&1 >/dev/tty) || {
+            clear
+            exit 0
+        }
 
-    if [ "$choice" = "s" ] || [ "$choice" = "S" ]; then
-        sync_repos "${paths[@]}"
-        exec "$0"
-    fi
-    
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt "${#dir_list[@]}" ]; then
-        echo -e "${RED}Invalid selection${NC}"
-        sleep 1
-        continue
-    fi
-    
-    selected_dir_idx=$((choice - 1))
-    selected_dir="${dir_list[$selected_dir_idx]}"
-    
-    # Show repos in selected directory
-    clear
-    echo -e "${BLUE}=== Repositories in $selected_dir ===${NC}"
-    echo ""
-    
-    IFS=',' read -ra repo_indices <<< "${dir_repos[$selected_dir]}"
-    
-    for i in "${!repo_indices[@]}"; do
-        idx="${repo_indices[$i]}"
-        icon=$(get_status_icon "${statuses[$idx]}")
-        printf "%2d) %s  %-40s\n" "$((i+1))" "$icon" "${repos[$idx]}"
-        echo -e "    ${BLUE}${paths[$idx]}${NC}"
-        if [ "${statuses[$idx]}" = "fetch_failed" ]; then
-            echo -e "    ${RED}Last fetch failed. See ${FETCH_LOG}${NC}"
+        if [ "$choice" = "S" ]; then
+            sync_repos "${paths[@]}"
+            exec "$0"
+        fi
+
+        if [ "$choice" = "L" ]; then
+            show_legend
+            continue
+        fi
+
+        local selected_dir_idx=$((choice - 1))
+        local selected_dir="${dir_list[$selected_dir_idx]}"
+
+        show_repo_menu "$selected_dir"
+    done
+}
+
+show_legend() {
+    local legend_text="$CLEAN  Clean - No uncommitted changes, up to date with remote\n"
+    legend_text+="$DIRTY  Dirty - Has uncommitted changes or untracked files\n"
+    legend_text+="$AHEAD  Ahead - Local commits not pushed to remote\n"
+    legend_text+="$BEHIND  Behind - Remote has commits not pulled locally\n"
+    legend_text+="$DIVERGED  Diverged - Both local and remote have new commits\n"
+    legend_text+="$UNINITIALIZED  Uninitialized - No remote branches configured\n"
+    legend_text+="$FETCH_FAILED  Fetch Failed - Could not reach remote"
+
+    dialog --title "Status Legend" --msgbox "$legend_text" 13 60
+}
+
+show_repo_menu() {
+    local selected_dir="$1"
+
+    while true; do
+        IFS=',' read -ra repo_indices <<< "${dir_repos[$selected_dir]}"
+
+        local menu_items=()
+        for i in "${!repo_indices[@]}"; do
+            idx="${repo_indices[$i]}"
+            icon=$(get_status_icon_plain "${statuses[$idx]}")
+            local extra_info=""
+            if [ "${statuses[$idx]}" = "fetch_failed" ]; then
+                extra_info=" [fetch failed]"
+            fi
+            menu_items+=("$((i+1))" "$icon ${repos[$idx]}$extra_info")
+        done
+        menu_items+=("S" "🔄 Sync all in this directory")
+        menu_items+=("B" "⬅ Back to directory list")
+
+        local choice
+        choice=$(dialog --title "Repos in $selected_dir" \
+            --menu "Select a repository to open in lazygit:" \
+            20 70 12 \
+            "${menu_items[@]}" \
+            2>&1 >/dev/tty) || return
+
+        if [ "$choice" = "B" ]; then
+            return
+        fi
+
+        if [ "$choice" = "S" ]; then
+            declare -a repos_to_sync_in_dir
+            for i in "${!repo_indices[@]}"; do
+                repos_to_sync_in_dir+=("${paths[${repo_indices[$i]}]}")
+            done
+            sync_repos "${repos_to_sync_in_dir[@]}"
+            exec "$0"
+        fi
+
+        local selected_repo_idx="${repo_indices[$((choice - 1))]}"
+        local selected_path="${paths[$selected_repo_idx]}"
+
+        clear
+        cd "$selected_path"
+
+        if command -v lazygit &> /dev/null; then
+            lazygit
+            dialog --title "Repository Status" --infobox "Rescanning repositories..." 5 40
+            exec "$0"
+        else
+            dialog --title "Error" --msgbox "lazygit not found.\n\nInstall with: sudo pacman -S lazygit" 8 50
         fi
     done
-    
-    echo ""
-    echo "s) Sync all in this directory"
-    echo "b) Back to directory list"
-    echo "q) Quit"
-    read -p "Select repo to open in lazygit, 's' to sync, 'b' to go back, or 'q' to quit: " repo_choice
-    
-    if [ "$repo_choice" = "q" ] || [ "$repo_choice" = "Q" ]; then
-        exit 0
-    fi
-    
-    if [ "$repo_choice" = "b" ] || [ "$repo_choice" = "B" ]; then
-        continue
-    fi
+}
 
-    if [ "$repo_choice" = "s" ] || [ "$repo_choice" = "S" ]; then
-        declare -a repos_to_sync_in_dir
-        for i in "${!repo_indices[@]}"; do
-            repos_to_sync_in_dir+=("${paths[${repo_indices[$i]}]}")
-        done
-        sync_repos "${repos_to_sync_in_dir[@]}"
-        exec "$0"
-    fi
-    
-    if ! [[ "$repo_choice" =~ ^[0-9]+$ ]] || [ "$repo_choice" -lt 1 ] || [ "$repo_choice" -gt "${#repo_indices[@]}" ]; then
-        echo -e "${RED}Invalid selection${NC}"
-        sleep 1
-        continue
-    fi
-    
-    selected_repo_idx="${repo_indices[$((repo_choice - 1))]}"
-    selected_path="${paths[$selected_repo_idx]}"
-    
-    echo -e "${GREEN}Launching lazygit in: ${selected_path}${NC}"
-    cd "$selected_path"
-    
-    if command -v lazygit &> /dev/null; then
-        lazygit
-        # After lazygit exits, rescan repos
-        echo ""
-        read -p "Press enter to rescan repositories..." 
-        exec "$0"
-    else
-        echo -e "${RED}lazygit not found.${NC}"
-        echo -e "${BLUE}Install with: sudo pacman -S lazygit${NC}"
-        sleep 2
-    fi
-done
+show_main_menu
