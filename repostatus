@@ -106,7 +106,13 @@ DIVERGED="🔴"
 UNINITIALIZED="⚪"
 FETCH_FAILED="⛔"
 
-FETCH_INTERVAL=${REPOSTATUS_FETCH_INTERVAL:-300}
+# When called from waybar with --json-summary, use shorter fetch interval
+# to avoid double-wait (waybar interval + script interval)
+if [ "$1" = "--json-summary" ]; then
+    FETCH_INTERVAL=${REPOSTATUS_FETCH_INTERVAL:-60}
+else
+    FETCH_INTERVAL=${REPOSTATUS_FETCH_INTERVAL:-300}
+fi
 FORCE_FETCH=${REPOSTATUS_FORCE_FETCH:-0}
 DISABLE_FETCH=${REPOSTATUS_DISABLE_FETCH:-0}
 LAST_FETCH_FILE="$CACHE_DIR/last_fetch"
