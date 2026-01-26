@@ -1,43 +1,83 @@
-# scripts
+# User Scripts Repository
 
-## Description
+Single source of truth for all custom shell scripts and utilities.
 
-CLI scripts for journaling with a simple markdown wiki (~/journal), plus helpers for TODO review and git repo utilities.
+## Structure
 
-## Setup
+Scripts are organized by purpose into the following categories:
 
-Requirements: bash, grep, sed, nvim (optional).
-
-Setup:
-- Create dirs and symlinks:
-  mkdir -p ~/bin ~/journal/diary
-  chmod +x wiki-daily-plan wiki-helper wiki-review-todos
-  ln -sf "$(pwd)/wiki-daily-plan" ~/bin/wiki-daily-plan
-  ln -sf "$(pwd)/wiki-helper" ~/bin/wiki-helper
-  ln -sf "$(pwd)/wiki-review-todos" ~/bin/wiki-review-todos
-- Ensure ~/bin on PATH (e.g., add to ~/.bashrc): export PATH="$HOME/bin:$PATH"
+| Category | Purpose | Scripts |
+|----------|---------|---------|
+| **waybar** | Waybar status bar modules | charge-waybar, cliphist-waybar, waybar-repostatus, yay-waybar |
+| **hypr** | Hyprland window manager utilities | monitor, monitor_setup, scratchpad, toggle, window-switcher, wallpaper |
+| **system** | System and desktop utilities | charge-rate, notifications, remote, update-mirrors, wallpaper, wlogout-custom, dotfiles-status |
+| **journal** | Note-taking and todo management | journal, start-journal, wiki-daily-plan, wiki-helper, wiki-review-todos |
+| **launcher** | Application launchers | launcher, scope, stfc-launch |
+| **clipboard** | Clipboard utilities | cliphist-watch, txtcliphist |
+| **other** | Miscellaneous utilities | arch-audit, bin-manager, config, install, startgp, update, wifi, wifistatus |
+| **lib** | Shared libraries | colors.sh, common.sh, waybar-cache.sh |
 
 ## Usage
 
-Daily flow:
-- Morning: run wiki-helper; it creates today's diary at ~/journal/diary/YYYY-MM-DD.md, shows outstanding TODOs, then choose 1 to edit in nvim and fill Plan/Morning/Afternoon/Evening/Reflections; add tasks as "- [ ]" and mark done as "- [X]" or "- [✓]".
-- Any time: wiki-daily-plan -o opens today directly; keep your main list at ~/journal/TODO.md, optional notes in ~/journal/notes/.
-- Review: run wiki-review-todos to list incomplete items from TODO.md, the last 7 days of diary, and notes; triage/migrate as needed.
-Tips: adjust the 7‑day window by editing -mtime in wiki-review-todos; you can alias jj='wiki-helper' for convenience.
+Access scripts through `~/.local/bin/` (via GNU Stow):
 
-## Neovim Wiki Keybinds
-Within vimwiki buffers:
-- <leader>wT  Open main TODO list
-- <leader>wr  Review TODOs (terminal)
-- <leader>wp  Generate today's plan
-- <leader>wh  Run combined helper (plan + review)
-- <leader>wi  Diary index
-- <leader>wd  Create diary note (today)
-- <C-Space> / <leader>wx Toggle checkbox
-- <leader>wL  Link current TODO line to main TODO.md
+```bash
+# Waybar modules
+~/.local/bin/waybar/charge-waybar.sh
 
-General dashboard and navigation:
-- <leader>h  Open Snacks dashboard
-- <leader>wi / <leader>wd for quick journal entry/index from anywhere
+# Hyprland utilities
+~/.local/bin/hypr/monitor.sh
 
-Checkbox states use symbols: space (open), ○, ◐, ●, ✓ (done).
+# System utilities
+~/.local/bin/system/wallpaper.sh
+
+# Journal/notes
+~/.local/bin/journal/start-journal.sh
+
+# Shared libraries
+source ~/.local/bin/lib/colors.sh
+```
+
+## Architecture
+
+```
+~/.local/bin/script                     (User accesses here)
+  ↓ (GNU Stow symlink)
+~/dotfiles/bin/.local/bin/script        (Symlink layer)
+  ↓ (Relative symlink)
+~/projects/scripts/{category}/script    (Source of truth)
+```
+
+## Adding New Scripts
+
+1. Place script in appropriate category directory
+2. Make executable: `chmod +x script.sh`
+3. If script uses libraries, source via absolute path:
+   ```bash
+   source /home/groot/projects/scripts/lib/colors.sh
+   ```
+4. Commit to git
+
+## Library Functions
+
+### colors.sh
+ANSI color codes for terminal output
+
+### common.sh
+Common utility functions
+
+### waybar-cache.sh
+Caching utilities for Waybar modules
+
+## Requirements
+
+- Bash 4.0+
+- Various system utilities (nmcli, tofi, fzf, etc.) - see individual scripts
+
+## License
+
+Personal use
+
+## Archive
+
+Older versions and deprecated scripts are kept in `archive/old-versions/`
