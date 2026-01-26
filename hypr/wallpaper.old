@@ -1,0 +1,45 @@
+#!/bin/bash
+
+# Configuration
+WALLPAPER_DIR="$HOME/wallpapers"  # Your wallpaper directory
+INTERVAL=300 # Time between changes (seconds, 300 = 5 minutes)
+
+# Check if script is already running and kill it
+SCRIPT_NAME=$(basename "$0")
+PID=$(pgrep -o -f "$SCRIPT_NAME")
+if [ "$PID" != "$$" ] && [ -n "$PID" ]; then
+    kill "$PID"
+    sleep 1
+fi
+
+
+# Initialize swww if not running
+#killall waypaper & waypaper &
+swww &
+
+# Loop to rotate wallpapers
+while true; do
+    # Get list of wallpapers (jpg, png)
+    wallpapers=("$WALLPAPER_DIR"/*.{jpg,jpeg,png})
+    if [ ${#wallpapers[@]} -eq 0 ]; then
+        echo "No wallpapers found in $WALLPAPER_DIR"
+        sleep $INTERVAL
+        continue
+    fi
+
+    # Randomly select a wallpaper
+    wallpaper=${wallpapers[$RANDOM % ${#wallpapers[@]}]}
+
+    # Set wallpaper with swww (fade transition)
+    swww img "$wallpaper" --transition-type wipe --transition-duration 2
+
+    # Generate and apply color scheme with Wallust
+    # wallust debug
+    wallust run -s "$wallpaper"
+
+    killall waybar 2>/dev/null
+    sleep 1 && waybar &
+
+    # Wait for interval
+    sleep $INTERVAL
+done

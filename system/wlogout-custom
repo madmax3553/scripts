@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
+#      ░    ░         ░ ░      ░ ░           
+# Script: wlogout-custom
+# Purpose: Utility script
+# Dependencies: <fill in as needed>
+# Author: Custom
+# Modified: 2026-01-24
+
+exec wlogout \
+  --layout /home/groot/.config/wlogout/layout \
+  --css /home/groot/.config/wlogout/style.css \
+  --buttons-per-row 4 \
+  --column-spacing 20 \
+  --row-spacing 20

@@ -1,0 +1,767 @@
+#!/usr/bin/env bash
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
+#      ░    ░         ░ ░      ░ ░           
+# Script: remote
+# Purpose: Utility: remote
+# Dependencies: <fill in as needed>
+# Author: Custom
+# Modified: 2026-01-24
+
+set -euo pipefail
+CONFIG_FILE="$HOME/.config/remotes"
+
+mkdir -p "$(dirname "$CONFIG_FILE")"
+touch "$CONFIG_FILE"
+
+# Detect dialog tool
+if command -v dialog &>/dev/null; then
+    DIALOG=dialog
+elif command -v whiptail &>/dev/null; then
+    DIALOG=whiptail
+else
+    DIALOG=""
+fi
+
+trim() {
+    echo "$1" | xargs
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TUI Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+tui_main_menu() {
+    while :; do
+        choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+            --title "Main Menu" \
+            --menu "Select an option:" 16 50 7 \
+            1 "Connect to remote" \
+            2 "Add new remote" \
+            3 "Edit remote" \
+            4 "Set default remote" \
+            5 "Delete remote" \
+            6 "Ad-hoc connection" \
+            7 "Exit" \
+            3>&1 1>&2 2>&3)
+
+        exit_status=$?
+        [ $exit_status -ne 0 ] && break
+
+        case "$choice" in
+            1) tui_connect ;;
+            2) tui_add ;;
+            3) tui_edit ;;
+            4) tui_set_default ;;
+            5) tui_delete ;;
+            6) tui_adhoc ;;
+            7) break ;;
+        esac
+    done
+    clear
+}
+
+tui_build_remote_list() {
+    awk -F',' '
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            def = ($5 == "default") ? " *" : ""
+            printf "%s\n%s@%s (%s)%s\n", $1, $2, $3, $4, def
+        }
+    ' "$CONFIG_FILE"
+}
+
+tui_connect() {
+    local items name user host proto is_default
+    mapfile -t items < <(tui_build_remote_list)
+
+    if [ ${#items[@]} -eq 0 ]; then
+        "$DIALOG" --msgbox "No remotes configured." 6 40
+        return
+    fi
+
+    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Connect to Remote" \
+        --menu "Select a remote:" 20 60 10 \
+        "${items[@]}" \
+        3>&1 1>&2 2>&3)
+
+    [ $? -ne 0 ] && return
+
+    entry="$(get_entry_by_name "$choice")"
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+    clear
+    connect_remote "$user" "$host" "$proto"
+}
+
+tui_add() {
+    local name user host proto make_default
+
+    name=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Add Remote" \
+        --inputbox "Name:" 8 40 \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    name="$(trim "$name")"
+
+    if [ -z "$name" ]; then
+        "$DIALOG" --msgbox "Name is required." 6 40
+        return
+    fi
+
+    if [ -n "$(get_entry_by_name "$name")" ]; then
+        "$DIALOG" --msgbox "Remote already exists: $name" 6 40
+        return
+    fi
+
+    user=$("$DIALOG" --clear --inputbox "User:" 8 40 \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    user="$(trim "$user")"
+
+    host=$("$DIALOG" --clear --inputbox "Host:" 8 40 \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    host="$(trim "$host")"
+
+    proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Protocol" \
+        --menu "Select protocol:" 12 40 3 \
+        ssh "SSH terminal" \
+        vnc "VNC (tunnel)" \
+        garchyvnc "VNC with remote setup" \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+
+    "$DIALOG" --yesno "Set as default?" 6 30
+    if [ $? -eq 0 ]; then
+        make_default="yes"
+    else
+        make_default=""
+    fi
+
+    printf "%s,%s,%s,%s,%s\n" "$name" "$user" "$host" "$proto" "" >> "$CONFIG_FILE"
+
+    if [ "$make_default" = "yes" ]; then
+        set_default "$name"
+    fi
+
+    "$DIALOG" --msgbox "Remote '$name' added." 6 40
+}
+
+tui_set_default() {
+    local items
+    mapfile -t items < <(tui_build_remote_list)
+
+    if [ ${#items[@]} -eq 0 ]; then
+        "$DIALOG" --msgbox "No remotes configured." 6 40
+        return
+    fi
+
+    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Set Default Remote" \
+        --menu "Select a remote:" 20 60 10 \
+        "${items[@]}" \
+        3>&1 1>&2 2>&3)
+
+    [ $? -ne 0 ] && return
+
+    set_default "$choice"
+    "$DIALOG" --msgbox "'$choice' is now the default." 6 40
+}
+
+tui_delete() {
+    local items
+    mapfile -t items < <(tui_build_remote_list)
+
+    if [ ${#items[@]} -eq 0 ]; then
+        "$DIALOG" --msgbox "No remotes configured." 6 40
+        return
+    fi
+
+    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Delete Remote" \
+        --menu "Select a remote to delete:" 20 60 10 \
+        "${items[@]}" \
+        3>&1 1>&2 2>&3)
+
+    [ $? -ne 0 ] && return
+
+    "$DIALOG" --yesno "Delete '$choice'?" 6 30
+    [ $? -ne 0 ] && return
+
+    local tmp
+    tmp="$(mktemp)"
+    awk -F',' -v name="$choice" '
+        /^[[:space:]]*(#|$)/ { print; next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($1 != name) print
+        }
+    ' "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+
+    "$DIALOG" --msgbox "'$choice' deleted." 6 40
+}
+
+tui_edit() {
+    local items name user host proto is_default
+    mapfile -t items < <(tui_build_remote_list)
+
+    if [ ${#items[@]} -eq 0 ]; then
+        "$DIALOG" --msgbox "No remotes configured." 6 40
+        return
+    fi
+
+    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Edit Remote" \
+        --menu "Select a remote to edit:" 20 60 10 \
+        "${items[@]}" \
+        3>&1 1>&2 2>&3)
+
+    [ $? -ne 0 ] && return
+
+    entry="$(get_entry_by_name "$choice")"
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+
+    # Edit name
+    new_name=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Edit Remote: $name" \
+        --inputbox "Name:" 8 40 "$name" \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    new_name="$(trim "$new_name")"
+    [ -z "$new_name" ] && new_name="$name"
+
+    # Check for name conflict if renamed
+    if [ "$new_name" != "$name" ] && [ -n "$(get_entry_by_name "$new_name")" ]; then
+        "$DIALOG" --msgbox "Remote already exists: $new_name" 6 40
+        return
+    fi
+
+    # Edit user
+    new_user=$("$DIALOG" --clear --inputbox "User:" 8 40 "$user" \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    new_user="$(trim "$new_user")"
+    [ -z "$new_user" ] && new_user="$user"
+
+    # Edit host
+    new_host=$("$DIALOG" --clear --inputbox "Host:" 8 40 "$host" \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    new_host="$(trim "$new_host")"
+    [ -z "$new_host" ] && new_host="$host"
+
+    # Edit protocol
+    new_proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Protocol" \
+        --default-item "$proto" \
+        --menu "Select protocol:" 12 40 3 \
+        ssh "SSH terminal" \
+        vnc "VNC (tunnel)" \
+        garchyvnc "VNC with remote setup" \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+
+    # Update the entry
+    local tmp
+    tmp="$(mktemp)"
+    awk -F',' -v oldname="$name" -v newname="$new_name" -v newuser="$new_user" \
+        -v newhost="$new_host" -v newproto="$new_proto" '
+        BEGIN { OFS = "," }
+        /^[[:space:]]*(#|$)/ { print; next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($1 == oldname) {
+                $1 = newname
+                $2 = newuser
+                $3 = newhost
+                $4 = newproto
+            }
+            print
+        }
+    ' "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+
+    "$DIALOG" --msgbox "Remote '$new_name' updated." 6 40
+}
+
+tui_adhoc() {
+    local user host proto
+
+    user=$("$DIALOG" --clear --inputbox "User:" 8 40 \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    user="$(trim "$user")"
+
+    host=$("$DIALOG" --clear --inputbox "Host:" 8 40 \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    host="$(trim "$host")"
+
+    proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Protocol" \
+        --menu "Select protocol:" 12 40 3 \
+        ssh "SSH terminal" \
+        vnc "VNC (tunnel)" \
+        garchyvnc "VNC with remote setup" \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+
+    clear
+    connect_remote "$user" "$host" "$proto"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Core Functions
+# ─────────────────────────────────────────────────────────────────────────────
+
+connect_remote() {
+    local user="$1"
+    local host="$2"
+    local proto="$3"
+    local target="${user}@${host}"
+    local max_retries=3
+    local retry_delay=2
+
+    printf "\033c"
+    echo "Remote: $target (proto: $proto)"
+
+    run_vnc() {
+        local attempt=1
+        local vnc_client=""
+        local tunnel_pid=""
+
+        # Prefer remmina for scaling support, fallback to tigervnc
+        if command -v remmina &>/dev/null; then
+            vnc_client="remmina"
+        elif command -v vncviewer &>/dev/null; then
+            vnc_client="vncviewer"
+        else
+            echo "No VNC client found. Install remmina or tigervnc." >&2
+            return 1
+        fi
+
+        cleanup_tunnel() {
+            if [ -n "$tunnel_pid" ] && kill -0 "$tunnel_pid" 2>/dev/null; then
+                echo "Closing SSH tunnel (PID $tunnel_pid)..."
+                kill "$tunnel_pid" 2>/dev/null
+            fi
+        }
+        trap cleanup_tunnel EXIT INT TERM
+
+        while :; do
+            echo "Starting SSH tunnel to $target (attempt ${attempt}/${max_retries})..."
+            ssh -o ConnectTimeout=10 -L 5900:localhost:5900 -N "$target" &
+            tunnel_pid=$!
+            sleep 1
+
+            if ! kill -0 "$tunnel_pid" 2>/dev/null; then
+                echo "SSH tunnel failed for $target." >&2
+                tunnel_pid=""
+            else
+                echo "SSH tunnel established (PID $tunnel_pid)."
+                echo "Launching VNC viewer ($vnc_client)..."
+                case "$vnc_client" in
+                    remmina)
+                        remmina -c vnc://localhost:5900
+                        ;;
+                    vncviewer)
+                        vncviewer localhost:5900
+                        ;;
+                esac
+                status=$?
+                cleanup_tunnel
+                tunnel_pid=""
+                if [ $status -eq 0 ]; then
+                    echo "VNC viewer exited cleanly."
+                    trap - EXIT INT TERM
+                    return 0
+                fi
+                echo "VNC viewer exited with status $status." >&2
+            fi
+
+            if [ $attempt -lt $max_retries ]; then
+                echo "Retrying in ${retry_delay}s..."
+                sleep "$retry_delay"
+                attempt=$((attempt + 1))
+                continue
+            fi
+
+            read -rp "Failed after ${max_retries} attempts. Retry? (y/N): " retry_choice
+            retry_choice="$(trim "$retry_choice")"
+            if [ "${retry_choice,,}" = "y" ] || [ "${retry_choice,,}" = "yes" ]; then
+                attempt=1
+                continue
+            fi
+            trap - EXIT INT TERM
+            return 1
+        done
+    }
+    run_remote_setup() {
+        local attempt=1
+        while :; do
+            echo "Initializing remote session on $target (attempt ${attempt}/${max_retries})..."
+            echo "Running ~/remote-session.sh on remote host..."
+            ssh -o ConnectTimeout=10 "$target" "~/remote-session.sh"
+            status=$?
+            if [ $status -eq 0 ]; then
+                echo "Remote session initialized."
+                return 0
+            fi
+            echo "Remote session setup failed for $target (exit $status)." >&2
+
+            if [ $attempt -lt $max_retries ]; then
+                echo "Retrying in ${retry_delay}s..."
+                sleep "$retry_delay"
+                attempt=$((attempt + 1))
+                continue
+            fi
+
+            read -rp "Failed after ${max_retries} attempts. Retry? (y/N): " retry_choice
+            retry_choice="$(trim "$retry_choice")"
+            if [ "${retry_choice,,}" = "y" ] || [ "${retry_choice,,}" = "yes" ]; then
+                attempt=1
+                continue
+            fi
+            return 1
+        done
+    }
+
+    case "$proto" in
+        ssh)
+            ssh "$target"
+            status=$?
+            if [ $status -ne 0 ]; then
+                echo "SSH connection failed for $target (exit $status)." >&2
+                exit $status
+            fi
+            exit 0
+            ;;
+        vnc)
+            run_vnc || exit 1
+            exit 0
+            ;;
+        garchyvnc)
+            run_remote_setup || exit 1
+            run_vnc || exit 1
+            exit 0
+            ;;
+        *)
+            echo "Unknown protocol: $proto" >&2
+            exit 1
+            ;;
+    esac
+}
+
+get_entry_by_name() {
+    local name="$1"
+    awk -F',' -v name="$name" '
+        BEGIN { OFS = "," }
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($1 == name) { print $0; exit }
+        }
+    ' "$CONFIG_FILE"
+}
+
+get_default_entry() {
+    awk -F',' '
+        BEGIN { OFS = "," }
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($5 == "default") { print $0; exit }
+        }
+    ' "$CONFIG_FILE"
+}
+
+list_entries() {
+    awk -F',' '
+        BEGIN { OFS = "," }
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            marker = ($5 == "default") ? " *" : ""
+            printf "%s%s\n", $1, marker
+        }
+    ' "$CONFIG_FILE"
+}
+
+set_default() {
+    local name="$1"
+    local tmp
+    tmp="$(mktemp)"
+    awk -F',' -v name="$name" '
+        BEGIN { OFS = ","; found = 0 }
+        /^[[:space:]]*(#|$)/ { print; next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($1 == name) { $5 = "default"; found = 1 }
+            else { $5 = "" }
+            print
+        }
+        END { if (!found) exit 2 }
+    ' "$CONFIG_FILE" > "$tmp"
+
+    if [ $? -ne 0 ]; then
+        rm -f "$tmp"
+        echo "No such remote: $name" >&2
+        exit 1
+    fi
+
+    mv "$tmp" "$CONFIG_FILE"
+}
+
+add_entry() {
+    local name user host proto make_default
+
+    read -rp "Name: " name
+    name="$(trim "$name")"
+    if [ -z "$name" ]; then
+        echo "Name is required." >&2
+        exit 1
+    fi
+
+    if [ -n "$(get_entry_by_name "$name")" ]; then
+        echo "Remote already exists: $name" >&2
+        exit 1
+    fi
+
+    read -rp "User: " user
+    user="$(trim "$user")"
+    read -rp "Host: " host
+    host="$(trim "$host")"
+
+    while :; do
+        read -rp "Protocol (ssh/vnc/garchyvnc): " proto
+        proto="$(trim "$proto")"
+        case "$proto" in
+            ssh|vnc|garchyvnc) break ;;
+            *) echo "Please enter 'ssh', 'vnc', or 'garchyvnc'." >&2 ;;
+        esac
+    done
+
+    read -rp "Set as default? (y/N): " make_default
+    make_default="$(trim "$make_default")"
+
+    printf "%s,%s,%s,%s,%s\n" "$name" "$user" "$host" "$proto" "" >> "$CONFIG_FILE"
+
+    if [ "${make_default,,}" = "y" ] || [ "${make_default,,}" = "yes" ]; then
+        set_default "$name"
+    fi
+}
+
+random_entry() {
+    local user host proto
+    read -rp "User: " user
+    user="$(trim "$user")"
+    read -rp "Host: " host
+    host="$(trim "$host")"
+
+    while :; do
+        read -rp "Protocol (ssh/vnc/garchyvnc): " proto
+        proto="$(trim "$proto")"
+        case "$proto" in
+            ssh|vnc|garchyvnc) break ;;
+            *) echo "Please enter 'ssh', 'vnc', or 'garchyvnc'." >&2 ;;
+        esac
+    done
+
+    connect_remote "$user" "$host" "$proto"
+}
+
+usage() {
+    cat <<'EOF'
+Usage: remote [options] [name]
+
+TUI Mode (default when no arguments):
+  remote              Launch interactive TUI menu
+
+CLI Mode:
+  remote <name>       Connect to a saved remote by name
+  remote -l, --list   List saved remotes (default marked with *)
+  remote -a, --add    Add a new remote
+  remote -e, --edit <name>     Edit an existing remote
+  remote -d, --default <name>  Set default remote
+  remote -r, --random Ad-hoc connection (not saved)
+  remote -D, --delete <name>   Delete a remote
+  remote -c, --connect <name>  Connect to a saved remote
+  remote -h, --help   Show this help
+
+If dialog/whiptail is not available, falls back to CLI prompts.
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
+delete_entry() {
+    local name="$1"
+    local tmp
+    tmp="$(mktemp)"
+
+    if [ -z "$(get_entry_by_name "$name")" ]; then
+        echo "No such remote: $name" >&2
+        exit 1
+    fi
+
+    awk -F',' -v name="$name" '
+        /^[[:space:]]*(#|$)/ { print; next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($1 != name) print
+        }
+    ' "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+    echo "Deleted: $name"
+}
+
+edit_entry() {
+    local name="$1"
+    local entry new_name new_user new_host new_proto
+
+    entry="$(get_entry_by_name "$name")"
+    if [ -z "$entry" ]; then
+        echo "No such remote: $name" >&2
+        exit 1
+    fi
+
+    IFS=',' read -r old_name old_user old_host old_proto old_default <<<"$entry"
+
+    read -rp "Name [$old_name]: " new_name
+    new_name="$(trim "$new_name")"
+    [ -z "$new_name" ] && new_name="$old_name"
+
+    if [ "$new_name" != "$old_name" ] && [ -n "$(get_entry_by_name "$new_name")" ]; then
+        echo "Remote already exists: $new_name" >&2
+        exit 1
+    fi
+
+    read -rp "User [$old_user]: " new_user
+    new_user="$(trim "$new_user")"
+    [ -z "$new_user" ] && new_user="$old_user"
+
+    read -rp "Host [$old_host]: " new_host
+    new_host="$(trim "$new_host")"
+    [ -z "$new_host" ] && new_host="$old_host"
+
+    while :; do
+        read -rp "Protocol (ssh/vnc/garchyvnc) [$old_proto]: " new_proto
+        new_proto="$(trim "$new_proto")"
+        [ -z "$new_proto" ] && new_proto="$old_proto"
+        case "$new_proto" in
+            ssh|vnc|garchyvnc) break ;;
+            *) echo "Please enter 'ssh', 'vnc', or 'garchyvnc'." >&2 ;;
+        esac
+    done
+
+    local tmp
+    tmp="$(mktemp)"
+    awk -F',' -v oldname="$old_name" -v newname="$new_name" -v newuser="$new_user" \
+        -v newhost="$new_host" -v newproto="$new_proto" '
+        BEGIN { OFS = "," }
+        /^[[:space:]]*(#|$)/ { print; next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($1 == oldname) {
+                $1 = newname
+                $2 = newuser
+                $3 = newhost
+                $4 = newproto
+            }
+            print
+        }
+    ' "$CONFIG_FILE" > "$tmp"
+    mv "$tmp" "$CONFIG_FILE"
+    echo "Updated: $new_name"
+}
+
+case "$1" in
+    -l|--list|list)
+        list_entries
+        ;;
+    -a|--add|add)
+        add_entry
+        ;;
+    -e|--edit|edit)
+        if [ -z "$2" ]; then
+            echo "Missing name to edit." >&2
+            exit 1
+        fi
+        edit_entry "$2"
+        ;;
+    -d|--default|default)
+        if [ -z "$2" ]; then
+            echo "Missing name for default." >&2
+            exit 1
+        fi
+        set_default "$2"
+        ;;
+    -D|--delete|delete)
+        if [ -z "$2" ]; then
+            echo "Missing name to delete." >&2
+            exit 1
+        fi
+        delete_entry "$2"
+        ;;
+    -r|--random|random)
+        random_entry
+        ;;
+    -c|--connect)
+        if [ -z "$2" ]; then
+            echo "Missing name for connect." >&2
+            exit 1
+        fi
+        entry="$(get_entry_by_name "$2")"
+        if [ -z "$entry" ]; then
+            echo "No such remote: $2" >&2
+            exit 1
+        fi
+        IFS=',' read -r name user host proto is_default <<<"$entry"
+        connect_remote "$user" "$host" "$proto"
+        ;;
+    "" )
+        # No arguments: launch TUI if available, else show help
+        if [ -n "$DIALOG" ]; then
+            tui_main_menu
+        else
+            entry="$(get_default_entry)"
+            if [ -z "$entry" ]; then
+                echo "No default remote set (install 'dialog' for TUI)." >&2
+                usage
+                exit 1
+            fi
+            IFS=',' read -r name user host proto is_default <<<"$entry"
+            connect_remote "$user" "$host" "$proto"
+        fi
+        ;;
+    -h|--help|help)
+        usage
+        ;;
+    -*)
+        echo "Unknown option: $1" >&2
+        usage
+        exit 1
+        ;;
+    *)
+        entry="$(get_entry_by_name "$1")"
+        if [ -z "$entry" ]; then
+            echo "No such remote: $1" >&2
+            usage
+            exit 1
+        fi
+        IFS=',' read -r name user host proto is_default <<<"$entry"
+        connect_remote "$user" "$host" "$proto"
+        ;;
+esac

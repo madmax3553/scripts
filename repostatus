@@ -1,7 +1,18 @@
-#!/bin/bash
-
-# Repository Status Checker
-# Finds all git repos, shows their status, and allows launching lazygit
+#!/usr/bin/env bash
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
+#      ░    ░         ░ ░      ░ ░           
+# Script: repostatus
+# Purpose: Utility: repo tatu
+# Dependencies: <fill in as needed>
+# Author: Custom
+# Modified: 2026-01-24
 
 set -e
 

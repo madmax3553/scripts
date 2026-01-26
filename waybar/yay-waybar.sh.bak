@@ -1,0 +1,85 @@
+#!/bin/bash
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
+#      ░    ░         ░ ░      ░ ░           
+# Script: yay-waybar.sh.bak
+# Purpose: Utility script
+# Dependencies: <fill in as needed>
+# Author: Custom
+# Modified: 2026-01-24
+
+IGNORE_FILE="$HOME/.config/yay/ignored_packages"
+CONFIG_FILE="$HOME/.config/yay/config.json"
+
+# Create the ignore file if it doesn't exist
+touch "$IGNORE_FILE"
+
+# Function to update the yay config file
+update_yay_config() {
+    ignored_packages=$(cat "$IGNORE_FILE" | tr '\n' ' ' | sed 's/ $//')
+    jq --arg ignored "$ignored_packages" '.answerupgrade = $ignored' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+}
+
+# Read the ignore list
+ignored_packages=$(cat "$IGNORE_FILE" | tr '\n' ',')
+
+# Function to get the number of updates
+get_update_count() {
+    if [ -s "$IGNORE_FILE" ]; then
+        yay -Qu | grep -v -f "$IGNORE_FILE" | wc -l
+    else
+        yay -Qu | wc -l
+    fi
+}
+
+# Function to get the list of updates
+get_update_list() {
+    if [ -s "$IGNORE_FILE" ]; then
+        yay -Qu | grep -v -f "$IGNORE_FILE"
+    else
+        yay -Qu
+    fi
+}
+
+# Main logic
+case "$1" in
+    "update")
+        echo "Ignoring packages: $ignored_packages" >> "$IGNORE_FILE.log"
+        kitty --title "yay-update" yay -Syyu
+        ;; 
+    "install")
+        package=$(rofi -dmenu -p "Install package:" -theme "$HOME/.config/rofi/launchers/type-7/style-yay.rasi")
+        if [ -n "$package" ]; then
+            kitty --title "yay-install" yay -S "$package"
+        fi
+        ;; 
+    "ignore")
+        echo "$2" >> "$IGNORE_FILE"
+        update_yay_config
+        ;; 
+    "unignore")
+        sed -i "/^$2$/d" "$IGNORE_FILE"
+        update_yay_config
+        ;; 
+    *)
+        update_count=$(get_update_count)
+        tooltip_text=""
+        if [ "$update_count" -gt 0 ]; then
+            tooltip_text="$(get_update_list)"
+        else
+            tooltip_text="No updates available"
+        fi
+
+        if [ -s "$IGNORE_FILE" ]; then
+            tooltip_text+="\n\nIgnoring:\n$(cat "$IGNORE_FILE")"
+        fi
+
+        echo "{"text": "$update_count updates", "tooltip": "$tooltip_text"}"
+        ;; 
+esac

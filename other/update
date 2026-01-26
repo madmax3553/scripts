@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
+#      ░    ░         ░ ░      ░ ░           
+# Script: update
+# Purpose: Utility: update
+# Dependencies: <fill in as needed>
+# Author: Custom
+# Modified: 2026-01-24
+
+set -euo pipefail
+rm ~/temp.up
+touch ~/temp.up
+
+echo -en "\n**** UPDATE **** \n\n $(date)\n\n" >> /var/log/updater.log
+apt update >> /var/log/updater.log
+tail --lines 1 /var/log/updater.log >> ~/temp.up
+
+echo -en "\n**** UPGRADER **** \n\n" >> /var/log/updater.log
+apt upgrade -y >> /var/log/updater.log
+tail --lines 1 /var/log/updater.log >> ~/temp.up
+
+echo -en "\n**** AUTOREMOVE **** \n\n" >> /var/log/updater.log
+apt autoremove >> /var/log/updater.log
+tail --lines 1 /var/log/updater.log >> ~/temp.up
+
+clear
+cat ~/temp.up
+echo "**** Complete ****"

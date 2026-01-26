@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
+#      ░    ░         ░ ░      ░ ░           
+# Script: monitor_setup.sh
+# Purpose: Utility: monitor  etup
+# Dependencies: <fill in as needed>
+# Author: Custom
+# Modified: 2026-01-24
+
+set -euo pipefail
+LAPTOP="eDP"
+HDMI="HDMI-A-0"
+
+#Check if HDMI is connected
+if xrandr | grep -q "$HDMI connected"; then
+    # Work use HDMI only
+    xrandr --output $HDMI --primary --auto --output $LAPTOP --off
+else
+    # Home use Laptop only
+    xrandr --output $LAPTOP --primary --auto --output $HDMI --off
+fi
