@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: monitor.sh
-# Purpose: Utility: monitor
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Hyprland monitor configuration
+# Dependencies: hyprctl
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

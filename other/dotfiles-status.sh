@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: dotfiles-status.sh
-# Purpose: Utility: dotfile   tatu
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Dotfiles symlink status checker
+# Dependencies: stow, find
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

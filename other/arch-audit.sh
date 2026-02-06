@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: arch-audit.sh
-# Purpose: Utility: arc  audit
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Arch Linux system audit and cleanup
+# Dependencies: pacman, paccache
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

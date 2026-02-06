@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: config.sh
-# Purpose: Utility: config
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Theme configuration variables
+# Dependencies: none
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

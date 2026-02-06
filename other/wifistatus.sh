@@ -11,7 +11,7 @@
 # Script: wifistatus.sh
 # Purpose: Waybar WiFi status indicator
 # Dependencies: nmcli
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

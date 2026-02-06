@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: toggle.sh
-# Purpose: Utility: toggle
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Waybar visibility toggle
+# Dependencies: waybar
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

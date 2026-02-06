@@ -11,7 +11,7 @@
 # Script: wifi.sh
 # Purpose: WiFi connection manager with tofi menu
 # Dependencies: nmcli, tofi, notify-send, nm-connection-editor
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

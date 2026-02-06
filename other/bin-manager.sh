@@ -10,8 +10,8 @@
 #      ░    ░         ░ ░      ░ ░           
 # Script: bin-manager.sh
 # Purpose: Central management, tracking, and utilities for script collection
-# Dependencies: <fill in as needed>
-# Author: Auto-generated
+# Dependencies: find, wc
+# Author: groot
 # Modified: 2025-01-24
 
 set -euo pipefail

@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: launcher.sh
-# Purpose: Utility: launc er
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Tofi application launcher wrapper
+# Dependencies: tofi
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

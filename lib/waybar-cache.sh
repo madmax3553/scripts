@@ -10,8 +10,8 @@
 #      ░    ░         ░ ░      ░ ░           
 # Script: waybar-cache.sh
 # Purpose: Shared caching utility for Waybar status scripts
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Dependencies: jq (optional), flock
+# Author: groot
 # Modified: 2026-01-24
 
 # lib/waybar-cache.sh
@@ -25,11 +25,20 @@ set -euo pipefail
 # Cache configuration
 CACHE_DIR="${WAYBAR_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/waybar}"
 CACHE_STALE_THRESHOLD="${WAYBAR_STALE_THRESHOLD:-300}"  # Default 5 minutes
+CACHE_DEBUG="${WAYBAR_CACHE_DEBUG:-0}"  # Set to 1 to enable debug logging
+CACHE_DEBUG_LOG="${CACHE_DIR}/debug.log"
 
 # Ensure cache directory exists
 mkdir -p "$CACHE_DIR"
 
 # ===== Helper Functions =====
+
+cache_debug_log() {
+    local msg="$1"
+    if [[ "$CACHE_DEBUG" == "1" ]]; then
+        printf '[%s] %s: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$$" "$msg" >> "$CACHE_DEBUG_LOG"
+    fi
+}
 
 cache_get_age_string() {
     local seconds="$1"
@@ -139,18 +148,42 @@ cache_update_with_lock() {
     local name="$1"
     local cmd="$2"
     
+    cache_debug_log "cache_update_with_lock: Starting update for '$name'"
+    
     local fd
-    fd=$(cache_lock_acquire "$name") || return 1
+    fd=$(cache_lock_acquire "$name") || {
+        cache_debug_log "cache_update_with_lock: Failed to acquire lock for '$name'"
+        return 1
+    }
     
     # Execute command and capture output
     local output
     if output=$($cmd 2>/dev/null); then
         if [[ -n "$output" ]]; then
             cache_write "$name" "$output"
+            cache_debug_log "cache_update_with_lock: Successfully updated '$name' (${#output} bytes)"
+        else
+            cache_debug_log "cache_update_with_lock: Command returned empty output for '$name'"
         fi
+    else
+        cache_debug_log "cache_update_with_lock: Command failed for '$name'"
     fi
     
     cache_lock_release "$fd"
+}
+
+cache_update_background() {
+    local name="$1"
+    local cmd="$2"
+    
+    # Spawn background process properly detached from parent
+    {
+        source "${WAYBAR_CACHE_LIB:-/home/groot/projects/scripts/lib/waybar-cache.sh}"
+        cache_update_with_lock "$name" "$cmd"
+        cache_debug_log "cache_update_background: Background update completed for '$name'"
+    } &>/dev/null &
+    
+    disown 2>/dev/null || true
 }
 
 # ===== Stale Indicator Functions =====
@@ -200,36 +233,59 @@ cache_serve() {
     local name="$1"
     local cmd="$2"
     local threshold="${3:-$CACHE_STALE_THRESHOLD}"
+    local default_output="${4:-}"
+    local script="${5:-}"
+    
+    cache_debug_log "cache_serve: Serving cache for '$name'"
     
     if [[ ! -f "${CACHE_DIR}/${name}.json" ]]; then
         # No cache exists, trigger background update
-        cache_update_with_lock "$name" "$cmd" &
-        return 1
+        cache_debug_log "cache_serve: No cache file found for '$name', triggering background update"
+        cache_update_background "$name" "$cmd" "$script"
+        
+        # Return default output if provided, otherwise fail
+        if [[ -n "$default_output" ]]; then
+            echo "$default_output"
+            return 0
+        else
+            return 1
+        fi
     fi
     
     local cached
     if ! cached=$(cache_read "$name"); then
         # Cache exists but is invalid
-        cache_update_with_lock "$name" "$cmd" &
-        return 1
+        cache_debug_log "cache_serve: Cache file invalid for '$name', triggering background update"
+        cache_update_background "$name" "$cmd" "$script"
+        
+        # Return default output if provided, otherwise fail
+        if [[ -n "$default_output" ]]; then
+            echo "$default_output"
+            return 0
+        else
+            return 1
+        fi
     fi
     
     # Check if cache is stale
     if cache_is_stale "${CACHE_DIR}/${name}.json" "$threshold"; then
         # Cache is stale, mark for background update
-        cache_update_with_lock "$name" "$cmd" &
+        cache_debug_log "cache_serve: Cache stale for '$name', triggering background update"
+        cache_update_background "$name" "$cmd" "$script"
         
-        # Add stale indicator to output
-        local age
-        age=$(cache_get_file_age "${CACHE_DIR}/${name}.json")
-        cache_add_stale_indicator "$cached" "$age"
+         # Add stale indicator to output and echo it
+         local age
+         age=$(cache_get_file_age "${CACHE_DIR}/${name}.json")
+         cache_add_stale_indicator "$cached" "$age"
     else
         # Cache is fresh
+        cache_debug_log "cache_serve: Serving fresh cache for '$name'"
         echo "$cached"
     fi
 }
 
 # Export functions
+export -f cache_debug_log
 export -f cache_get_age_string
 export -f cache_get_file_age
 export -f cache_is_stale
@@ -240,6 +296,7 @@ export -f cache_clear
 export -f cache_lock_acquire
 export -f cache_lock_release
 export -f cache_update_with_lock
+export -f cache_update_background
 export -f cache_add_stale_indicator
 export -f waybar_output
 export -f cache_serve

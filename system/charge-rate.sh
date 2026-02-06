@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: charge-rate.sh
-# Purpose: Utility: c arge rate
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Battery charge rate monitor
+# Dependencies: upower, awk
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

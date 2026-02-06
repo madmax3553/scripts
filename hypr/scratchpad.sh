@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: scratchpad.sh
-# Purpose: Utility:  cratc pad
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Quick scratchpad note window
+# Dependencies: nvim, hyprctl (optional)
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

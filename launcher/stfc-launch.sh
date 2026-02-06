@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: stfc-launch.sh
-# Purpose: Utility:  tfc launc
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Star Trek Fleet Command Wine launcher
+# Dependencies: wine, wineserver
+# Author: groot
 # Modified: 2026-01-24
 
 set -e

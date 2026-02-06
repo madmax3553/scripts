@@ -9,52 +9,10 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: wiki-review-todos
-# Purpose: Review outstanding TODOs from vimwiki
-# Dependencies: grep, find
-# Author: Custom
-# Modified: 2026-01-24
+# Purpose: Review outstanding TODOs from vimwiki (wrapper for journal.sh)
+# Dependencies: journal.sh
+# Author: groot
+# Modified: 2026-02-04
 
-set -euo pipefail
-
-JOURNAL_DIR="$HOME/journal"
-TODO_FILE="$JOURNAL_DIR/TODO.md"
-
-echo "=== Outstanding TODOs ==="
-echo ""
-
-# Check main TODO file
-if [ -f "$TODO_FILE" ]; then
-    echo "📋 Main TODO List:"
-    grep -E '^\s*[-*]\s*\[[ ○◐●]\]' "$TODO_FILE" | grep -v '\[✓\]' | grep -v '\[X\]' | sed 's/^/  /'
-    echo ""
-fi
-
-# Check diary entries for TODOs
-echo "📅 TODOs from Recent Diary Entries:"
-find "$JOURNAL_DIR/diary" -name "*.md" -type f -mtime -7 | sort -r | while read -r file; do
-    todos=$(grep -E '^\s*[-*]\s*\[[ ○◐●]\]' "$file" | grep -v '\[✓\]' | grep -v '\[X\]')
-    if [ -n "$todos" ]; then
-        date=$(basename "$file" .md)
-        echo "  [$date]"
-        echo "$todos" | sed 's/^/    /'
-        echo ""
-    fi
-done
-
-# Check notes for TODOs
-if [ -d "$JOURNAL_DIR/notes" ]; then
-    echo "📝 TODOs from Notes:"
-    find "$JOURNAL_DIR/notes" -name "*.md" -type f | while read -r file; do
-        todos=$(grep -E '^\s*[-*]\s*\[[ ○◐●]\]' "$file" | grep -v '\[✓\]' | grep -v '\[X\]')
-        if [ -n "$todos" ]; then
-            note=$(basename "$file" .md)
-            echo "  [$note]"
-            echo "$todos" | sed 's/^/    /'
-            echo ""
-        fi
-    done
-fi
-
-# Summary count
-total_incomplete=$(grep -rh -E '^\s*[-*]\s*\[[ ○◐●]\]' "$JOURNAL_DIR" --include="*.md" | grep -v '\[✓\]' | grep -v '\[X\]' | wc -l)
-echo "=== Summary: $total_incomplete incomplete TODOs ==="
+# This script is now a thin wrapper around journal.sh for backwards compatibility
+exec ~/bin/journal review "$@"

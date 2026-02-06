@@ -11,7 +11,7 @@
 # Script: cliphist-waybar.sh
 # Purpose: Waybar clipboard indicator with hover preview
 # Dependencies: cliphist, wl-clipboard, jq
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

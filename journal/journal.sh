@@ -11,7 +11,7 @@
 # Script: journal.sh
 # Purpose: Consolidated journal management with daily planning, TODO review, and window control
 # Dependencies: nvim, jq, hyprctl (optional), ghostty/kitty/alacritty (optional)
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail
@@ -278,6 +278,109 @@ cmd_plan() {
     log_success "Daily plan ready at $JOURNAL_FILE"
 }
 
+# ===== Diary Index Command =====
+
+cmd_index() {
+    log_info "Generating diary index..."
+    
+    local index_file="${DIARY_DIR}/index.md"
+    local current_month=""
+    local current_year=""
+    
+    {
+        echo "# Diary Index"
+        echo ""
+        echo "*Auto-generated: $(date '+%Y-%m-%d %H:%M')*"
+        echo ""
+        echo "[[../index|Back to Journal]]"
+        echo ""
+        
+        # List all diary entries grouped by month (only YYYY-MM-DD.md files)
+        find "${DIARY_DIR}" -maxdepth 1 -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md" -type f | sort -r | while read -r file; do
+            local filename
+            filename=$(basename "$file" .md)
+            
+            # Extract year and month
+            local year month day
+            year=$(echo "$filename" | cut -d'-' -f1)
+            month=$(echo "$filename" | cut -d'-' -f2)
+            day=$(echo "$filename" | cut -d'-' -f3)
+            
+            # Get month name
+            local month_name=""
+            case "$month" in
+                01) month_name="January" ;;
+                02) month_name="February" ;;
+                03) month_name="March" ;;
+                04) month_name="April" ;;
+                05) month_name="May" ;;
+                06) month_name="June" ;;
+                07) month_name="July" ;;
+                08) month_name="August" ;;
+                09) month_name="September" ;;
+                10) month_name="October" ;;
+                11) month_name="November" ;;
+                12) month_name="December" ;;
+                *) month_name="Unknown" ;;
+            esac
+            
+            # Print year header if changed
+            if [[ "$year" != "$current_year" ]]; then
+                current_year="$year"
+                current_month=""
+                echo ""
+                echo "## $year"
+            fi
+            
+            # Print month header if changed
+            if [[ "$month" != "$current_month" ]]; then
+                current_month="$month"
+                echo ""
+                echo "### $month_name"
+                echo ""
+            fi
+            
+            # Get weekday
+            local weekday
+            weekday=$(date -d "$filename" '+%A' 2>/dev/null || echo "")
+            
+            # Count TODOs
+            local todo_count done_count
+            todo_count=$(grep -c '^\s*[-*]\s*\[[ ○◐●]\]' "$file" 2>/dev/null || true)
+            done_count=$(grep -c '^\s*[-*]\s*\[✓X\]' "$file" 2>/dev/null || true)
+            [[ -z "$todo_count" ]] && todo_count=0
+            [[ -z "$done_count" ]] && done_count=0
+            
+            # Format entry
+            if [[ -n "$weekday" ]]; then
+                echo "- [[$filename]] - $weekday ($todo_count pending, $done_count done)"
+            else
+                echo "- [[$filename]]"
+            fi
+        done
+        
+        echo ""
+        echo "---"
+        echo ""
+        echo "## Statistics"
+        echo ""
+        local total_entries
+        total_entries=$(find "${DIARY_DIR}" -maxdepth 1 -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md" -type f | wc -l)
+        echo "- Total entries: $total_entries"
+        
+        local first_entry
+        first_entry=$(find "${DIARY_DIR}" -maxdepth 1 -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md" -type f | sort | head -1 | xargs basename 2>/dev/null | sed 's/.md$//' || echo "N/A")
+        echo "- First entry: $first_entry"
+        
+        local last_entry
+        last_entry=$(find "${DIARY_DIR}" -maxdepth 1 -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md" -type f | sort -r | head -1 | xargs basename 2>/dev/null | sed 's/.md$//' || echo "N/A")
+        echo "- Latest entry: $last_entry"
+        
+    } > "$index_file"
+    
+    log_success "Diary index generated at $index_file"
+}
+
 # ===== Review TODOs Command =====
 
 cmd_review() {
@@ -343,6 +446,283 @@ cmd_surface() {
     fi
 }
 
+# ===== Weekly Summary Command =====
+
+cmd_weekly() {
+    local week_start week_end
+    # Get Monday of current week
+    week_start=$(date -d "last monday" +%Y-%m-%d 2>/dev/null || date -d "monday" +%Y-%m-%d)
+    week_end=$(date -d "$week_start + 6 days" +%Y-%m-%d)
+    
+    local summary_file="${JOURNAL_DIR}/weekly-review-${week_start}.md"
+    
+    log_info "Generating weekly summary for $week_start to $week_end..."
+    
+    {
+        echo "# Weekly Review: $week_start to $week_end"
+        echo ""
+        echo "*Generated: $(date '+%Y-%m-%d %H:%M')*"
+        echo ""
+        
+        # === Journaling Stats ===
+        echo "## Journaling Stats"
+        echo ""
+        
+        local days_with_entries=0
+        local total_words=0
+        local entries_list=""
+        
+        for i in {0..6}; do
+            local check_date
+            check_date=$(date -d "$week_start + $i days" +%Y-%m-%d)
+            local check_file="${DIARY_DIR}/${check_date}.md"
+            
+            if [[ -f "$check_file" ]]; then
+                local word_count
+                word_count=$(wc -w < "$check_file" 2>/dev/null || echo 0)
+                # Only count if more than template (roughly 50 words)
+                if [[ "$word_count" -gt 50 ]]; then
+                    days_with_entries=$((days_with_entries + 1))
+                    total_words=$((total_words + word_count))
+                    local day_name
+                    day_name=$(date -d "$check_date" '+%A')
+                    entries_list="${entries_list}- [[$check_date]] - $day_name ($word_count words)\n"
+                fi
+            fi
+        done
+        
+        echo "- Days journaled: $days_with_entries / 7"
+        echo "- Total words written: $total_words"
+        if [[ $days_with_entries -gt 0 ]]; then
+            echo "- Average words/day: $((total_words / days_with_entries))"
+        fi
+        echo ""
+        
+        if [[ -n "$entries_list" ]]; then
+            echo "### Entries This Week"
+            echo ""
+            echo -e "$entries_list"
+        fi
+        
+        # === Completed Tasks ===
+        echo "## Completed Tasks"
+        echo ""
+        
+        local completed_count=0
+        for i in {0..6}; do
+            local check_date
+            check_date=$(date -d "$week_start + $i days" +%Y-%m-%d)
+            local check_file="${DIARY_DIR}/${check_date}.md"
+            
+            if [[ -f "$check_file" ]]; then
+                local completed
+                completed=$(grep -E '^\s*[-*]\s*\[✓X\]' "$check_file" 2>/dev/null || true)
+                if [[ -n "$completed" ]]; then
+                    echo "### $check_date"
+                    echo "$completed" | sed 's/^//'
+                    echo ""
+                    completed_count=$((completed_count + $(echo "$completed" | wc -l)))
+                fi
+            fi
+        done
+        
+        if [[ $completed_count -eq 0 ]]; then
+            echo "*No completed tasks this week*"
+            echo ""
+        else
+            echo "**Total completed: $completed_count tasks**"
+            echo ""
+        fi
+        
+        # === Carried Over Tasks ===
+        echo "## Carried Over Tasks (Need Attention)"
+        echo ""
+        
+        # Find tasks that appear in multiple days (rolled over)
+        declare -A task_counts
+        declare -A task_first_seen
+        
+        for i in {0..6}; do
+            local check_date
+            check_date=$(date -d "$week_start + $i days" +%Y-%m-%d)
+            local check_file="${DIARY_DIR}/${check_date}.md"
+            
+            if [[ -f "$check_file" ]]; then
+                while IFS= read -r task; do
+                    # Normalize task (remove checkbox, trim)
+                    local normalized
+                    normalized=$(echo "$task" | sed 's/^\s*[-*]\s*\[.\]\s*//' | xargs)
+                    if [[ -n "$normalized" ]]; then
+                        task_counts["$normalized"]=$((${task_counts["$normalized"]:-0} + 1))
+                        if [[ -z "${task_first_seen["$normalized"]:-}" ]]; then
+                            task_first_seen["$normalized"]="$check_date"
+                        fi
+                    fi
+                done < <(grep -E '^\s*[-*]\s*\[[ ○◐●]\]' "$check_file" 2>/dev/null || true)
+            fi
+        done
+        
+        local has_rollovers=0
+        for task in "${!task_counts[@]}"; do
+            if [[ ${task_counts["$task"]} -gt 1 ]]; then
+                has_rollovers=1
+                echo "- [ ] $task *(appeared ${task_counts["$task"]} times, since ${task_first_seen["$task"]})*"
+            fi
+        done
+        
+        if [[ $has_rollovers -eq 0 ]]; then
+            echo "*No tasks carried over multiple days - great job!*"
+        fi
+        echo ""
+        
+        # === Outstanding from TODO.md ===
+        echo "## Outstanding from Master TODO"
+        echo ""
+        
+        if [[ -f "${TODO_FILE}" ]]; then
+            local outstanding
+            outstanding=$(grep -E '^\s*[-*]\s*\[[ ○◐●]\]' "${TODO_FILE}" 2>/dev/null | grep -v '\[✓\]' | grep -v '\[X\]' || true)
+            if [[ -n "$outstanding" ]]; then
+                echo "$outstanding"
+            else
+                echo "*All clear!*"
+            fi
+        else
+            echo "*No TODO.md file found*"
+        fi
+        echo ""
+        
+        # === Next Week Planning ===
+        echo "## Next Week Planning"
+        echo ""
+        echo "### High Priority"
+        echo "- [ ] "
+        echo ""
+        echo "### Goals"
+        echo "- [ ] "
+        echo ""
+        echo "### Notes"
+        echo ""
+        echo ""
+        echo "---"
+        echo "[[index|Back to Journal]] | [[diary/index|Diary Index]]"
+        
+    } > "$summary_file"
+    
+    log_success "Weekly summary generated: $summary_file"
+    echo ""
+    echo "Opening weekly summary..."
+    nvim "$summary_file"
+}
+
+# ===== Cleanup Command =====
+
+cmd_cleanup() {
+    local dry_run=0
+    if [[ "${1:-}" == "--dry-run" ]] || [[ "${1:-}" == "-n" ]]; then
+        dry_run=1
+        log_info "Dry run mode - no files will be deleted"
+    fi
+    
+    log_info "Scanning for empty/unmodified diary entries..."
+    echo ""
+    
+    local empty_files=()
+    local template_only_files=()
+    
+    # Get template line count (approximate - templates are ~20-30 lines)
+    local template_threshold=35
+    local word_threshold=50
+    
+    while IFS= read -r file; do
+        local filename
+        filename=$(basename "$file" .md)
+        
+        # Skip today's file
+        if [[ "$filename" == "$TODAY" ]]; then
+            continue
+        fi
+        
+        local line_count word_count
+        line_count=$(wc -l < "$file" 2>/dev/null || echo 0)
+        word_count=$(wc -w < "$file" 2>/dev/null || echo 0)
+        
+        # Check if file is essentially empty or just template
+        if [[ $line_count -le 5 ]]; then
+            empty_files+=("$file")
+        elif [[ $word_count -le $word_threshold && $line_count -le $template_threshold ]]; then
+            # Check if content is mostly just template headers
+            local content_lines
+            content_lines=$(grep -cv '^#\|^$\|^\s*-\s*$\|^\[\[' "$file" 2>/dev/null || echo 0)
+            content_lines="${content_lines//[[:space:]]/}"
+            if [[ -z "$content_lines" ]]; then content_lines=0; fi
+            if [[ $content_lines -le 3 ]]; then
+                template_only_files+=("$file")
+            fi
+        fi
+    done < <(find "${DIARY_DIR}" -maxdepth 1 -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md" -type f | sort)
+    
+    # Report findings
+    if [[ ${#empty_files[@]} -eq 0 && ${#template_only_files[@]} -eq 0 ]]; then
+        log_success "No empty entries found - all diary entries have content!"
+        return 0
+    fi
+    
+    echo -e "${BOLD}Found entries to clean up:${RESET}"
+    echo ""
+    
+    if [[ ${#empty_files[@]} -gt 0 ]]; then
+        echo -e "${RED}Empty files (${#empty_files[@]}):${RESET}"
+        for f in "${empty_files[@]}"; do
+            echo "  - $(basename "$f" .md)"
+        done
+        echo ""
+    fi
+    
+    if [[ ${#template_only_files[@]} -gt 0 ]]; then
+        echo -e "${YELLOW}Template-only files (${#template_only_files[@]}):${RESET}"
+        for f in "${template_only_files[@]}"; do
+            local wc
+            wc=$(wc -w < "$f" 2>/dev/null || echo 0)
+            echo "  - $(basename "$f" .md) ($wc words)"
+        done
+        echo ""
+    fi
+    
+    if [[ $dry_run -eq 1 ]]; then
+        echo -e "${CYAN}Dry run complete. Run without --dry-run to delete these files.${RESET}"
+        return 0
+    fi
+    
+    # Confirm deletion
+    local total=$((${#empty_files[@]} + ${#template_only_files[@]}))
+    echo -e "${YELLOW}This will delete $total file(s).${RESET}"
+    read -p "Continue? (y/N): " confirm
+    
+    if [[ "${confirm,,}" != "y" && "${confirm,,}" != "yes" ]]; then
+        log_info "Cleanup cancelled."
+        return 0
+    fi
+    
+    # Delete files
+    local deleted=0
+    for f in "${empty_files[@]}" "${template_only_files[@]}"; do
+        if rm "$f" 2>/dev/null; then
+            deleted=$((deleted + 1))
+            echo "  Deleted: $(basename "$f")"
+        else
+            log_error "Failed to delete: $f"
+        fi
+    done
+    
+    log_success "Cleaned up $deleted file(s)"
+    
+    # Regenerate index
+    echo ""
+    log_info "Regenerating diary index..."
+    cmd_index
+}
+
 # ===== Menu Command =====
 
 cmd_menu() {
@@ -398,6 +778,9 @@ ${BOLD}Commands:${RESET}
     ${CYAN}surface${RESET}     - Focus existing journal or open if not found
     ${CYAN}plan${RESET}        - Generate today's daily plan
     ${CYAN}review${RESET}      - Review outstanding TODOs
+    ${CYAN}index${RESET}       - Generate diary index
+    ${CYAN}weekly${RESET}      - Generate weekly summary (stats, completed tasks, etc.)
+    ${CYAN}cleanup${RESET}     - Remove empty/template-only diary entries
     ${CYAN}menu${RESET}        - Show interactive menu
     ${CYAN}help${RESET}        - Show this help message
 
@@ -406,6 +789,10 @@ ${BOLD}Examples:${RESET}
     journal.sh surface       # Focus existing or open
     journal.sh plan          # Generate daily plan
     journal.sh review        # Show outstanding TODOs
+    journal.sh index         # Regenerate diary index
+    journal.sh weekly        # Generate and open weekly summary
+    journal.sh cleanup --dry-run  # Preview cleanup (no deletion)
+    journal.sh cleanup       # Remove empty entries (with confirmation)
     journal.sh menu          # Interactive menu
 
 ${BOLD}Configuration:${RESET}
@@ -433,6 +820,16 @@ main() {
             ;;
         review)
             cmd_review
+            ;;
+        index)
+            cmd_index
+            ;;
+        weekly)
+            cmd_weekly
+            ;;
+        cleanup)
+            shift
+            cmd_cleanup "$@"
             ;;
         menu)
             cmd_menu

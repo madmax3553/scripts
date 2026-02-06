@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: monitor_setup.sh
-# Purpose: Utility: monitor  etup
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: X11 monitor configuration
+# Dependencies: xrandr
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

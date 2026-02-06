@@ -11,7 +11,7 @@
 # Script: txtcliphist
 # Purpose: Clipboard history actions with cliphist
 # Dependencies: cliphist, wl-clipboard, tofi
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

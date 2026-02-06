@@ -11,7 +11,7 @@
 # Script: yay-waybar.sh
 # Purpose: Waybar yay updates indicator with caching
 # Dependencies: yay, jq, flock, kitty, tofi (optional)
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

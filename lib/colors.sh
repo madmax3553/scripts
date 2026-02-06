@@ -10,8 +10,8 @@
 #      ░    ░         ░ ░      ░ ░           
 # Script: colors.sh
 # Purpose: Central location for all ANSI color codes and styles
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Dependencies: none
+# Author: groot
 # Modified: 2026-01-24
 
 # lib/colors.sh - Standardized color and style definitions

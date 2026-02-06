@@ -11,7 +11,7 @@
 # Script: cliphist-watch.sh
 # Purpose: Start clipboard history watchers
 # Dependencies: wl-clipboard, cliphist
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

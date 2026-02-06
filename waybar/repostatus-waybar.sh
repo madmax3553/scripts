@@ -8,11 +8,11 @@
 #  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
-# Script: waybar-repostatus.sh
+# Script: repostatus-waybar.sh
 # Purpose: Waybar repo status indicator with caching
 # Dependencies: jq, repostatus, flock
-# Author: Custom
-# Modified: 2026-01-24
+# Author: groot
+# Modified: 2026-01-25
 
 set -euo pipefail
 
@@ -24,7 +24,7 @@ STALE_THRESHOLD="${WAYBAR_STALE_THRESHOLD:-300}"
 DEFAULT_OUTPUT=$(waybar_output "⏳ Loading..." "Scanning repositories..." "loading")
 
 if ! command -v repostatus >/dev/null 2>&1; then
-    waybar_output "repo" "repostatus not found" "error"
+    waybar_output "Err!" "$PATH" "$USER"
     exit 0
 fi
 
@@ -73,5 +73,6 @@ generate_output() {
     printf '{"text": "%s", "class": "%s", "tooltip": "%s"}\n' "$text" "$overall_status" "$tooltip"
 }
 
-output=$(cache_serve "$CACHE_NAME" generate_output "$STALE_THRESHOLD") || output="$DEFAULT_OUTPUT"
+# Try to serve from cache, show default on first boot
+output=$(cache_serve "$CACHE_NAME" generate_output "$STALE_THRESHOLD" "$DEFAULT_OUTPUT") || output="$DEFAULT_OUTPUT"
 echo "$output"

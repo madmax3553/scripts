@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: remote
-# Purpose: Utility: remote
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Remote server connection manager
+# Dependencies: ssh, dialog or whiptail
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

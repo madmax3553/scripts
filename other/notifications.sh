@@ -11,7 +11,7 @@
 # Script: notifications.sh
 # Purpose: Waybar notification indicator (mako)
 # Dependencies: makoctl
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

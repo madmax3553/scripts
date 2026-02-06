@@ -10,8 +10,8 @@
 #      ░    ░         ░ ░      ░ ░           
 # Script: common.sh
 # Purpose: Shared functionality across scripts
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Dependencies: colors.sh
+# Author: groot
 # Modified: 2026-01-24
 
 # lib/common.sh - Common utilities for error handling, logging, and functions

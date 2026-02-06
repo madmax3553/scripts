@@ -11,7 +11,7 @@
 # Script: wallpaper.sh
 # Purpose: Wallpaper rotation using swww
 # Dependencies: swww
-# Author: Custom
+# Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail

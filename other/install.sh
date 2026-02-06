@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: install.sh
-# Purpose: Utility: in tall
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Tuigreet neon theme installer
+# Dependencies: greetd, tuigreet
+# Author: groot
 # Modified: 2026-01-24
 
 set -e
