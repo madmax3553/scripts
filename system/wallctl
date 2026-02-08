@@ -1,0 +1,2157 @@
+#!/usr/bin/env bash
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
+#      ░    ░         ░ ░      ░ ░
+# Script: wallctl
+# Purpose: Wallpaper fetch, triage, and status manager
+# Dependencies: bash, curl, jq, identify, chafa, sha256sum, mpv, mpvpaper
+# Author: groot
+# Modified: 2026-02-07
+
+set -euo pipefail
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared libraries
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/colors.sh"
+
+# Override common.sh LOG_FILE before sourcing to keep wallctl's own log
+export LOG_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/wall-tools"
+export LOG_FILE="$LOG_DIR/wallctl.log"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/common.sh"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Paths and defaults
+# ─────────────────────────────────────────────────────────────────────────────
+
+SCRIPT_NAME=$(basename "$0")
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/wall-tools"
+CONFIG_FILE="$CONFIG_DIR/config.sh"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wall-tools"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/wall-tools"
+TRASH_DIR="$CACHE_DIR/trash"
+LOCK_FILE="$STATE_DIR/screensaver.lock"
+SCREENSAVER_LIST_FILE="$STATE_DIR/screensaver.list"
+SEEN_HASH_LOG="$STATE_DIR/seen_hashes.tsv"
+
+STEP=0
+TOTAL_STEPS=1
+IN_MENU=0
+CLEAR_ON_EXIT=1
+NO_PAUSE=0
+
+# Undo stack for triage (parallel arrays)
+UNDO_ACTIONS=()
+UNDO_SRC_PATHS=()
+UNDO_DST_PATHS=()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config defaults
+# ─────────────────────────────────────────────────────────────────────────────
+
+WALLPAPER_DIR_BASE="$HOME/wallpapers"
+WALLPAPER_DIR_CURRENT="$WALLPAPER_DIR_BASE/current"
+WALLPAPER_DIR_NEW="$WALLPAPER_DIR_BASE/new"
+WALLPAPER_DIR_OLD="$WALLPAPER_DIR_BASE/old"
+MIN_WIDTH=1920
+MIN_HEIGHT=1080
+LANDSCAPE_ONLY=1
+MAX_CURRENT_WARN=100
+FETCH_LIMIT=30
+FETCH_TIMEOUT=20
+LIVE_RATIO=50
+HASH_RETENTION_DAYS=60
+ARCHIVE_AGE_DAYS=60
+ARCHIVE_BATCH=10
+SCREENSAVER_INTERVAL=30
+SCREENSAVER_MODE="overlay"
+ROTATION_POOL="current"
+SCREENSAVER_POOL="current+old"
+REVIEW_POOL="new"
+WALLCTL_VIEWER=""
+USER_AGENT="wallctl/1.0 (groot@localhost)"
+KEYWORDS=(retro cyberpunk anime synthwave vaporwave lofi neon city-night)
+REDDIT_SUBS=(wallpapers Animewallpaper cyberpunk vaporwave ImaginaryLandscapes)
+GITHUB_SOURCES=(adi1090x/wallpapers:. D3Ext/aesthetic-wallpapers:. sindresorhus/wallpapers:.)
+WALLHAVEN_SORT="toplist"
+WALLHAVEN_PURITY="100"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Wallctl-specific output helpers (not in common.sh)
+# ─────────────────────────────────────────────────────────────────────────────
+
+cleanup() {
+    local code=$?
+    printf '\033[?25h' >&2
+    if [[ $code -eq 0 && -t 1 && $CLEAR_ON_EXIT -eq 1 ]]; then
+        clear
+    fi
+}
+
+trap cleanup EXIT INT TERM
+
+log() {
+    mkdir -p "$CACHE_DIR"
+    printf "[%s] %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
+}
+
+print_step() {
+    STEP=$((STEP + 1))
+    printf "${BOLD}${MAGENTA}[%d/%d]${RESET} %s\n" "$STEP" "$TOTAL_STEPS" "$1"
+}
+
+SPINNER_STATE=0
+spinner_tick() {
+    [[ -t 1 ]] || return 0
+    local msg="$1"
+    local frames='|/-\\'
+    local ch="${frames:SPINNER_STATE:1}"
+    SPINNER_STATE=$(( (SPINNER_STATE + 1) % 4 ))
+    printf "\r${CYAN}[%s]${RESET} %s" "$ch" "$msg"
+}
+
+spinner_clear() {
+    [[ -t 1 ]] || return 0
+    printf "\r\033[K\033[?25h"
+}
+
+print_groot_logo() {
+    printf "${RED}  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓${RESET}\n"
+    printf "${LIGHT_RED} ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒${RESET}\n"
+    printf "${YELLOW}▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░${RESET}\n"
+    printf "${LIGHT_GREEN}░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ ${RESET}\n"
+    printf "${GREEN}░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ ${RESET}\n"
+    printf "${LIGHT_CYAN} ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   ${RESET}\n"
+    printf "${CYAN}  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    ${RESET}\n"
+    printf "${LIGHT_BLUE}░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      ${RESET}\n"
+    printf "${LIGHT_MAGENTA}      ░    ░         ░ ░      ░ ░            ${RESET}\n"
+}
+
+maybe_pause() {
+    if [[ "$NO_PAUSE" -eq 1 ]]; then
+        return 0
+    fi
+    if [[ "$IN_MENU" -eq 1 ]]; then
+        return 0
+    fi
+    if [[ -t 0 && -t 1 ]]; then
+        printf "\n${BOLD}${CYAN}Press Enter to continue...${RESET}"
+        read -r _ || true
+    fi
+}
+
+require_tty() {
+    local action="$1"
+    if [[ ! -t 0 || ! -t 1 ]]; then
+        die "$action requires an interactive terminal (try: ghostty -e wallctl $action)"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Config management
+# ─────────────────────────────────────────────────────────────────────────────
+
+write_config() {
+    local keywords_csv reddit_csv github_csv
+    keywords_csv=$(IFS=,; printf '%s' "${KEYWORDS[*]}")
+    reddit_csv=$(IFS=,; printf '%s' "${REDDIT_SUBS[*]}")
+    github_csv=$(IFS=,; printf '%s' "${GITHUB_SOURCES[*]}")
+    cat > "$CONFIG_FILE" <<EOF
+# wallctl dynamic configuration
+WALLPAPER_DIR_BASE="$WALLPAPER_DIR_BASE"
+WALLPAPER_DIR_CURRENT="$WALLPAPER_DIR_CURRENT"
+WALLPAPER_DIR_NEW="$WALLPAPER_DIR_NEW"
+WALLPAPER_DIR_OLD="$WALLPAPER_DIR_OLD"
+MIN_WIDTH=$MIN_WIDTH
+MIN_HEIGHT=$MIN_HEIGHT
+LANDSCAPE_ONLY=$LANDSCAPE_ONLY
+MAX_CURRENT_WARN=$MAX_CURRENT_WARN
+FETCH_LIMIT=$FETCH_LIMIT
+FETCH_TIMEOUT=$FETCH_TIMEOUT
+LIVE_RATIO=$LIVE_RATIO
+HASH_RETENTION_DAYS=$HASH_RETENTION_DAYS
+ARCHIVE_AGE_DAYS=$ARCHIVE_AGE_DAYS
+ARCHIVE_BATCH=$ARCHIVE_BATCH
+SCREENSAVER_INTERVAL=$SCREENSAVER_INTERVAL
+SCREENSAVER_MODE="$SCREENSAVER_MODE"
+ROTATION_POOL="$ROTATION_POOL"
+SCREENSAVER_POOL="$SCREENSAVER_POOL"
+REVIEW_POOL="$REVIEW_POOL"
+WALLCTL_VIEWER="$WALLCTL_VIEWER"
+USER_AGENT="$USER_AGENT"
+KEYWORDS=(${keywords_csv//,/ })
+REDDIT_SUBS=(${reddit_csv//,/ })
+GITHUB_SOURCES=(${github_csv//,/ })
+WALLHAVEN_SORT="$WALLHAVEN_SORT"
+WALLHAVEN_PURITY="$WALLHAVEN_PURITY"
+EOF
+}
+
+screensaver_is_running() {
+    if [[ ! -f "$LOCK_FILE" ]]; then
+        return 1
+    fi
+    local pid
+    pid=$(awk -F: '{print $1}' "$LOCK_FILE" 2>/dev/null || true)
+    if [[ -z "$pid" ]]; then
+        rm -f "$LOCK_FILE"
+        return 1
+    fi
+    if kill -0 "$pid" 2>/dev/null; then
+        return 0
+    fi
+    # Stale PID -- clean up
+    rm -f "$LOCK_FILE"
+    return 1
+}
+
+screensaver_lock_type() {
+    [[ -f "$LOCK_FILE" ]] || return 1
+    awk -F: '{print $2}' "$LOCK_FILE" 2>/dev/null || printf 'unknown\n'
+}
+
+resolve_viewer() {
+    if [[ -n "$WALLCTL_VIEWER" ]] && command -v "$WALLCTL_VIEWER" >/dev/null 2>&1; then
+        printf '%s\n' "$WALLCTL_VIEWER"
+        return 0
+    fi
+    local candidate
+    for candidate in nomacs nsxiv imv sxiv feh pqiv xdg-open; do
+        if command -v "$candidate" >/dev/null 2>&1; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+thumbnail_pick_index() {
+    local current_idx="$1"
+    shift
+    local picked
+    picked=$(nsxiv -t -n "$current_idx" -o "$@" 2>/dev/null | head -n1 || true)
+    [[ -n "$picked" ]] || return 1
+
+    local i=1 f
+    for f in "$@"; do
+        if [[ "$f" == "$picked" ]]; then
+            printf '%s\n' "$i"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    return 1
+}
+
+open_image_viewer() {
+    local file="$1"
+    local viewer
+    viewer=$(resolve_viewer) || {
+        print_warn "no viewer found (install nsxiv/imv or set WALLCTL_VIEWER)"
+        sleep 1
+        return 1
+    }
+
+    spinner_clear
+    printf '\033[?25h'
+    case "$viewer" in
+        xdg-open)
+            xdg-open "$file" >/dev/null 2>&1 &
+            print_info "opened in default app: $(basename "$file")"
+            sleep 1
+            ;;
+        *)
+            "$viewer" "$file"
+            ;;
+    esac
+    return 0
+}
+
+ensure_layout() {
+    mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR" "$TRASH_DIR" \
+             "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD"
+    touch "$SEEN_HASH_LOG"
+}
+
+create_default_config() {
+    [[ -f "$CONFIG_FILE" ]] && return 0
+    cat > "$CONFIG_FILE" <<'EOF'
+# wallctl dynamic configuration
+WALLPAPER_DIR_BASE="$HOME/wallpapers"
+WALLPAPER_DIR_CURRENT="$WALLPAPER_DIR_BASE/current"
+WALLPAPER_DIR_NEW="$WALLPAPER_DIR_BASE/new"
+WALLPAPER_DIR_OLD="$WALLPAPER_DIR_BASE/old"
+MIN_WIDTH=1920
+MIN_HEIGHT=1080
+LANDSCAPE_ONLY=1
+MAX_CURRENT_WARN=100
+FETCH_LIMIT=30
+FETCH_TIMEOUT=20
+LIVE_RATIO=50
+HASH_RETENTION_DAYS=60
+ARCHIVE_AGE_DAYS=60
+ARCHIVE_BATCH=10
+SCREENSAVER_INTERVAL=30
+SCREENSAVER_MODE="overlay"
+ROTATION_POOL="current"
+SCREENSAVER_POOL="current+old"
+REVIEW_POOL="new"
+WALLCTL_VIEWER=""
+USER_AGENT="wallctl/1.0 (groot@localhost)"
+KEYWORDS=(retro cyberpunk anime synthwave vaporwave lofi neon city-night)
+REDDIT_SUBS=(wallpapers Animewallpaper cyberpunk vaporwave ImaginaryLandscapes)
+GITHUB_SOURCES=(adi1090x/wallpapers:. D3Ext/aesthetic-wallpapers:. sindresorhus/wallpapers:.)
+WALLHAVEN_SORT="toplist"
+WALLHAVEN_PURITY="100"
+EOF
+}
+
+load_config() {
+    ensure_layout
+    create_default_config
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    : "${WALLPAPER_DIR_OLD:=$WALLPAPER_DIR_BASE/old}"
+    : "${ROTATION_POOL:=current}"
+    : "${SCREENSAVER_POOL:=current+old}"
+    : "${REVIEW_POOL:=new}"
+    : "${WALLCTL_VIEWER:=}"
+    : "${LIVE_RATIO:=50}"
+    : "${HASH_RETENTION_DAYS:=60}"
+    : "${ARCHIVE_AGE_DAYS:=60}"
+    : "${ARCHIVE_BATCH:=10}"
+    : "${SCREENSAVER_MODE:=overlay}"
+    if ! declare -p GITHUB_SOURCES >/dev/null 2>&1 || (( ${#GITHUB_SOURCES[@]} == 0 )); then
+        GITHUB_SOURCES=(adi1090x/wallpapers:. D3Ext/aesthetic-wallpapers:. sindresorhus/wallpapers:.)
+    fi
+    : "${LANDSCAPE_ONLY:=1}"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Media helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+count_media() {
+    local dir="$1"
+    find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.png' \
+         -o -iname '*.webp' -o -iname '*.gif' -o -iname '*.mp4' -o -iname '*.webm' \) 2>/dev/null | wc -l
+}
+
+valid_ext() {
+    [[ "$1" =~ \.(jpg|jpeg|png|webp|gif|mp4|webm)$ ]]
+}
+
+is_live_url() {
+    local lower
+    lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    [[ "$lower" =~ \.(gif|gifv|mp4|webm)(\?.*)?$ ]]
+}
+
+is_live_file() {
+    local lower
+    lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    [[ "$lower" =~ \.(gif|mp4|webm)$ ]]
+}
+
+list_pool_dirs() {
+    local pool="$1"
+    case "$pool" in
+        current)
+            printf '%s\n' "$WALLPAPER_DIR_CURRENT"
+            ;;
+        new)
+            printf '%s\n' "$WALLPAPER_DIR_NEW"
+            ;;
+        current+new|new+current)
+            printf '%s\n' "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW"
+            ;;
+        current+old|old+current)
+            printf '%s\n' "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_OLD"
+            ;;
+        new+old|old+new)
+            printf '%s\n' "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD"
+            ;;
+        current+new+old|current+old+new|new+current+old|new+old+current|old+current+new|old+new+current)
+            printf '%s\n' "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD"
+            ;;
+        old)
+            printf '%s\n' "$WALLPAPER_DIR_OLD"
+            ;;
+        *)
+            printf '%s\n' "$WALLPAPER_DIR_CURRENT"
+            ;;
+    esac
+}
+
+pool_dir() {
+    case "$1" in
+        new) printf '%s\n' "$WALLPAPER_DIR_NEW" ;;
+        current) printf '%s\n' "$WALLPAPER_DIR_CURRENT" ;;
+        old) printf '%s\n' "$WALLPAPER_DIR_OLD" ;;
+        *) return 1 ;;
+    esac
+}
+
+get_dimensions() {
+    local file="$1"
+    local dims
+    dims=$(identify -ping -format '%w %h' "$file" 2>/dev/null || true)
+    if [[ "$dims" =~ ^[0-9]+[[:space:]][0-9]+$ ]]; then
+        printf '%s\n' "$dims"
+    else
+        printf '0 0\n'
+    fi
+}
+
+get_video_dimensions() {
+    local file="$1"
+    local dims
+    if ! command -v ffprobe >/dev/null 2>&1; then
+        printf '0 0\n'
+        return 0
+    fi
+    dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height \
+           -of csv=s=x:p=0 "$file" 2>/dev/null || true)
+    if [[ "$dims" =~ ^[0-9]+x[0-9]+$ ]]; then
+        printf '%s\n' "${dims/x/ }"
+    else
+        printf '0 0\n'
+    fi
+}
+
+get_media_dimensions() {
+    local file="$1"
+    if is_live_file "$file"; then
+        get_video_dimensions "$file"
+    else
+        get_dimensions "$file"
+    fi
+}
+
+is_selectable_wallpaper() {
+    local file="$1"
+    local w h
+    read -r w h <<< "$(get_media_dimensions "$file")"
+    (( w >= MIN_WIDTH && h >= MIN_HEIGHT )) || return 1
+    if (( LANDSCAPE_ONLY == 1 )); then
+        (( w >= h )) || return 1
+    fi
+    return 0
+}
+
+pick_random_wallpaper() {
+    local pool="$1"
+    local dir file
+    local candidates=()
+
+    while IFS= read -r dir; do
+        [[ -d "$dir" ]] || continue
+        while IFS= read -r -d '' file; do
+            if is_selectable_wallpaper "$file"; then
+                candidates+=("$file")
+            fi
+        done < <(find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \
+                      -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
+                      -o -iname '*.mp4' -o -iname '*.webm' \) -print0)
+    done < <(list_pool_dirs "$pool")
+
+    if (( ${#candidates[@]} == 0 )); then
+        return 1
+    fi
+    printf '%s\n' "${candidates[$RANDOM % ${#candidates[@]}]}"
+}
+
+warn_if_over_limit() {
+    local count
+    count=$(count_media "$WALLPAPER_DIR_CURRENT")
+    if (( count > MAX_CURRENT_WARN )); then
+        print_warn "current has $count wallpapers (limit warning: $MAX_CURRENT_WARN)"
+    fi
+}
+
+duplicate_count() {
+    python3 - "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD" <<'PY'
+import hashlib, sys
+from pathlib import Path
+dirs=[Path(p) for p in sys.argv[1:]]
+hashes={}
+dups=0
+for d in dirs:
+    if not d.exists():
+        continue
+    for f in d.iterdir():
+        if not f.is_file():
+            continue
+        h=hashlib.sha256(f.read_bytes()).hexdigest()
+        if h in hashes:
+            dups+=1
+        else:
+            hashes[h]=f
+print(dups)
+PY
+}
+
+duplicate_report() {
+    local dups
+    dups=$(duplicate_count)
+    if (( dups > 0 )); then
+        print_warn "detected $dups duplicate file(s) across current/new/old"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Hash tracking
+# ─────────────────────────────────────────────────────────────────────────────
+
+purge_seen_hash_log() {
+    [[ -f "$SEEN_HASH_LOG" ]] || return 0
+    python3 - "$SEEN_HASH_LOG" "$HASH_RETENTION_DAYS" <<'PY'
+import time, sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+days = int(sys.argv[2])
+cutoff = int(time.time()) - (days * 86400)
+
+rows = []
+for line in path.read_text(errors='ignore').splitlines():
+    parts = line.split('\t', 2)
+    if len(parts) < 2:
+        continue
+    try:
+        ts = int(parts[0])
+    except ValueError:
+        continue
+    if ts >= cutoff:
+        rows.append((ts, parts[1], parts[2] if len(parts) > 2 else ''))
+
+latest = {}
+for ts, h, src in rows:
+    prev = latest.get(h)
+    if prev is None or ts > prev[0]:
+        latest[h] = (ts, src)
+
+out = sorted(((ts, h, src) for h, (ts, src) in latest.items()), key=lambda x: x[0])
+with path.open('w') as f:
+    for ts, h, src in out:
+        f.write(f"{ts}\t{h}\t{src}\n")
+PY
+}
+
+hash_seen_recent() {
+    local hash="$1"
+    [[ -f "$SEEN_HASH_LOG" ]] || return 1
+    awk -F '\t' -v h="$hash" '$2 == h { found=1; exit } END { exit(found ? 0 : 1) }' "$SEEN_HASH_LOG"
+}
+
+record_seen_hash() {
+    local hash="$1"
+    local src="$2"
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$hash" "$src" >> "$SEEN_HASH_LOG"
+}
+
+build_hash_cache() {
+    : > "$STATE_DIR/hashes.txt"
+    find "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD" \
+         -maxdepth 1 -type f -print0 2>/dev/null | while IFS= read -r -d '' file; do
+        sha256sum "$file"
+    done >> "$STATE_DIR/hashes.txt" || true
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Download engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+download_image() {
+    local url="$1"
+    local base name out w h hash
+    base=$(basename "${url%%\?*}")
+    if [[ "$base" == *.gifv ]]; then
+        url="${url%.gifv}.mp4"
+        base="${base%.gifv}.mp4"
+    fi
+    [[ -z "$base" ]] && return 1
+    name=$(printf '%s' "$base" | tr -cd '[:alnum:]._-')
+    valid_ext "${name,,}" || return 1
+    out="$WALLPAPER_DIR_NEW/$name"
+
+    if [[ -f "$out" ]]; then
+        return 1
+    fi
+    if ! curl -L --fail --max-time "$FETCH_TIMEOUT" -A "$USER_AGENT" -sS "$url" -o "$out"; then
+        rm -f "$out"
+        return 1
+    fi
+
+    read -r w h <<< "$(get_media_dimensions "$out")"
+    if (( w < MIN_WIDTH || h < MIN_HEIGHT )); then
+        rm -f "$out"
+        return 1
+    fi
+    if (( LANDSCAPE_ONLY == 1 && h > w )); then
+        rm -f "$out"
+        return 1
+    fi
+
+    hash=$(sha256sum "$out" | awk '{print $1}')
+    if grep -q "^$hash " "$STATE_DIR/hashes.txt" 2>/dev/null; then
+        print_warn "duplicate skipped: $name"
+        rm -f "$out"
+        return 1
+    fi
+    if hash_seen_recent "$hash"; then
+        print_warn "seen recently skipped: $name"
+        rm -f "$out"
+        return 1
+    fi
+    printf '%s %s\n' "$hash" "$out" >> "$STATE_DIR/hashes.txt"
+    record_seen_hash "$hash" "$url"
+    return 0
+}
+
+github_urls_for_source() {
+    local source="$1"
+    local repo path_ref path ref api
+
+    [[ "$source" == *:* ]] || return 0
+    repo="${source%%:*}"
+    path_ref="${source#*:}"
+    path="$path_ref"
+    ref=""
+
+    if [[ "$path_ref" == *"@"* ]]; then
+        path="${path_ref%@*}"
+        ref="${path_ref##*@}"
+    fi
+
+    api="https://api.github.com/repos/${repo}/contents/${path}"
+    if [[ -n "$ref" ]]; then
+        api="${api}?ref=${ref}"
+    fi
+
+    curl -A "$USER_AGENT" -sS "$api" | jq -r \
+        'if type=="array" then .[] | select(.type=="file") | .download_url // empty else empty end'
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Trash management
+# ─────────────────────────────────────────────────────────────────────────────
+
+purge_trash() {
+    if [[ -d "$TRASH_DIR" ]]; then
+        local count
+        count=$(find "$TRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+        rm -rf "${TRASH_DIR:?}"/*
+        if (( count > 0 )); then
+            print_info "purged $count file(s) from trash"
+        fi
+    fi
+}
+
+cmd_trash() {
+    load_config
+    local action="${1:-list}"
+    case "$action" in
+        --list|list)
+            clear
+            print_groot_logo
+            print_header "trash"
+            if [[ -d "$TRASH_DIR" ]]; then
+                local count
+                count=$(find "$TRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+                print_info "$count file(s) in trash"
+                find "$TRASH_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort
+            else
+                print_info "trash is empty"
+            fi
+            ;;
+        --purge|purge)
+            clear
+            print_groot_logo
+            print_header "trash"
+            purge_trash
+            ;;
+        *)
+            die "Usage: $SCRIPT_NAME trash [--list|--purge]"
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard renderer (shared by menu + status)
+# ─────────────────────────────────────────────────────────────────────────────
+
+render_dashboard() {
+    local new_count current_count old_count trash_count dups saver_state
+
+    new_count=$(count_media "$WALLPAPER_DIR_NEW")
+    current_count=$(count_media "$WALLPAPER_DIR_CURRENT")
+    old_count=$(count_media "$WALLPAPER_DIR_OLD")
+    trash_count=$(find "$TRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+    dups=$(duplicate_count)
+
+    if screensaver_is_running; then
+        saver_state="on"
+    else
+        saver_state="off"
+    fi
+
+    printf "\n"
+    printf "  ${BOLD}%-20s${RESET} %-6s" "inbox (new)" "$new_count"
+    if (( new_count > 0 )); then
+        printf "  ${DIM}unreviewed downloads${RESET}"
+    fi
+    printf "\n"
+
+    printf "  ${BOLD}%-20s${RESET} %-6s" "active (current)" "$current_count"
+    if (( current_count > MAX_CURRENT_WARN )); then
+        printf "  ${YELLOW}over limit (%s)${RESET}" "$MAX_CURRENT_WARN"
+    fi
+    printf "\n"
+
+    printf "  ${BOLD}%-20s${RESET} %-6s\n" "archive (old)" "$old_count"
+
+    if (( dups > 0 )); then
+        printf "  ${BOLD}%-20s${RESET} %-6s  ${YELLOW}run dedupe${RESET}\n" "duplicates" "$dups"
+    fi
+
+    if (( trash_count > 0 )); then
+        printf "  ${DIM}%-20s %-6s${RESET}\n" "trash" "$trash_count"
+    fi
+
+    printf "\n"
+    printf "  ${BOLD}%-20s${RESET} %-6s  %s, %ss, pool: %s\n" \
+           "screensaver" "$saver_state" "$SCREENSAVER_MODE" "$SCREENSAVER_INTERVAL" "$SCREENSAVER_POOL"
+    printf "  ${BOLD}%-20s${RESET} %-6s  pool: %s\n" \
+           "rotation" "on" "$ROTATION_POOL"
+    printf "\n"
+
+    # Return values for suggested action
+    DASH_NEW_COUNT="$new_count"
+    DASH_CURRENT_COUNT="$current_count"
+    DASH_DUPS="$dups"
+}
+
+suggest_action() {
+    local suggestion=""
+    if (( DASH_NEW_COUNT > 0 )); then
+        suggestion="review $DASH_NEW_COUNT inbox wallpapers"
+    elif (( DASH_DUPS > 0 )); then
+        suggestion="run dedupe to clean $DASH_DUPS duplicate(s)"
+    elif (( DASH_CURRENT_COUNT > MAX_CURRENT_WARN )); then
+        suggestion="archive: current ($DASH_CURRENT_COUNT) is over limit ($MAX_CURRENT_WARN)"
+    elif (( DASH_NEW_COUNT == 0 )); then
+        suggestion="download new wallpapers"
+    fi
+
+    if [[ -n "$suggestion" ]]; then
+        printf "  ${CYAN}-> suggested: %s${RESET}\n\n" "$suggestion"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_fetch
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_fetch() {
+    local limit="$FETCH_LIMIT"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --limit)
+                [[ $# -ge 2 ]] || die "--limit requires a numeric value"
+                [[ "$2" =~ ^[0-9]+$ ]] || die "--limit must be numeric"
+                limit="$2"
+                shift 2
+                ;;
+            *) die "Unknown fetch flag: $1" ;;
+        esac
+    done
+
+    require_commands curl jq identify sha256sum
+    load_config
+    clear
+    print_groot_logo
+    print_header "download wallpapers"
+    if (( ${#GITHUB_SOURCES[@]} > 0 )); then
+        TOTAL_STEPS=6
+    else
+        TOTAL_STEPS=5
+    fi
+    STEP=0
+    print_step "prepare directories and duplicate hash cache"
+    purge_seen_hash_log
+    purge_trash
+    build_hash_cache
+
+    local imported=0 imported_live=0 imported_static=0 processed=0
+    local url
+    local target="$limit"
+    local target_live target_static
+    local wallhaven_batch reddit_batch
+
+    target_live=$(( target * LIVE_RATIO / 100 ))
+    target_static=$(( target - target_live ))
+
+    if (( target > 0 && target_live == 0 && LIVE_RATIO > 0 )); then
+        target_live=1
+        target_static=$(( target - 1 ))
+    fi
+
+    if (( target_live > target )); then
+        target_live=$target
+        target_static=0
+    fi
+
+    print_step "fetch wallhaven themed wallpapers"
+    local q urls
+    wallhaven_batch=$(( limit * 3 ))
+    (( wallhaven_batch < 15 )) && wallhaven_batch=15
+    for q in "${KEYWORDS[@]}"; do
+        (( imported >= target )) && break
+        spinner_tick "wallhaven: $q ($imported/$target)"
+        urls=$(curl -A "$USER_AGENT" -sS \
+            "https://wallhaven.cc/api/v1/search?q=${q}&categories=111&purity=${WALLHAVEN_PURITY}&sorting=${WALLHAVEN_SORT}&atleast=${MIN_WIDTH}x${MIN_HEIGHT}" \
+            | jq -r '.data[].path' | head -n "$wallhaven_batch")
+        while IFS= read -r url; do
+            (( imported >= target )) && break
+            [[ -z "$url" ]] && continue
+            local live=0
+            is_live_url "$url" && live=1
+            if (( live == 1 && imported_live >= target_live )); then
+                continue
+            fi
+            if (( live == 0 && imported_static >= target_static )); then
+                continue
+            fi
+            processed=$((processed + 1))
+            spinner_tick "download: $imported/$target (live $imported_live/$target_live, static $imported_static/$target_static)"
+            if download_image "$url"; then
+                imported=$((imported + 1))
+                if (( live == 1 )); then
+                    imported_live=$((imported_live + 1))
+                else
+                    imported_static=$((imported_static + 1))
+                fi
+            fi
+        done <<< "$urls"
+    done
+    spinner_clear
+
+    print_step "fetch reddit themed wallpapers"
+    local sub reddit_urls
+    reddit_batch=$(( limit * 3 ))
+    (( reddit_batch < 20 )) && reddit_batch=20
+    for sub in "${REDDIT_SUBS[@]}"; do
+        (( imported >= target )) && break
+        spinner_tick "reddit: r/$sub ($imported/$target)"
+        # Extract image/video URLs from reddit listings
+        reddit_urls=$(curl -A "$USER_AGENT" -sS \
+            "https://www.reddit.com/r/${sub}/top.json?t=month&limit=${reddit_batch}" \
+            | jq -r '
+                .data.children[].data |
+                (
+                    .url_overridden_by_dest // .url,
+                    (.media?.reddit_video?.fallback_url // empty),
+                    (.preview?.reddit_video_preview?.fallback_url // empty)
+                )
+            ' 2>/dev/null \
+            | grep -Ei '\.(jpg|jpeg|png|webp|gif|gifv|mp4|webm)(\?.*)?$' \
+            | sed 's/\?.*$//' \
+            || true)
+        while IFS= read -r url; do
+            (( imported >= target )) && break
+            [[ -z "$url" ]] && continue
+            local live=0
+            is_live_url "$url" && live=1
+            if (( live == 1 && imported_live >= target_live )); then
+                continue
+            fi
+            if (( live == 0 && imported_static >= target_static )); then
+                continue
+            fi
+            processed=$((processed + 1))
+            spinner_tick "download: $imported/$target (live $imported_live/$target_live, static $imported_static/$target_static)"
+            if download_image "$url"; then
+                imported=$((imported + 1))
+                if (( live == 1 )); then
+                    imported_live=$((imported_live + 1))
+                else
+                    imported_static=$((imported_static + 1))
+                fi
+            fi
+        done <<< "$reddit_urls"
+    done
+    spinner_clear
+
+    if (( ${#GITHUB_SOURCES[@]} > 0 )); then
+        print_step "fetch github wallpaper repos"
+        if (( imported >= target )); then
+            print_info "github skipped (target already met)"
+        else
+            local source gh_urls
+            for source in "${GITHUB_SOURCES[@]}"; do
+                (( imported >= target )) && break
+                spinner_tick "github: $source ($imported/$target)"
+                gh_urls=$(github_urls_for_source "$source" \
+                    | grep -Ei '\.(jpg|jpeg|png|webp|gif|mp4|webm)$' || true)
+                while IFS= read -r url; do
+                    (( imported >= target )) && break
+                    [[ -z "$url" ]] && continue
+                    local live=0
+                    is_live_url "$url" && live=1
+                    if (( live == 1 && imported_live >= target_live )); then
+                        continue
+                    fi
+                    if (( live == 0 && imported_static >= target_static )); then
+                        continue
+                    fi
+                    processed=$((processed + 1))
+                    spinner_tick "download: $imported/$target (live $imported_live/$target_live, static $imported_static/$target_static)"
+                    if download_image "$url"; then
+                        imported=$((imported + 1))
+                        if (( live == 1 )); then
+                            imported_live=$((imported_live + 1))
+                        else
+                            imported_static=$((imported_static + 1))
+                        fi
+                    fi
+                done <<< "$gh_urls"
+            done
+        fi
+        spinner_clear
+    fi
+
+    print_step "fill remaining slots"
+    if (( imported < target )); then
+        for q in "${KEYWORDS[@]}"; do
+            (( imported >= target )) && break
+            urls=$(curl -A "$USER_AGENT" -sS \
+                "https://wallhaven.cc/api/v1/search?q=${q}&categories=111&purity=${WALLHAVEN_PURITY}&sorting=${WALLHAVEN_SORT}&atleast=${MIN_WIDTH}x${MIN_HEIGHT}" \
+                | jq -r '.data[].path' | head -n "$wallhaven_batch")
+            while IFS= read -r url; do
+                (( imported >= target )) && break
+                [[ -z "$url" ]] && continue
+                processed=$((processed + 1))
+                spinner_tick "fill: $imported/$target"
+                if download_image "$url"; then
+                    imported=$((imported + 1))
+                    if is_live_url "$url"; then
+                        imported_live=$((imported_live + 1))
+                    else
+                        imported_static=$((imported_static + 1))
+                    fi
+                fi
+            done <<< "$urls"
+        done
+        spinner_clear
+    else
+        print_info "fill skipped (target already met)"
+    fi
+
+    print_step "report status and warnings"
+    print_success "imported $imported/$target wallpaper(s) to inbox (live $imported_live, static $imported_static)"
+    if (( imported_live < target_live )); then
+        print_warn "live target not fully met (wanted $target_live, got $imported_live)"
+    fi
+    duplicate_report
+    warn_if_over_limit
+    log "fetch completed: imported=$imported"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_triage (review)
+# ─────────────────────────────────────────────────────────────────────────────
+
+triage_action_tty() {
+    local action
+    printf "\naction: " >&2
+    read -r -n1 action
+    printf "\n" >&2
+    printf '%s' "$action"
+}
+
+triage_undo() {
+    if (( ${#UNDO_ACTIONS[@]} == 0 )); then
+        print_warn "nothing to undo"
+        sleep 1
+        return 1
+    fi
+
+    local last_idx=$(( ${#UNDO_ACTIONS[@]} - 1 ))
+    local action="${UNDO_ACTIONS[$last_idx]}"
+    local src="${UNDO_SRC_PATHS[$last_idx]}"
+    local dst="${UNDO_DST_PATHS[$last_idx]}"
+
+    case "$action" in
+        keep|archive|delete)
+            if [[ -f "$dst" ]]; then
+                mv "$dst" "$src"
+                print_success "undo $action: $(basename "$src") restored"
+            else
+                print_warn "undo failed: destination file missing"
+                sleep 1
+                return 1
+            fi
+            ;;
+    esac
+
+    unset 'UNDO_ACTIONS[last_idx]'
+    unset 'UNDO_SRC_PATHS[last_idx]'
+    unset 'UNDO_DST_PATHS[last_idx]'
+    sleep 1
+    return 0
+}
+
+cmd_triage() {
+    require_commands identify chafa
+    load_config
+    require_tty "review"
+    local source_pool="$REVIEW_POOL"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pool)
+                [[ $# -ge 2 ]] || die "--pool requires: new|current|old"
+                case "$2" in
+                    new|n) source_pool="new" ;;
+                    current|c) source_pool="current" ;;
+                    old|o) source_pool="old" ;;
+                    *) die "Invalid review pool: $2" ;;
+                esac
+                shift 2
+                ;;
+            *)
+                die "Unknown triage flag: $1"
+                ;;
+        esac
+    done
+    local source_dir
+    source_dir=$(pool_dir "$source_pool") || die "Invalid review pool: $source_pool"
+
+    # Reset undo stack
+    UNDO_ACTIONS=()
+    UNDO_SRC_PATHS=()
+    UNDO_DST_PATHS=()
+
+    clear
+    print_groot_logo
+    print_header "review ($source_pool)"
+
+    shopt -s nullglob
+    local files=("$source_dir"/*)
+    shopt -u nullglob
+
+    if (( ${#files[@]} == 0 )); then
+        print_info "no files in $source_pool"
+        return 0
+    fi
+
+    local kept=0 moved_old=0 deleted=0 skipped=0 idx=1 total=${#files[@]} quit_requested=0
+    local file w h size action media_type
+    while (( idx <= total )); do
+        file="${files[$((idx - 1))]}"
+
+        if [[ ! -f "$file" ]]; then
+            idx=$((idx + 1))
+            continue
+        fi
+
+        read -r w h <<< "$(get_media_dimensions "$file")"
+        size=$(du -h "$file" | awk '{print $1}')
+        if is_live_file "$file"; then
+            media_type="live"
+        else
+            media_type="static"
+        fi
+
+        while :; do
+            clear
+            print_groot_logo
+            printf "${BOLD}${MAGENTA}[${idx}/${total}]${RESET} %s\n" "$(basename "$file")"
+            printf "%sx%s | %s | %s\n\n" "$w" "$h" "$size" "$media_type"
+
+            # Primary keys
+            printf "  ${DIM}<-/${RESET}${LIGHT_MAGENTA}h${RESET} back    "
+            printf "${DIM}->${RESET}/${CYAN}l${RESET} next    "
+            printf "${GREEN}Enter${RESET} keep    "
+            printf "${MAGENTA}a${RESET} archive    "
+            printf "${RED}d${RESET} delete    "
+            printf "${YELLOW}q${RESET} quit\n"
+            printf "  ${DIM}?=more keys${RESET}\n\n"
+
+            if ! is_live_file "$file"; then
+                chafa -f symbols -s 80x24 "$file" || true
+            else
+                printf "  ${DIM}[live wallpaper - press v to preview]${RESET}\n"
+            fi
+
+            action=$(triage_action_tty)
+
+            case "$action" in
+                # Enter key (empty read from -n1)
+                "")
+                    if [[ "$source_pool" != "current" ]]; then
+                        mv "$file" "$WALLPAPER_DIR_CURRENT/"
+                        UNDO_ACTIONS+=("keep")
+                        UNDO_SRC_PATHS+=("$file")
+                        UNDO_DST_PATHS+=("$WALLPAPER_DIR_CURRENT/$(basename "$file")")
+                    fi
+                    kept=$((kept + 1))
+                    idx=$((idx + 1))
+                    break
+                    ;;
+                k|K)
+                    if [[ "$source_pool" != "current" ]]; then
+                        mv "$file" "$WALLPAPER_DIR_CURRENT/"
+                        UNDO_ACTIONS+=("keep")
+                        UNDO_SRC_PATHS+=("$file")
+                        UNDO_DST_PATHS+=("$WALLPAPER_DIR_CURRENT/$(basename "$file")")
+                    fi
+                    kept=$((kept + 1))
+                    idx=$((idx + 1))
+                    break
+                    ;;
+                a|A|j|J|o|O)
+                    if [[ "$source_pool" != "old" ]]; then
+                        mv "$file" "$WALLPAPER_DIR_OLD/"
+                        UNDO_ACTIONS+=("archive")
+                        UNDO_SRC_PATHS+=("$file")
+                        UNDO_DST_PATHS+=("$WALLPAPER_DIR_OLD/$(basename "$file")")
+                    fi
+                    moved_old=$((moved_old + 1))
+                    idx=$((idx + 1))
+                    break
+                    ;;
+                d|D|x|X)
+                    # Soft-delete: move to trash instead of rm
+                    local trash_name="${source_pool}__$(basename "$file")"
+                    mv "$file" "$TRASH_DIR/$trash_name"
+                    UNDO_ACTIONS+=("delete")
+                    UNDO_SRC_PATHS+=("$file")
+                    UNDO_DST_PATHS+=("$TRASH_DIR/$trash_name")
+                    deleted=$((deleted + 1))
+                    idx=$((idx + 1))
+                    break
+                    ;;
+                l|L|s|S)
+                    skipped=$((skipped + 1))
+                    idx=$((idx + 1))
+                    break
+                    ;;
+                h|H|b|B|p|P)
+                    if (( idx > 1 )); then
+                        idx=$((idx - 1))
+                        break
+                    else
+                        print_warn "already at first image"
+                        sleep 1
+                    fi
+                    ;;
+                v|V)
+                    if is_live_file "$file"; then
+                        if command -v mpv >/dev/null 2>&1; then
+                            mpv --loop --no-audio --really-quiet "$file" 2>/dev/null || true
+                        else
+                            print_warn "mpv not installed for video preview"
+                            sleep 1
+                        fi
+                    else
+                        open_image_viewer "$file"
+                    fi
+                    ;;
+                t|T)
+                    if command -v nsxiv >/dev/null 2>&1; then
+                        print_info "thumbnails: move, press m to mark, then q to return"
+                        sleep 1
+                        local new_idx
+                        if new_idx=$(thumbnail_pick_index "$idx" "${files[@]}"); then
+                            idx="$new_idx"
+                            file="${files[$((idx - 1))]}"
+                            read -r w h <<< "$(get_media_dimensions "$file")"
+                            size=$(du -h "$file" | awk '{print $1}')
+                        fi
+                    else
+                        print_warn "nsxiv not installed for thumbnail mode"
+                        sleep 1
+                    fi
+                    ;;
+                u|U)
+                    triage_undo || true
+                    ;;
+                i|I)
+                    local fhash
+                    fhash=$(sha256sum "$file" | awk '{print $1}')
+                    printf "\n${BOLD}file info${RESET}\n"
+                    printf "  path: %s\n" "$file"
+                    printf "  hash: %s\n" "$fhash"
+                    printf "  dims: %sx%s\n" "$w" "$h"
+                    printf "  size: %s\n" "$size"
+                    printf "  type: %s\n" "$media_type"
+                    printf "\nPress Enter..."
+                    read -r _
+                    ;;
+                ?)
+                    printf "\n${BOLD}extended keys${RESET}\n"
+                    printf "  ${BLUE}v${RESET}  open in viewer        "
+                    printf "${LIGHT_BLUE}t${RESET}  thumbnail grid (nsxiv)\n"
+                    printf "  ${LIGHT_GREEN}u${RESET}  undo last action      "
+                    printf "${CYAN}i${RESET}  file info (hash, source)\n"
+                    printf "\nPress Enter..."
+                    read -r _
+                    ;;
+                q|Q)
+                    quit_requested=1
+                    break
+                    ;;
+                *)
+                    print_warn "unknown key (press ? for help)"
+                    sleep 1
+                    ;;
+            esac
+        done
+
+        if (( quit_requested == 1 )); then
+            break
+        fi
+    done
+
+    clear
+    print_groot_logo
+    if (( quit_requested == 1 )); then
+        print_header "review aborted"
+    else
+        print_header "review summary"
+    fi
+    print_success "kept: $kept"
+    print_info "archived: $moved_old"
+    print_info "deleted (in trash): $deleted"
+    print_info "skipped: $skipped"
+    duplicate_report
+    warn_if_over_limit
+    log "triage completed: kept=$kept old=$moved_old deleted=$deleted skipped=$skipped"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_status
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_status() {
+    load_config
+    clear
+    print_groot_logo
+    print_header "wallctl status"
+    render_dashboard
+    printf "  ${DIM}config: %s${RESET}\n" "$CONFIG_FILE"
+    printf "  ${DIM}viewer: %s${RESET}\n" "${WALLCTL_VIEWER:-auto}"
+    printf "  ${DIM}landscape only: %s${RESET}\n" "$LANDSCAPE_ONLY"
+    printf "  ${DIM}live ratio target: %s%%${RESET}\n" "$LIVE_RATIO"
+    printf "  ${DIM}hash retention: %sd${RESET}\n" "$HASH_RETENTION_DAYS"
+    printf "  ${DIM}archive policy: %sd age, batch %s${RESET}\n" "$ARCHIVE_AGE_DAYS" "$ARCHIVE_BATCH"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_list
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_list() {
+    load_config
+    local pool="${1:-all}"
+    local dir
+    case "$pool" in
+        new) dir="$WALLPAPER_DIR_NEW" ;;
+        current) dir="$WALLPAPER_DIR_CURRENT" ;;
+        old) dir="$WALLPAPER_DIR_OLD" ;;
+        all) dir="" ;;
+        *) die "Usage: $SCRIPT_NAME list [new|current|old|all]" ;;
+    esac
+
+    clear
+    print_groot_logo
+    print_header "wallctl list"
+
+    if [[ -n "$dir" ]]; then
+        printf "pool: %s\n" "$pool"
+        find "$dir" -maxdepth 1 -type f -printf '%f\n' | sort
+    else
+        printf "pool: new\n"
+        find "$WALLPAPER_DIR_NEW" -maxdepth 1 -type f -printf '%f\n' | sort
+        printf "\npool: current\n"
+        find "$WALLPAPER_DIR_CURRENT" -maxdepth 1 -type f -printf '%f\n' | sort
+        printf "\npool: old\n"
+        find "$WALLPAPER_DIR_OLD" -maxdepth 1 -type f -printf '%f\n' | sort
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_dedupe
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_dedupe() {
+    load_config
+    local apply=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --apply)
+                apply=1
+                shift
+                ;;
+            *)
+                die "Unknown dedupe flag: $1"
+                ;;
+        esac
+    done
+
+    local report
+    report=$(python3 - "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_OLD" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+pool_order = {"current": 0, "old": 1, "new": 2, "other": 9}
+paths = [Path(p) for p in sys.argv[1:]]
+rows = []
+for p in paths:
+    pool = p.name
+    if not p.exists():
+        continue
+    for f in p.iterdir():
+        if f.is_file():
+            h = hashlib.sha256(f.read_bytes()).hexdigest()
+            rows.append((h, pool, str(f)))
+
+groups = {}
+for h, pool, full in rows:
+    groups.setdefault(h, []).append((pool, full))
+
+dup_groups = [g for g in groups.values() if len(g) > 1]
+dup_groups.sort(key=lambda g: (pool_order.get(g[0][0], 9), g[0][1]))
+
+print(f"GROUPS\t{len(dup_groups)}")
+for i, g in enumerate(dup_groups, 1):
+    g.sort(key=lambda t: (pool_order.get(t[0], 9), len(t[1]), t[1]))
+    keep = g[0]
+    print(f"GROUP\t{i}\t{len(g)}")
+    print(f"KEEP\t{keep[0]}\t{keep[1]}")
+    for item in g[1:]:
+        print(f"DROP\t{item[0]}\t{item[1]}")
+PY
+)
+
+    clear
+    print_groot_logo
+    print_header "dedupe"
+
+    local groups=0 dropped=0
+    local line kind a b
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        IFS=$'\t' read -r kind a b <<< "$line"
+        case "$kind" in
+            GROUPS)
+                groups="$a"
+                print_info "duplicate groups: $groups"
+                ;;
+            GROUP)
+                print_info "group $a (files: $b)"
+                ;;
+            KEEP)
+                printf "  keep: [%s] %s\n" "$a" "$b"
+                ;;
+            DROP)
+                if (( apply == 1 )); then
+                    if rm -f "$b"; then
+                        printf "  drop: [%s] %s\n" "$a" "$b"
+                        dropped=$((dropped + 1))
+                    else
+                        print_warn "failed to remove: $b"
+                    fi
+                else
+                    printf "  drop: [%s] %s\n" "$a" "$b"
+                fi
+                ;;
+        esac
+    done <<< "$report"
+
+    if (( groups == 0 )); then
+        print_success "no duplicates found"
+    elif (( apply == 1 )); then
+        print_success "removed duplicate files: $dropped"
+    else
+        print_info "dry-run only; use: $SCRIPT_NAME dedupe --apply"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_migrate
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_migrate() {
+    load_config
+    local dry_run=0
+    local target_pool="new"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            --to-new)
+                target_pool="new"
+                shift
+                ;;
+            --to-current)
+                target_pool="current"
+                shift
+                ;;
+            *)
+                die "Unknown migrate flag: $1"
+                ;;
+        esac
+    done
+
+    local moved=0 removed_dupes=0 renamed=0
+    local file target hash1 hash2 base name ext n
+    local destination_dir="$WALLPAPER_DIR_NEW"
+    [[ "$target_pool" == "current" ]] && destination_dir="$WALLPAPER_DIR_CURRENT"
+
+    shopt -s nullglob
+    for file in "$WALLPAPER_DIR_BASE"/*.{jpg,jpeg,png,webp,gif,mp4,webm}; do
+        [[ -f "$file" ]] || continue
+        base=$(basename "$file")
+        target="$destination_dir/$base"
+
+        if [[ -f "$target" ]]; then
+            hash1=$(sha256sum "$file" | awk '{print $1}')
+            hash2=$(sha256sum "$target" | awk '{print $1}')
+            if [[ "$hash1" == "$hash2" ]]; then
+                if (( dry_run == 0 )); then
+                    rm -f "$file"
+                fi
+                removed_dupes=$((removed_dupes + 1))
+                continue
+            fi
+            name="${base%.*}"
+            ext="${base##*.}"
+            n=1
+            while [[ -e "$destination_dir/${name}-legacy-${n}.${ext}" ]]; do
+                n=$((n + 1))
+            done
+            target="$destination_dir/${name}-legacy-${n}.${ext}"
+            renamed=$((renamed + 1))
+        fi
+
+        if (( dry_run == 0 )); then
+            mv "$file" "$target"
+        fi
+        moved=$((moved + 1))
+    done
+    shopt -u nullglob
+
+    clear
+    print_groot_logo
+    print_header "migrate summary"
+    if (( dry_run == 1 )); then
+        print_info "dry-run only; no files moved"
+    fi
+    print_success "would move to $target_pool: $moved"
+    print_info "duplicate loose files removed: $removed_dupes"
+    print_info "renamed on collision: $renamed"
+    print_info "tip: use --to-new for quick review queue"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_archive
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_archive() {
+    load_config
+    local age_days="$ARCHIVE_AGE_DAYS"
+    local batch="$ARCHIVE_BATCH"
+    local max_current="$MAX_CURRENT_WARN"
+    local dry_run=1
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --age-days)
+                [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "--age-days requires a number"
+                age_days="$2"
+                shift 2
+                ;;
+            --batch)
+                [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "--batch requires a number"
+                batch="$2"
+                shift 2
+                ;;
+            --max-current)
+                [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "--max-current requires a number"
+                max_current="$2"
+                shift 2
+                ;;
+            --apply)
+                dry_run=0
+                shift
+                ;;
+            --dry-run)
+                dry_run=1
+                shift
+                ;;
+            *)
+                die "Unknown archive flag: $1"
+                ;;
+        esac
+    done
+
+    clear
+    print_groot_logo
+    print_header "archive"
+
+    local current_count moved=0
+    current_count=$(count_media "$WALLPAPER_DIR_CURRENT")
+    local cutoff_epoch
+    cutoff_epoch=$(( $(date +%s) - (age_days * 86400) ))
+
+    print_info "policy: age > ${age_days}d, batch ${batch}, max-current ${max_current}"
+    print_info "current pool: $current_count wallpapers"
+
+    # Collect candidates sorted by mtime (oldest first)
+    local candidates=()
+    while IFS= read -r -d '' file; do
+        local mtime
+        mtime=$(stat -c '%Y' "$file" 2>/dev/null || echo 0)
+        if (( mtime < cutoff_epoch )) || (( current_count > max_current )); then
+            candidates+=("$file")
+        fi
+    done < <(find "$WALLPAPER_DIR_CURRENT" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \
+                  -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
+                  -o -iname '*.mp4' -o -iname '*.webm' \) -printf '%T@\t%p\0' \
+              | sort -z -t$'\t' -k1,1n | cut -z -f2-)
+
+    if (( ${#candidates[@]} == 0 )); then
+        print_success "nothing to archive"
+        return 0
+    fi
+
+    local file
+    for file in "${candidates[@]}"; do
+        (( moved >= batch )) && break
+        local bname
+        bname=$(basename "$file")
+        if (( dry_run == 1 )); then
+            printf "  would move: %s\n" "$bname"
+        else
+            mv "$file" "$WALLPAPER_DIR_OLD/"
+            printf "  moved: %s\n" "$bname"
+        fi
+        moved=$((moved + 1))
+    done
+
+    if (( dry_run == 1 )); then
+        print_info "dry-run: would archive $moved file(s)"
+        print_info "use: $SCRIPT_NAME archive --apply"
+    else
+        print_success "archived $moved file(s) to old"
+        log "archive completed: moved=$moved"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_apply (quick-set wallpaper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+kill_live_wallpaper() {
+    # Kill any running mpvpaper instances
+    if command -v mpvpaper >/dev/null 2>&1; then
+        pkill -x mpvpaper 2>/dev/null || true
+    fi
+}
+
+set_wallpaper() {
+    local file="$1"
+    if is_live_file "$file"; then
+        # Live wallpaper via mpvpaper
+        if ! command -v mpvpaper >/dev/null 2>&1; then
+            die "mpvpaper required for live wallpapers (install: paru -S mpvpaper)"
+        fi
+        kill_live_wallpaper
+        # Get focused monitor
+        local monitor
+        monitor=$(hyprctl monitors -j 2>/dev/null | jq -r '.[0].name' 2>/dev/null || echo "eDP-1")
+        mpvpaper -o "no-audio loop" "$monitor" "$file" &
+        disown
+        print_success "live wallpaper set: $(basename "$file") (mpvpaper on $monitor)"
+    else
+        # Static wallpaper via swww
+        if ! command -v swww >/dev/null 2>&1; then
+            die "swww required for static wallpapers"
+        fi
+        kill_live_wallpaper
+        swww img "$file" --transition-type wipe --transition-duration 1 >/dev/null 2>&1 || true
+        print_success "wallpaper set: $(basename "$file")"
+    fi
+}
+
+cmd_apply() {
+    load_config
+    local mode="random"
+    local target_file=""
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pick)
+                mode="pick"
+                shift
+                ;;
+            random)
+                mode="random"
+                shift
+                ;;
+            *)
+                if [[ -f "$1" ]]; then
+                    mode="file"
+                    target_file="$1"
+                else
+                    die "File not found: $1"
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    clear
+    print_groot_logo
+    print_header "apply wallpaper"
+
+    case "$mode" in
+        file)
+            set_wallpaper "$target_file"
+            ;;
+        pick)
+            if ! command -v nsxiv >/dev/null 2>&1; then
+                die "nsxiv required for --pick mode"
+            fi
+            local picked
+            shopt -s nullglob
+            local pool_files=("$WALLPAPER_DIR_CURRENT"/*)
+            shopt -u nullglob
+            if (( ${#pool_files[@]} == 0 )); then
+                die "no wallpapers in current pool"
+            fi
+            picked=$(nsxiv -t -o "${pool_files[@]}" 2>/dev/null | head -n1 || true)
+            if [[ -z "$picked" ]]; then
+                print_info "no wallpaper selected"
+                return 0
+            fi
+            set_wallpaper "$picked"
+            ;;
+        random)
+            local wallpaper
+            if ! wallpaper=$(pick_random_wallpaper "$ROTATION_POOL"); then
+                die "no wallpapers available in pool: $ROTATION_POOL"
+            fi
+            set_wallpaper "$wallpaper"
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_screensaver
+# ─────────────────────────────────────────────────────────────────────────────
+
+screensaver_loop_wallpaper() {
+    local wallpaper
+    while :; do
+        if wallpaper=$(pick_random_wallpaper "$SCREENSAVER_POOL"); then
+            set_wallpaper "$wallpaper"
+        fi
+        sleep "$SCREENSAVER_INTERVAL"
+    done
+}
+
+build_screensaver_filelist() {
+    local dir file
+    : > "$SCREENSAVER_LIST_FILE"
+    while IFS= read -r dir; do
+        [[ -d "$dir" ]] || continue
+        while IFS= read -r -d '' file; do
+            if is_selectable_wallpaper "$file"; then
+                printf '%s\n' "$file" >> "$SCREENSAVER_LIST_FILE"
+            fi
+        done < <(find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \
+                      -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
+                      -o -iname '*.mp4' -o -iname '*.webm' \) -print0)
+    done < <(list_pool_dirs "$SCREENSAVER_POOL")
+}
+
+start_overlay_screensaver() {
+    if ! command -v mpv >/dev/null 2>&1; then
+        print_warn "mpv not found for overlay mode"
+        return 1
+    fi
+
+    build_screensaver_filelist
+    if [[ ! -s "$SCREENSAVER_LIST_FILE" ]]; then
+        return 1
+    fi
+
+    local shuffled
+    shuffled=$(shuf "$SCREENSAVER_LIST_FILE")
+    if [[ -z "$shuffled" ]]; then
+        return 1
+    fi
+
+    # mpv handles both images and video natively
+    # --image-display-duration controls how long each image shows
+    # videos play to completion then advance
+    mpv --fullscreen --loop-playlist --no-audio --really-quiet \
+        --image-display-duration="$SCREENSAVER_INTERVAL" \
+        --playlist=<(printf '%s\n' "$shuffled") >/dev/null 2>&1 &
+    printf '%s:mpv\n' "$!" > "$LOCK_FILE"
+    return 0
+}
+
+cmd_screensaver() {
+    load_config
+    local action="${1:-}"
+    case "$action" in
+        start)
+            if screensaver_is_running; then
+                print_info "screensaver already running"
+                return 0
+            fi
+            if [[ "$SCREENSAVER_MODE" == "overlay" ]]; then
+                if start_overlay_screensaver; then
+                    print_success "screensaver overlay started (mpv)"
+                else
+                    print_warn "overlay mode unavailable; falling back to wallpaper mode"
+                    if ! command -v swww >/dev/null 2>&1; then
+                        die "swww required for wallpaper screensaver mode"
+                    fi
+                    screensaver_loop_wallpaper &
+                    printf '%s:swww\n' "$!" > "$LOCK_FILE"
+                    print_success "screensaver wallpaper loop started"
+                fi
+            else
+                if ! command -v swww >/dev/null 2>&1; then
+                    die "swww required for wallpaper screensaver mode"
+                fi
+                screensaver_loop_wallpaper &
+                printf '%s:swww\n' "$!" > "$LOCK_FILE"
+                print_success "screensaver wallpaper loop started"
+            fi
+            ;;
+        stop)
+            if screensaver_is_running; then
+                local pid lock_type
+                pid=$(awk -F: '{print $1}' "$LOCK_FILE" 2>/dev/null || true)
+                lock_type=$(awk -F: '{print $2}' "$LOCK_FILE" 2>/dev/null || true)
+                kill "$pid" 2>/dev/null || true
+                # Also clean up any spawned mpv/mpvpaper processes
+                case "$lock_type" in
+                    mpv)
+                        # Kill the specific mpv overlay if it's still around
+                        pkill -P "$pid" 2>/dev/null || true
+                        ;;
+                    swww)
+                        # Wallpaper loop may have spawned mpvpaper for live files
+                        kill_live_wallpaper
+                        ;;
+                esac
+                rm -f "$LOCK_FILE"
+                rm -f "$SCREENSAVER_LIST_FILE"
+                print_success "screensaver stopped"
+            else
+                print_info "screensaver not running"
+            fi
+            ;;
+        toggle)
+            if screensaver_is_running; then
+                cmd_screensaver stop
+            else
+                cmd_screensaver start
+            fi
+            ;;
+        status)
+            if screensaver_is_running; then
+                local lock_type
+                lock_type=$(screensaver_lock_type || echo "unknown")
+                print_info "screensaver: on (pool=$SCREENSAVER_POOL mode=$SCREENSAVER_MODE engine=$lock_type delay=${SCREENSAVER_INTERVAL}s)"
+            else
+                print_info "screensaver: off (pool=$SCREENSAVER_POOL mode=$SCREENSAVER_MODE delay=${SCREENSAVER_INTERVAL}s)"
+            fi
+            ;;
+        *)
+            die "Usage: $SCRIPT_NAME screensaver {start|stop|toggle|status}"
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_config (grouped)
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_config() {
+    load_config
+    require_tty "config"
+
+    while :; do
+        clear
+        print_groot_logo
+        print_header "config"
+
+        print_section "Quality"
+        printf "   1) min resolution       %sx%s\n" "$MIN_WIDTH" "$MIN_HEIGHT"
+        printf "   2) landscape only       %s\n" "$( (( LANDSCAPE_ONLY )) && echo yes || echo no)"
+
+        print_section "Sources"
+        printf "   3) keywords             %s\n" "${KEYWORDS[*]}"
+        printf "   4) reddit subs          %s\n" "${REDDIT_SUBS[*]}"
+        printf "   5) github repos         %s\n" "${GITHUB_SOURCES[*]}"
+        printf "   6) fetch limit          %s\n" "$FETCH_LIMIT"
+        printf "   7) live ratio           %s%%\n" "$LIVE_RATIO"
+
+        print_section "Pools & Review"
+        printf "   8) rotation pool        %s\n" "$ROTATION_POOL"
+        printf "   9) review source        %s\n" "$REVIEW_POOL"
+        printf "  10) current warn at      %s\n" "$MAX_CURRENT_WARN"
+
+        print_section "Playback"
+        printf "  11) screensaver pool     %s\n" "$SCREENSAVER_POOL"
+        printf "  12) screensaver delay    %ss\n" "$SCREENSAVER_INTERVAL"
+        printf "  13) screensaver mode     %s\n" "$SCREENSAVER_MODE"
+        printf "  14) image viewer         %s\n" "${WALLCTL_VIEWER:-auto}"
+
+        print_section "Advanced"
+        printf "  15) hash retention       %sd\n" "$HASH_RETENTION_DAYS"
+        printf "  16) archive age          %sd\n" "$ARCHIVE_AGE_DAYS"
+        printf "  17) archive batch        %s\n" "$ARCHIVE_BATCH"
+        printf "  18) user agent           %s\n" "$USER_AGENT"
+
+        printf "\n"
+        printf "  e) edit config file    s) save    q) quit\n\n"
+        printf "choice: "
+        local choice value
+        read -r choice
+        case "$choice" in
+            1)
+                printf "min width: "
+                read -r value
+                if [[ "$value" =~ ^[0-9]+$ ]]; then
+                    MIN_WIDTH="$value"
+                    printf "min height: "
+                    read -r value
+                    [[ "$value" =~ ^[0-9]+$ ]] && MIN_HEIGHT="$value" || print_warn "invalid number"
+                else
+                    print_warn "invalid number"
+                fi
+                ;;
+            2)
+                printf "landscape only (yes/no): "
+                read -r value
+                case "$value" in
+                    yes|y|1) LANDSCAPE_ONLY=1 ;;
+                    no|n|0) LANDSCAPE_ONLY=0 ;;
+                    *) print_warn "invalid input" ;;
+                esac
+                ;;
+            3)
+                printf "keywords (space-separated): "
+                read -r value
+                [[ -n "$value" ]] && read -ra KEYWORDS <<< "$value"
+                ;;
+            4)
+                printf "reddit subs (space-separated): "
+                read -r value
+                [[ -n "$value" ]] && read -ra REDDIT_SUBS <<< "$value"
+                ;;
+            5)
+                printf "github sources (repo:path[@ref], space-separated): "
+                read -r value
+                [[ -n "$value" ]] && read -ra GITHUB_SOURCES <<< "$value"
+                ;;
+            6)
+                printf "fetch limit: "
+                read -r value
+                [[ "$value" =~ ^[0-9]+$ ]] && FETCH_LIMIT="$value" || print_warn "invalid number"
+                ;;
+            7)
+                printf "live ratio (0-100): "
+                read -r value
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 0 && value <= 100 )) && LIVE_RATIO="$value" || print_warn "invalid ratio"
+                ;;
+            8)
+                printf "rotation pool (current/current+new/current+old/current+new+old): "
+                read -r value
+                case "$value" in
+                    current|current+new|current+old|current+new+old) ROTATION_POOL="$value" ;;
+                    *) print_warn "invalid pool" ;;
+                esac
+                ;;
+            9)
+                printf "review source (new/current/old): "
+                read -r value
+                case "$value" in
+                    new|current|old) REVIEW_POOL="$value" ;;
+                    *) print_warn "invalid pool" ;;
+                esac
+                ;;
+            10)
+                printf "current warn threshold: "
+                read -r value
+                [[ "$value" =~ ^[0-9]+$ ]] && MAX_CURRENT_WARN="$value" || print_warn "invalid number"
+                ;;
+            11)
+                printf "screensaver pool (current/current+new/current+old/current+new+old): "
+                read -r value
+                case "$value" in
+                    current|current+new|current+old|current+new+old) SCREENSAVER_POOL="$value" ;;
+                    *) print_warn "invalid pool" ;;
+                esac
+                ;;
+            12)
+                printf "screensaver delay seconds: "
+                read -r value
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )) && SCREENSAVER_INTERVAL="$value" || print_warn "invalid seconds"
+                ;;
+            13)
+                printf "screensaver mode (overlay/wallpaper): "
+                read -r value
+                case "$value" in
+                    overlay|wallpaper) SCREENSAVER_MODE="$value" ;;
+                    *) print_warn "invalid mode" ;;
+                esac
+                ;;
+            14)
+                printf "viewer command (empty=auto): "
+                read -r value
+                WALLCTL_VIEWER="$value"
+                ;;
+            15)
+                printf "hash retention days: "
+                read -r value
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )) && HASH_RETENTION_DAYS="$value" || print_warn "invalid days"
+                ;;
+            16)
+                printf "archive age days: "
+                read -r value
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )) && ARCHIVE_AGE_DAYS="$value" || print_warn "invalid days"
+                ;;
+            17)
+                printf "archive batch size: "
+                read -r value
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 )) && ARCHIVE_BATCH="$value" || print_warn "invalid number"
+                ;;
+            18)
+                printf "user agent: "
+                read -r value
+                [[ -n "$value" ]] && USER_AGENT="$value"
+                ;;
+            e|E)
+                ${EDITOR:-nano} "$CONFIG_FILE"
+                load_config
+                ;;
+            s|S)
+                write_config
+                print_success "saved $CONFIG_FILE"
+                sleep 1
+                break
+                ;;
+            q|Q)
+                break
+                ;;
+            *)
+                print_warn "unknown option"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_menu (pipeline dashboard)
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_menu() {
+    IN_MENU=1
+    load_config
+    require_tty "menu"
+
+    local choice
+    while :; do
+        printf '\033[?25h'
+        clear
+        print_groot_logo
+        print_header "wallctl"
+        render_dashboard
+
+        printf "  1) download           fetch new wallpapers\n"
+        printf "  2) review             triage inbox (%s pending)\n" "$DASH_NEW_COUNT"
+        printf "  3) archive            move aging wallpapers to old\n"
+        printf "  4) dedupe             find/remove duplicates\n"
+        printf "  5) screensaver        start | stop | toggle\n"
+        printf "  6) apply              set a wallpaper now\n"
+        printf "  7) config             edit settings\n"
+        printf "  h) help   q) quit\n"
+        printf "\n"
+        suggest_action
+        printf "choice: "
+        read -r choice
+
+        case "$choice" in
+            1|download|fetch)
+                cmd_fetch
+                ;;
+            2|review|triage)
+                cmd_triage --pool "$REVIEW_POOL"
+                ;;
+            3|archive)
+                cmd_archive
+                ;;
+            4|dedupe)
+                cmd_dedupe
+                ;;
+            5|screensaver|ss)
+                printf "  1) start  2) stop  3) toggle  4) status\n"
+                printf "  choice: "
+                local ss_choice
+                read -r ss_choice
+                case "$ss_choice" in
+                    1|start) cmd_screensaver start ;;
+                    2|stop) cmd_screensaver stop ;;
+                    3|toggle) cmd_screensaver toggle ;;
+                    4|status) cmd_screensaver status ;;
+                    *) print_warn "invalid screensaver action" ; sleep 1 ;;
+                esac
+                ;;
+            6|apply)
+                printf "  1) random  2) pick from thumbnails  3) enter path\n"
+                printf "  choice: "
+                local apply_choice
+                read -r apply_choice
+                case "$apply_choice" in
+                    1|random) cmd_apply random ;;
+                    2|pick) cmd_apply --pick ;;
+                    3|path)
+                        printf "  path: "
+                        local apply_path
+                        read -r apply_path
+                        cmd_apply "$apply_path"
+                        ;;
+                    *) print_warn "invalid apply action" ; sleep 1 ;;
+                esac
+                ;;
+            7|config)
+                cmd_config
+                ;;
+            h|H|help)
+                clear
+                print_groot_logo
+                usage
+                printf "\nPress Enter to return to menu..."
+                read -r _
+                ;;
+            q|quit)
+                break
+                ;;
+            *)
+                print_warn "unknown option"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Usage / help
+# ─────────────────────────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+wallctl - wallpaper workflow manager
+
+Usage:
+  $SCRIPT_NAME [command] [options]
+
+Commands:
+  menu                          Interactive menu (default)
+  fetch [--limit N]             Download into inbox (new pool)
+  triage [--pool new|current|old]
+                                Review wallpapers one at a time
+  apply [file|random|--pick]    Set a wallpaper immediately
+  archive [--apply] [--age-days N] [--batch N] [--max-current N]
+                                Move aging wallpapers to old pool
+  status                        Show pool counts and runtime state
+  list [new|current|old|all]    List files by pool
+  dedupe [--apply]              Find or remove exact duplicate files
+  migrate [--dry-run] [--to-new|--to-current]
+                                Move loose wallpapers into a pool
+  trash [--list|--purge]        View or empty the soft-delete trash
+  config                        Edit runtime configuration
+  screensaver {start|stop|toggle|status}
+                                Control pseudo-screensaver loop
+  help                          Show this help
+
+Review keys:
+  Enter=keep  a=archive  d=delete  h=back  l=next  q=quit  ?=more
+
+Config:
+  $CONFIG_FILE
+
+Pool meanings:
+  new     = unreviewed inbox
+  current = active rotation set
+  old     = resting / archived set
+EOF
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-menu}"
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+
+    if [[ "$cmd" == "help" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
+        CLEAR_ON_EXIT=0
+        NO_PAUSE=1
+    fi
+
+    if [[ "$cmd" == "menu" && ( ! -t 0 || ! -t 1 ) ]]; then
+        usage
+        exit 1
+    fi
+
+    case "$cmd" in
+        menu) cmd_menu "$@" ;;
+        fetch|download) cmd_fetch "$@" ;;
+        triage|review) cmd_triage "$@" ;;
+        apply) cmd_apply "$@" ;;
+        archive) cmd_archive "$@" ;;
+        status) cmd_status "$@" ;;
+        list) cmd_list "$@" ;;
+        dedupe) cmd_dedupe "$@" ;;
+        migrate) cmd_migrate "$@" ;;
+        trash) cmd_trash "$@" ;;
+        config) cmd_config "$@" ;;
+        screensaver) cmd_screensaver "$@" ;;
+        screensaver-start) cmd_screensaver start ;;
+        screensaver-stop) cmd_screensaver stop ;;
+        help|-h|--help) usage ;;
+        *) die "Unknown command: $cmd" ;;
+    esac
+
+    maybe_pause
+}
+
+main "$@"

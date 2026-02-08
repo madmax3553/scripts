@@ -10,18 +10,47 @@
 #      ░    ░         ░ ░      ░ ░           
 # Script: wallpaper.sh
 # Purpose: Wallpaper rotation using swww
-# Dependencies: swww
+# Dependencies: swww, identify
 # Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail
-WALLPAPER_DIR="$HOME/wallpapers"  # Your wallpaper directory
+shopt -s nullglob
+WALLPAPER_DIR="$HOME/wallpapers/current"  # Active wallpaper rotation directory
+FALLBACK_DIR="$HOME/wallpapers"  # Legacy wallpaper directory
 INTERVAL=300  # Time between changes (seconds, 300 = 5 minutes)
 LOG_FILE="$HOME/.cache/wallpaper.log"  # Log file for debugging
+LANDSCAPE_ONLY=1
 
 # Function to log messages
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" >> "$LOG_FILE"
+}
+
+get_dimensions() {
+    local file="$1"
+    local dims
+    dims=$(identify -ping -format '%w %h' "$file" 2>/dev/null || true)
+    if [[ "$dims" =~ ^[0-9]+[[:space:]][0-9]+$ ]]; then
+        printf '%s\n' "$dims"
+    else
+        printf '0 0\n'
+    fi
+}
+
+build_candidates() {
+    local dir="$1"
+    local file w h
+    local list=()
+    for file in "$dir"/*.{jpg,jpeg,png,webp,gif}; do
+        [[ -f "$file" ]] || continue
+        if (( LANDSCAPE_ONLY == 1 )); then
+            read -r w h <<< "$(get_dimensions "$file")"
+            (( w >= h )) || continue
+        fi
+        list+=("$file")
+    done
+    printf '%s\n' "${list[@]}"
 }
 
 # Check if script is already running and kill it
@@ -48,11 +77,14 @@ fi
 
 # Loop to rotate wallpapers
 while true; do
-    # Get list of wallpapers (jpg, jpeg, png)
-    wallpapers=("$WALLPAPER_DIR"/*.{jpg,jpeg,png})
+    # Get list of wallpapers
+    mapfile -t wallpapers < <(build_candidates "$WALLPAPER_DIR")
     if [ ${#wallpapers[@]} -eq 0 ]; then
-        log_message "No wallpapers found in $WALLPAPER_DIR"
-        sleep $INTERVAL
+        mapfile -t wallpapers < <(build_candidates "$FALLBACK_DIR")
+    fi
+    if [ ${#wallpapers[@]} -eq 0 ]; then
+        log_message "No wallpapers found in $WALLPAPER_DIR or $FALLBACK_DIR"
+        sleep "$INTERVAL"
         continue
     fi
 
