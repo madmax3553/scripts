@@ -12,7 +12,7 @@
 # Purpose: Wallpaper fetch, triage, and status manager
 # Dependencies: bash, curl, jq, identify, chafa, sha256sum, mpv, mpvpaper
 # Author: groot
-# Modified: 2026-02-07
+# Modified: 2026-02-08
 
 set -euo pipefail
 
@@ -40,6 +40,8 @@ CONFIG_FILE="$CONFIG_DIR/config.sh"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/wall-tools"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/wall-tools"
 TRASH_DIR="$CACHE_DIR/trash"
+THUMB_CACHE_DIR="$CACHE_DIR/thumbcache"
+THUMB_GEN_TIMEOUT_SEC=4
 LOCK_FILE="$STATE_DIR/screensaver.lock"
 SCREENSAVER_LIST_FILE="$STATE_DIR/screensaver.list"
 SEEN_HASH_LOG="$STATE_DIR/seen_hashes.tsv"
@@ -92,7 +94,30 @@ WALLHAVEN_PURITY="100"
 
 cleanup() {
     local code=$?
-    printf '\033[?25h' >&2
+    local _pid
+
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -TERM -P $$ 2>/dev/null || true
+    fi
+    while read -r _pid; do
+        kill "$_pid" 2>/dev/null || true
+    done < <(jobs -pr 2>/dev/null || true)
+
+    _spinner_kill 2>/dev/null
+
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -KILL -P $$ 2>/dev/null || true
+    fi
+    while read -r _pid; do
+        wait "$_pid" 2>/dev/null || true
+    done < <(jobs -pr 2>/dev/null || true)
+
+    unpin_header 2>/dev/null
+    if [[ -e /dev/tty ]]; then
+        stty sane </dev/tty 2>/dev/null || true
+        # Reset common terminal modes (cursor, wrapping, scroll region, mouse, bracketed paste).
+        printf '\033[0m\033[?25h\033[?7h\033[r\033[?1l\033[?1000l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l\033[?2004l\033[?1049l' >/dev/tty 2>/dev/null || true
+    fi
     if [[ $code -eq 0 && -t 1 && $CLEAR_ON_EXIT -eq 1 ]]; then
         clear
     fi
@@ -111,18 +136,480 @@ print_step() {
 }
 
 SPINNER_STATE=0
+SPINNER_ACTIVE=0
+SPINNER_CANCELLED=0
+SPINNER_STARTED_MS=0
+SPINNER_MIN_ACTIVE_MS=700
+SPINNER_PULSES=0
+SPINNER_MIN_PULSES=4
+SPINNER_LAST_DRAW_MS=0
+SPINNER_MIN_FRAME_MS=80
+SPINNER_ROW=11
+SPINNER_WIDTH=36
+SPINNER_BAR_W=12           # width of the cylon bar track
+SPINNER_DIR=1              # 1 = sweeping right, -1 = sweeping left
+SPINNER_PID=""
+SPINNER_FIFO=""
+SPINNER_MSG_FILE=""
+
+DUP_COUNT_CACHE_VALUE=""
+DUP_COUNT_CACHE_MS=0
+DUP_COUNT_CACHE_TTL_MS=900000
+
+# Get real terminal column count via /dev/tty (immune to scroll regions,
+# piped stdout, and command substitution).
+_term_cols() {
+    local _l _c
+    if read -r _l _c < <(stty size </dev/tty 2>/dev/null); then
+        printf '%s' "$_c"
+    else
+        printf '80'
+    fi
+}
+
+_term_lines() {
+    local _l _c
+    if read -r _l _c < <(stty size </dev/tty 2>/dev/null); then
+        printf '%s' "$_l"
+    else
+        printf '24'
+    fi
+}
+
+_now_ms() {
+    if [[ -n "${EPOCHREALTIME:-}" ]]; then
+        local _s _us
+        _s=${EPOCHREALTIME%.*}
+        _us=${EPOCHREALTIME#*.}
+        _us=${_us:0:3}
+        while (( ${#_us} < 3 )); do
+            _us+="0"
+        done
+        printf '%d' "$((10#${_s} * 1000 + 10#${_us}))"
+    else
+        date +%s000
+    fi
+}
+
+_sleep_ms() {
+    local ms=${1:-0}
+    (( ms > 0 )) || return 0
+    local sec=$(( ms / 1000 ))
+    local rem=$(( ms % 1000 ))
+    sleep "${sec}.$(printf '%03d' "$rem")"
+}
+
+# ── Background cylon spinner ─────────────────────────────────────────────────
+# The spinner runs as a background subprocess with its own render loop at
+# ~15 fps.  The main process communicates via a tmpfile for the label and
+# a FIFO for commands (start/stop/cancel/quit).
+#
+# API (unchanged for callers):
+#   spinner_tick "msg"          — start/update the spinner label
+#   spinner_cancelled && break  — check if user pressed q/Esc
+#   spinner_clear               — stop animation, show idle track
+#   spinner_idle                — draw idle track (no background process)
+
+_spinner_render_bar() {
+    # Build and render one frame of the cylon bar.
+    # Reads/writes SPINNER_STATE and SPINNER_DIR from the subprocess env.
+    local pos=$SPINNER_STATE
+    local bar="" i dist
+    for (( i = 0; i < SPINNER_BAR_W; i++ )); do
+        dist=$(( pos - i ))
+        (( dist < 0 )) && dist=$(( -dist )) || true
+        case "$dist" in
+            0) bar+="\033[1m\033[0;36m█\033[0m" ;;
+            1) bar+="\033[0;36m▄\033[0m" ;;
+            2) bar+="\033[2m\033[0;36m_\033[0m" ;;
+            3) bar+="\033[2m.\033[0m" ;;
+            *) bar+=" " ;;
+        esac
+    done
+
+    # Advance position, bounce at edges
+    if (( SPINNER_DIR == 1 )); then
+        SPINNER_STATE=$(( pos + 1 ))
+        if (( SPINNER_STATE >= SPINNER_BAR_W )); then
+            SPINNER_STATE=$(( SPINNER_BAR_W - 2 ))
+            SPINNER_DIR=-1
+        fi
+    else
+        SPINNER_STATE=$(( pos - 1 ))
+        if (( SPINNER_STATE < 0 )); then
+            SPINNER_STATE=1
+            SPINNER_DIR=1
+        fi
+    fi
+
+    # Position and render
+    local cols
+    read -r _ cols < <(stty size </dev/tty 2>/dev/null) || cols=80
+    local bar_col=$(( cols - SPINNER_BAR_W ))
+    (( bar_col < 1 )) && bar_col=1 || true
+    local widget_col=$(( cols - SPINNER_WIDTH ))
+    (( widget_col < 1 )) && widget_col=1 || true
+
+    # Read current label from shared file
+    local msg=""
+    [[ -f "$1" ]] && msg=$(<"$1") || true
+    local label_w=$(( SPINNER_WIDTH - SPINNER_BAR_W - 2 ))
+    (( label_w < 4 )) && label_w=4 || true
+    (( ${#msg} > label_w )) && msg="${msg:0:$((label_w - 3))}..." || true
+    local label
+    printf -v label "%-${label_w}s" "$msg"
+
+    printf '\033[?25l\0337' >/dev/tty 2>/dev/null || return 0
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
+    printf '%*s' "$SPINNER_WIDTH" '' >/dev/tty 2>/dev/null
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
+    printf '\033[2m%s\033[0m ' "$label" >/dev/tty 2>/dev/null
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$bar_col" >/dev/tty 2>/dev/null
+    printf '%b' "$bar" >/dev/tty 2>/dev/null
+    printf '\0338' >/dev/tty 2>/dev/null
+}
+
+_spinner_render_cancelled() {
+    local cols
+    read -r _ cols < <(stty size </dev/tty 2>/dev/null) || cols=80
+    local bar_col=$(( cols - SPINNER_BAR_W ))
+    (( bar_col < 1 )) && bar_col=1 || true
+    local widget_col=$(( cols - SPINNER_WIDTH ))
+    (( widget_col < 1 )) && widget_col=1 || true
+    local label_w=$(( SPINNER_WIDTH - SPINNER_BAR_W - 2 ))
+    (( label_w < 4 )) && label_w=4 || true
+    local cancel_label
+    printf -v cancel_label "%-${label_w}s" "cancelled"
+    # Build dim gradient block bar in yellow for cancelled state
+    local dead_bar="" _i _edge
+    for (( _i = 0; _i < SPINNER_BAR_W; _i++ )); do
+        _edge=$_i
+        (( (SPINNER_BAR_W - 1 - _i) < _edge )) && _edge=$(( SPINNER_BAR_W - 1 - _i )) || true
+        case "$_edge" in
+            0) dead_bar+="░" ;;
+            1) dead_bar+="▒" ;;
+            2) dead_bar+="▓" ;;
+            *) dead_bar+="█" ;;
+        esac
+    done
+    printf '\0337' >/dev/tty 2>/dev/null || return 0
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
+    printf '%*s' "$SPINNER_WIDTH" '' >/dev/tty 2>/dev/null
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
+    printf '\033[1;33m%s\033[0m ' "$cancel_label" >/dev/tty 2>/dev/null
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$bar_col" >/dev/tty 2>/dev/null
+    printf '\033[2;33m%s\033[0m' "$dead_bar" >/dev/tty 2>/dev/null
+    printf '\0338' >/dev/tty 2>/dev/null
+}
+
+# The background loop.  Runs in a subshell, communicates via FIFO + tmpfile.
+_spinner_loop() {
+    local fifo="$1" msg_file="$2" cancel_file="$3"
+    local running=0
+    SPINNER_STATE=0
+    SPINNER_DIR=1
+
+    # Keep FIFO open read/write so read timeouts work without blocking on open.
+    exec 9<>"$fifo" || return 0
+
+    while true; do
+        # Check FIFO for commands (non-blocking)
+        local cmd=""
+        if read -r -t 0.06 -u 9 cmd 2>/dev/null; then
+            case "$cmd" in
+                start)  running=1 ;;
+                stop)   running=0; SPINNER_STATE=0; SPINNER_DIR=1 ;;
+                cancel) printf '1' > "$cancel_file"; _spinner_render_cancelled; running=0 ;;
+                quit)   break ;;
+            esac
+        fi
+
+        # Check for cancel key (non-blocking) while running
+        if (( running )); then
+            local _key=""
+            if read -rsn1 -t 0.005 _key </dev/tty 2>/dev/null; then
+                case "$_key" in
+                    q|Q|$'\x1b')
+                        printf '1' > "$cancel_file"
+                        _spinner_render_cancelled
+                        running=0
+                        ;;
+                esac
+            fi
+        fi
+
+        # Render frame
+        if (( running )); then
+            _spinner_render_bar "$msg_file"
+        fi
+    done
+
+    exec 9>&-
+    exec 9<&-
+}
+
+# Start the background spinner process
+_spinner_ensure_bg() {
+    [[ -n "$SPINNER_PID" ]] && kill -0 "$SPINNER_PID" 2>/dev/null && return 0
+
+    SPINNER_FIFO=$(mktemp -u)
+    mkfifo "$SPINNER_FIFO"
+    SPINNER_MSG_FILE=$(mktemp)
+    SPINNER_CANCEL_FILE=$(mktemp)
+    printf '0' > "$SPINNER_CANCEL_FILE"
+
+    _spinner_loop "$SPINNER_FIFO" "$SPINNER_MSG_FILE" "$SPINNER_CANCEL_FILE" &
+    SPINNER_PID=$!
+}
+
+_spinner_send() {
+    [[ -n "$SPINNER_PID" ]] || return 0
+    kill -0 "$SPINNER_PID" 2>/dev/null || return 0
+    [[ -n "$SPINNER_FIFO" && -p "$SPINNER_FIFO" ]] || return 0
+    printf '%s\n' "$1" > "$SPINNER_FIFO" 2>/dev/null || true
+}
+
+_spinner_kill() {
+    if [[ -n "$SPINNER_PID" ]]; then
+        kill "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+        SPINNER_PID=""
+    fi
+    [[ -n "$SPINNER_FIFO" ]] && rm -f "$SPINNER_FIFO" 2>/dev/null || true
+    [[ -n "$SPINNER_MSG_FILE" ]] && rm -f "$SPINNER_MSG_FILE" 2>/dev/null || true
+    [[ -n "${SPINNER_CANCEL_FILE:-}" ]] && rm -f "$SPINNER_CANCEL_FILE" 2>/dev/null || true
+    SPINNER_FIFO=""
+    SPINNER_MSG_FILE=""
+    SPINNER_CANCEL_FILE=""
+}
+
+# ── Public API (same interface as before) ─────────────────────────────────────
+
 spinner_tick() {
-    [[ -t 1 ]] || return 0
-    local msg="$1"
-    local frames='|/-\\'
-    local ch="${frames:SPINNER_STATE:1}"
-    SPINNER_STATE=$(( (SPINNER_STATE + 1) % 4 ))
-    printf "\r${CYAN}[%s]${RESET} %s" "$ch" "$msg"
+    [[ -e /dev/tty ]] || return 0
+    local now
+    now=$(_now_ms)
+    if (( SPINNER_ACTIVE )) && (( now - SPINNER_LAST_DRAW_MS < SPINNER_MIN_FRAME_MS )); then
+        return 0
+    fi
+
+    # Ensure cancel state file exists for spinner_cancelled checks.
+    if [[ -z "${SPINNER_CANCEL_FILE:-}" || ! -f "$SPINNER_CANCEL_FILE" ]]; then
+        SPINNER_CANCEL_FILE=$(mktemp)
+        printf '0' > "$SPINNER_CANCEL_FILE"
+    fi
+
+    # Poll cancel keys during long loops.
+    local _key=""
+    if read -rsn1 -t 0.001 _key </dev/tty 2>/dev/null; then
+        case "$_key" in
+            q|Q|$'\x1b')
+                printf '1' > "$SPINNER_CANCEL_FILE"
+                _spinner_render_cancelled
+                SPINNER_CANCELLED=1
+                return 0
+                ;;
+        esac
+    fi
+
+    if (( ! SPINNER_ACTIVE )); then
+        SPINNER_ACTIVE=1
+        SPINNER_STARTED_MS=$now
+        SPINNER_PULSES=0
+        SPINNER_STATE=0
+        SPINNER_DIR=1
+        _spinner_render_idle
+        SPINNER_LAST_DRAW_MS=$now
+        return 0
+    fi
+
+    _spinner_render_cylon
+    SPINNER_LAST_DRAW_MS=$now
+}
+
+_spinner_render_idle() {
+    local cols
+    cols=$(_term_cols)
+    local bar_col=$(( cols - SPINNER_BAR_W ))
+    (( bar_col < 1 )) && bar_col=1 || true
+    local widget_col=$(( cols - SPINNER_WIDTH ))
+    (( widget_col < 1 )) && widget_col=1 || true
+
+    local lead_w=$(( SPINNER_WIDTH - SPINNER_BAR_W ))
+    (( lead_w < 0 )) && lead_w=0 || true
+
+    # Build a dim gradient block bar: ░▒▓██...██▓▒░
+    local track="" i edge
+    for (( i = 0; i < SPINNER_BAR_W; i++ )); do
+        edge=$i
+        (( (SPINNER_BAR_W - 1 - i) < edge )) && edge=$(( SPINNER_BAR_W - 1 - i )) || true
+        case "$edge" in
+            0) track+="░" ;;
+            1) track+="▒" ;;
+            2) track+="▓" ;;
+            *) track+="█" ;;
+        esac
+    done
+
+    printf '\0337' >/dev/tty 2>/dev/null || return 0
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
+    printf '%*s' "$SPINNER_WIDTH" '' >/dev/tty 2>/dev/null
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
+    printf '%*s' "$lead_w" '' >/dev/tty 2>/dev/null
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$bar_col" >/dev/tty 2>/dev/null
+    printf '%b' "${DIM}\033[0;36m${track}${RESET}" >/dev/tty 2>/dev/null
+    printf '\0338' >/dev/tty 2>/dev/null
+}
+
+_spinner_render_cylon() {
+    local pos=$SPINNER_STATE
+    local bar="" i dist edge base
+
+    for (( i = 0; i < SPINNER_BAR_W; i++ )); do
+        edge=$i
+        (( (SPINNER_BAR_W - 1 - i) < edge )) && edge=$(( SPINNER_BAR_W - 1 - i )) || true
+        case "$edge" in
+            0) base="░" ;;
+            1) base="▒" ;;
+            2) base="▓" ;;
+            *) base="█" ;;
+        esac
+
+        dist=$(( pos - i ))
+        (( dist < 0 )) && dist=$(( -dist )) || true
+        case "$dist" in
+            0) bar+="\033[1m\033[0;36m█\033[0m" ;;
+            1) bar+="\033[0;36m▓\033[0m" ;;
+            2) bar+="\033[0;36m▒\033[0m" ;;
+            3) bar+="\033[0;36m░\033[0m" ;;
+            *) bar+="\033[2m\033[0;36m${base}\033[0m" ;;
+        esac
+    done
+
+    if (( SPINNER_DIR == 1 )); then
+        SPINNER_STATE=$(( pos + 1 ))
+        if (( SPINNER_STATE >= SPINNER_BAR_W )); then
+            SPINNER_STATE=$(( SPINNER_BAR_W - 2 ))
+            SPINNER_DIR=-1
+            SPINNER_PULSES=$((SPINNER_PULSES + 1))
+        fi
+    else
+        SPINNER_STATE=$(( pos - 1 ))
+        if (( SPINNER_STATE < 0 )); then
+            SPINNER_STATE=1
+            SPINNER_DIR=1
+            SPINNER_PULSES=$((SPINNER_PULSES + 1))
+        fi
+    fi
+
+    local cols
+    cols=$(_term_cols)
+    local bar_col=$(( cols - SPINNER_BAR_W ))
+    (( bar_col < 1 )) && bar_col=1 || true
+    local widget_col=$(( cols - SPINNER_WIDTH ))
+    (( widget_col < 1 )) && widget_col=1 || true
+
+    local lead_w=$(( SPINNER_WIDTH - SPINNER_BAR_W ))
+    (( lead_w < 0 )) && lead_w=0 || true
+
+    printf '\033[?25l\0337' >/dev/tty 2>/dev/null || return 0
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
+    printf '%*s' "$SPINNER_WIDTH" '' >/dev/tty 2>/dev/null
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
+    printf '%*s' "$lead_w" '' >/dev/tty 2>/dev/null
+    printf '\033[%d;%dH' "$SPINNER_ROW" "$bar_col" >/dev/tty 2>/dev/null
+    printf '%b' "$bar" >/dev/tty 2>/dev/null
+    printf '\0338' >/dev/tty 2>/dev/null
+}
+
+spinner_idle() {
+    [[ -e /dev/tty ]] || return 0
+    SPINNER_ACTIVE=0
+    SPINNER_PULSES=0
+    _spinner_render_idle
+    SPINNER_LAST_DRAW_MS=$(_now_ms)
 }
 
 spinner_clear() {
+    [[ -e /dev/tty ]] || return 0
+    local mode="${1:-normal}"
+    if (( SPINNER_ACTIVE )); then
+        if [[ "$mode" != "fast" ]]; then
+            local now elapsed wait_ms
+
+            while (( SPINNER_PULSES < SPINNER_MIN_PULSES )); do
+                _sleep_ms "$SPINNER_MIN_FRAME_MS"
+                _spinner_render_cylon
+            done
+
+            now=$(_now_ms)
+            elapsed=$(( now - SPINNER_STARTED_MS ))
+            wait_ms=$(( SPINNER_MIN_ACTIVE_MS - elapsed ))
+            _sleep_ms "$wait_ms"
+        fi
+        SPINNER_ACTIVE=0
+    fi
+    SPINNER_CANCELLED=0
+    [[ -n "${SPINNER_CANCEL_FILE:-}" && -f "$SPINNER_CANCEL_FILE" ]] && printf '0' > "$SPINNER_CANCEL_FILE" || true
+    printf '\033[?25h' >/dev/tty 2>/dev/null
+    spinner_idle
+}
+
+spinner_cancelled() {
+    [[ -f "${SPINNER_CANCEL_FILE:-}" ]] || return 1
+    local val
+    val=$(<"$SPINNER_CANCEL_FILE") || true
+    if [[ "$val" == "1" ]]; then
+        SPINNER_CANCELLED=1
+        return 0
+    fi
+    return 1
+}
+
+# ── Scroll region pinning ────────────────────────────────────────────────────
+# After drawing the logo + header, call pin_header to freeze those rows.
+# Content printed after this scrolls only within the area below.
+# Call unpin_header (or clear) before a full redraw.
+
+HEADER_PINNED=0
+
+pin_header() {
     [[ -t 1 ]] || return 0
-    printf "\r\033[K\033[?25h"
+    local rows
+    rows=$(_term_lines)
+    local pin_rows=${1:-$((SPINNER_ROW))}    # freeze rows 1..pin_rows
+    # Set scroll region to pin_rows+1 .. bottom
+    printf '\033[%d;%dr' "$((pin_rows + 1))" "$rows" >/dev/tty 2>/dev/null || return 0
+    # Move cursor to first scrollable row
+    printf '\033[%d;1H' "$((pin_rows + 1))" >/dev/tty 2>/dev/null
+    HEADER_PINNED=1
+}
+
+unpin_header() {
+    [[ -t 1 ]] || return 0
+    (( HEADER_PINNED )) || return 0
+    local rows
+    rows=$(_term_lines)
+    # Reset scroll region to full terminal
+    printf '\033[1;%dr' "$rows" >/dev/tty 2>/dev/null || return 0
+    HEADER_PINNED=0
+}
+
+# ── Combined screen redraw ───────────────────────────────────────────────────
+# Replaces the common  clear && print_groot_logo && print_header "..."
+# pattern.  Unpins scroll region, clears, draws logo + header, then
+# re-pins so content scrolls underneath.
+
+draw_screen() {
+    local title="${1:-}"
+    unpin_header
+    # Clear kitty graphics protocol images before clearing screen
+    kitten icat --clear >/dev/tty 2>/dev/null || true
+    clear
+    print_groot_logo
+    [[ -n "$title" ]] && print_header "$title" || true
+    pin_header
+    spinner_idle
 }
 
 print_groot_logo() {
@@ -155,6 +642,98 @@ require_tty() {
     if [[ ! -t 0 || ! -t 1 ]]; then
         die "$action requires an interactive terminal (try: ghostty -e wallctl $action)"
     fi
+}
+
+# Cache the chafa format after first detection
+CHAFA_FMT=""
+detect_chafa_format() {
+    if [[ -n "$CHAFA_FMT" ]]; then
+        printf '%s\n' "$CHAFA_FMT"
+        return 0
+    fi
+
+    # Kitty graphics protocol: ghostty, kitty, WezTerm
+    case "${TERM_PROGRAM:-}:${TERM:-}" in
+        ghostty:*|kitty:*|WezTerm:*)
+            CHAFA_FMT="kitty"
+            ;;
+        *:*kitty*|*:*ghostty*)
+            CHAFA_FMT="kitty"
+            ;;
+    esac
+
+    # Sixel support: foot, mlterm, xterm (if compiled with sixel)
+    if [[ -z "$CHAFA_FMT" ]]; then
+        case "${TERM_PROGRAM:-}:${TERM:-}" in
+            *:foot*|mlterm:*|*:xterm*)
+                CHAFA_FMT="sixels"
+                ;;
+        esac
+    fi
+
+    # Fallback to symbols
+    : "${CHAFA_FMT:=symbols}"
+    printf '%s\n' "$CHAFA_FMT"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Side-by-side column helpers (ANSI-aware)
+# ─────────────────────────────────────────────────────────────────────────────
+
+strip_ansi() {
+    # Remove ANSI escape sequences for visible-length calculation
+    sed 's/\x1b\[[0-9;]*[a-zA-Z]//g; s/\x1b\[[?][0-9]*[a-zA-Z]//g'
+}
+
+visible_len() {
+    # Return visible character count of a string (stripping ANSI codes)
+    local stripped
+    stripped=$(printf '%s' "$1" | strip_ansi)
+    printf '%s\n' "${#stripped}"
+}
+
+pad_to_width() {
+    # Print a line then pad with spaces to reach target visible width
+    local line="$1" target="$2"
+    local vlen
+    vlen=$(visible_len "$line")
+    printf '%s' "$line"
+    local pad=$(( target - vlen ))
+    if (( pad > 0 )); then
+        printf '%*s' "$pad" ""
+    fi
+}
+
+merge_columns() {
+    # Merge two multi-line strings side-by-side
+    # $1 = left text, $2 = right text, $3 = left column width, $4 = separator
+    local left_text="$1" right_text="$2"
+    local left_width="${3:-44}" sep="${4:-  }"
+
+    local -a left_lines=() right_lines=()
+    while IFS= read -r line; do
+        left_lines+=("$line")
+    done <<< "$left_text"
+    while IFS= read -r line; do
+        right_lines+=("$line")
+    done <<< "$right_text"
+
+    local max=${#left_lines[@]}
+    if (( ${#right_lines[@]} > max )); then
+        max=${#right_lines[@]}
+    fi
+
+    local i
+    for (( i = 0; i < max; i++ )); do
+        local l="${left_lines[$i]:-}"
+        local r="${right_lines[$i]:-}"
+        if [[ -n "$r" ]]; then
+            pad_to_width "$l" "$left_width"
+            printf '%s%s\n' "$sep" "$r"
+        else
+            printf '%s\n' "$l"
+        fi
+    done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -235,24 +814,6 @@ resolve_viewer() {
     return 1
 }
 
-thumbnail_pick_index() {
-    local current_idx="$1"
-    shift
-    local picked
-    picked=$(nsxiv -t -n "$current_idx" -o "$@" 2>/dev/null | head -n1 || true)
-    [[ -n "$picked" ]] || return 1
-
-    local i=1 f
-    for f in "$@"; do
-        if [[ "$f" == "$picked" ]]; then
-            printf '%s\n' "$i"
-            return 0
-        fi
-        i=$((i + 1))
-    done
-    return 1
-}
-
 open_image_viewer() {
     local file="$1"
     local viewer
@@ -262,7 +823,7 @@ open_image_viewer() {
         return 1
     }
 
-    spinner_clear
+    spinner_clear fast
     printf '\033[?25h'
     case "$viewer" in
         xdg-open)
@@ -278,13 +839,13 @@ open_image_viewer() {
 }
 
 ensure_layout() {
-    mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR" "$TRASH_DIR" \
+    mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$CACHE_DIR" "$TRASH_DIR" "$THUMB_CACHE_DIR" \
              "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD"
     touch "$SEEN_HASH_LOG"
 }
 
 create_default_config() {
-    [[ -f "$CONFIG_FILE" ]] && return 0
+    [[ -f "$CONFIG_FILE" ]] && return 0 || true
     cat > "$CONFIG_FILE" <<'EOF'
 # wallctl dynamic configuration
 WALLPAPER_DIR_BASE="$HOME/wallpapers"
@@ -361,6 +922,58 @@ is_live_file() {
     local lower
     lower=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
     [[ "$lower" =~ \.(gif|mp4|webm)$ ]]
+}
+
+# get_thumbnail FILE
+# For static images, prints the file path unchanged.
+# For video/gif files, extracts a frame via ffmpegthumbnailer (cached),
+# and prints the cached thumbnail path. Returns 1 if generation fails.
+get_thumbnail() {
+    local file="$1"
+    if ! is_live_file "$file"; then
+        printf '%s' "$file"
+        return 0
+    fi
+
+    mkdir -p "$THUMB_CACHE_DIR"
+
+    # Cache key: full path + mtime hash to avoid cross-dir basename collisions.
+    local mtime cache_key thumb_path
+    mtime=$(stat -c '%Y' "$file" 2>/dev/null || echo "0")
+    cache_key=$(printf '%s|%s' "$file" "$mtime" | sha256sum | cut -d' ' -f1)
+    thumb_path="$THUMB_CACHE_DIR/${cache_key}.jpg"
+
+    if [[ -f "$thumb_path" ]]; then
+        printf '%s' "$thumb_path"
+        return 0
+    fi
+
+    if command -v ffmpegthumbnailer >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${THUMB_GEN_TIMEOUT_SEC}s" ffmpegthumbnailer -i "$file" -o "$thumb_path" -s 320 -q 8 -t 10 2>/dev/null || true
+        else
+            ffmpegthumbnailer -i "$file" -o "$thumb_path" -s 320 -q 8 -t 10 2>/dev/null || true
+        fi
+        if [[ -f "$thumb_path" ]]; then
+            printf '%s' "$thumb_path"
+            return 0
+        fi
+    fi
+
+    # Fallback: try ffmpeg directly with a fast early seek.
+    if command -v ffmpeg >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then
+            timeout "${THUMB_GEN_TIMEOUT_SEC}s" ffmpeg -v error -ss 1 -i "$file" -frames:v 1 -vf "scale=320:-1" -q:v 7 -y "$thumb_path" 2>/dev/null || true
+        else
+            ffmpeg -v error -ss 1 -i "$file" -frames:v 1 -vf "scale=320:-1" -q:v 7 -y "$thumb_path" 2>/dev/null || true
+        fi
+        if [[ -f "$thumb_path" ]]; then
+            printf '%s' "$thumb_path"
+            return 0
+        fi
+    fi
+
+    return 1
 }
 
 list_pool_dirs() {
@@ -454,9 +1067,11 @@ pick_random_wallpaper() {
     local dir file
     local candidates=()
 
+    spinner_tick "picking wallpaper"
     while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
         while IFS= read -r -d '' file; do
+            spinner_tick "scanning $(basename "$file")"
             if is_selectable_wallpaper "$file"; then
                 candidates+=("$file")
             fi
@@ -464,6 +1079,7 @@ pick_random_wallpaper() {
                       -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
                       -o -iname '*.mp4' -o -iname '*.webm' \) -print0)
     done < <(list_pool_dirs "$pool")
+    spinner_clear fast
 
     if (( ${#candidates[@]} == 0 )); then
         return 1
@@ -480,7 +1096,15 @@ warn_if_over_limit() {
 }
 
 duplicate_count() {
-    python3 - "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD" <<'PY'
+    local now
+    now=$(_now_ms)
+    if [[ -n "$DUP_COUNT_CACHE_VALUE" ]] && (( now - DUP_COUNT_CACHE_MS < DUP_COUNT_CACHE_TTL_MS )); then
+        printf '%s\n' "$DUP_COUNT_CACHE_VALUE"
+        return 0
+    fi
+
+    local dups
+    dups=$(python3 - "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD" <<'PY'
 import hashlib, sys
 from pathlib import Path
 dirs=[Path(p) for p in sys.argv[1:]]
@@ -499,6 +1123,11 @@ for d in dirs:
             hashes[h]=f
 print(dups)
 PY
+
+)
+    DUP_COUNT_CACHE_VALUE="$dups"
+    DUP_COUNT_CACHE_MS=$now
+    printf '%s\n' "$dups"
 }
 
 duplicate_report() {
@@ -515,6 +1144,7 @@ duplicate_report() {
 
 purge_seen_hash_log() {
     [[ -f "$SEEN_HASH_LOG" ]] || return 0
+    spinner_tick "purging hash log"
     python3 - "$SEEN_HASH_LOG" "$HASH_RETENTION_DAYS" <<'PY'
 import time, sys
 from pathlib import Path
@@ -546,6 +1176,7 @@ with path.open('w') as f:
     for ts, h, src in out:
         f.write(f"{ts}\t{h}\t{src}\n")
 PY
+    spinner_clear
 }
 
 hash_seen_recent() {
@@ -562,10 +1193,14 @@ record_seen_hash() {
 
 build_hash_cache() {
     : > "$STATE_DIR/hashes.txt"
+    spinner_tick "hashing files"
     find "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD" \
          -maxdepth 1 -type f -print0 2>/dev/null | while IFS= read -r -d '' file; do
+        spinner_tick "hashing $(basename "$file")"
+        spinner_cancelled && break
         sha256sum "$file"
     done >> "$STATE_DIR/hashes.txt" || true
+    spinner_clear
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -580,7 +1215,7 @@ download_image() {
         url="${url%.gifv}.mp4"
         base="${base%.gifv}.mp4"
     fi
-    [[ -z "$base" ]] && return 1
+    [[ -z "$base" ]] && return 1 || true
     name=$(printf '%s' "$base" | tr -cd '[:alnum:]._-')
     valid_ext "${name,,}" || return 1
     out="$WALLPAPER_DIR_NEW/$name"
@@ -649,9 +1284,12 @@ github_urls_for_source() {
 
 purge_trash() {
     if [[ -d "$TRASH_DIR" ]]; then
+        spinner_tick "counting trash"
         local count
         count=$(find "$TRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+        spinner_tick "purging $count file(s)"
         rm -rf "${TRASH_DIR:?}"/*
+        spinner_clear
         if (( count > 0 )); then
             print_info "purged $count file(s) from trash"
         fi
@@ -663,12 +1301,12 @@ cmd_trash() {
     local action="${1:-list}"
     case "$action" in
         --list|list)
-            clear
-            print_groot_logo
-            print_header "trash"
+            draw_screen "trash"
             if [[ -d "$TRASH_DIR" ]]; then
+                spinner_tick "scanning trash"
                 local count
                 count=$(find "$TRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
+                spinner_clear
                 print_info "$count file(s) in trash"
                 find "$TRASH_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort
             else
@@ -676,9 +1314,7 @@ cmd_trash() {
             fi
             ;;
         --purge|purge)
-            clear
-            print_groot_logo
-            print_header "trash"
+            draw_screen "trash"
             purge_trash
             ;;
         *)
@@ -688,17 +1324,118 @@ cmd_trash() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Interactive menu selector (arrow keys / j,k / number keys)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# menu_select RESULT_VAR label1 label2 ...
+#   Renders a navigable menu, returns the 1-based index in RESULT_VAR.
+#   Returns 0 on selection, 1 on quit.
+#   Supports: arrow up/down, j/k, number keys (instant), Enter, q to quit.
+menu_select() {
+    local _result_var="$1"
+    shift
+    local -a items=("$@")
+    local count=${#items[@]}
+    local sel=0
+
+    # Hide cursor
+    printf '\033[?25l'
+
+    # Print all items (initial render)
+    local i
+    for (( i = 0; i < count; i++ )); do
+        if (( i == sel )); then
+            printf "  \033[7m ${items[$i]} \033[0m\n"
+        else
+            printf "   ${items[$i]}\n"
+        fi
+    done
+    # Hint line
+    printf "\n  ${DIM}j/k or arrows to move, Enter to select, q to quit${RESET}\n"
+
+    while :; do
+        # Read a single key
+        local key
+        IFS= read -rsn1 key
+
+        local prev_sel=$sel
+
+        case "$key" in
+            # Arrow keys: ESC [ A/B
+            $'\x1b')
+                local seq1 seq2
+                read -rsn1 -t 0.05 seq1 || true
+                read -rsn1 -t 0.05 seq2 || true
+                case "$seq1$seq2" in
+                    '[A') (( sel > 0 )) && sel=$((sel - 1)) ;;           # up
+                    '[B') (( sel < count - 1 )) && sel=$((sel + 1)) ;;   # down
+                esac
+                ;;
+            j|J) (( sel < count - 1 )) && sel=$((sel + 1)) ;;
+            k|K) (( sel > 0 )) && sel=$((sel - 1)) ;;
+            # Enter
+            "")
+                printf '\033[?25h'
+                eval "$_result_var=$((sel + 1))"
+                return 0
+                ;;
+            q|Q)
+                printf '\033[?25h'
+                eval "$_result_var=0"
+                return 1
+                ;;
+            # Number keys: instant select
+            [1-9])
+                local num=$((key))
+                if (( num >= 1 && num <= count )); then
+                    printf '\033[?25h'
+                    # Redraw to show selection before acting
+                    sel=$((num - 1))
+                    printf '\033[%dA' "$((count + 2))"
+                    for (( i = 0; i < count; i++ )); do
+                        printf '\033[2K\r'
+                        if (( i == sel )); then
+                            printf "  \033[7m ${items[$i]} \033[0m\n"
+                        else
+                            printf "   ${items[$i]}\n"
+                        fi
+                    done
+                    printf '\033[2K\r\n\033[2K\r'
+                    eval "$_result_var=$num"
+                    return 0
+                fi
+                ;;
+        esac
+
+        # Redraw only if selection changed
+        if (( prev_sel != sel )); then
+            # Move cursor up to top of menu (count items + 2 for hint)
+            printf '\033[%dA' "$((count + 2))"
+            for (( i = 0; i < count; i++ )); do
+                printf '\033[2K\r'
+                if (( i == sel )); then
+                    printf "  \033[7m ${items[$i]} \033[0m\n"
+                else
+                    printf "   ${items[$i]}\n"
+                fi
+            done
+            # Redraw hint
+            printf "\033[2K\r\n\033[2K\r  ${DIM}j/k or arrows to move, Enter to select, q to quit${RESET}\n"
+        fi
+    done
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Dashboard renderer (shared by menu + status)
 # ─────────────────────────────────────────────────────────────────────────────
 
 render_dashboard() {
-    local new_count current_count old_count trash_count dups saver_state
+    local new_count current_count old_count trash_count saver_state
 
     new_count=$(count_media "$WALLPAPER_DIR_NEW")
     current_count=$(count_media "$WALLPAPER_DIR_CURRENT")
     old_count=$(count_media "$WALLPAPER_DIR_OLD")
     trash_count=$(find "$TRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
-    dups=$(duplicate_count)
 
     if screensaver_is_running; then
         saver_state="on"
@@ -706,48 +1443,86 @@ render_dashboard() {
         saver_state="off"
     fi
 
-    printf "\n"
-    printf "  ${BOLD}%-20s${RESET} %-6s" "inbox (new)" "$new_count"
+    # Build left column (pool stats + runtime info)
+    local left=""
+    left+="$(printf "  ${BOLD}%-20s${RESET} %-6s" "inbox (new)" "$new_count")"
     if (( new_count > 0 )); then
-        printf "  ${DIM}unreviewed downloads${RESET}"
+        left+="$(printf "  ${DIM}unreviewed${RESET}")"
     fi
-    printf "\n"
+    left+=$'\n'
 
-    printf "  ${BOLD}%-20s${RESET} %-6s" "active (current)" "$current_count"
+    left+="$(printf "  ${BOLD}%-20s${RESET} %-6s" "active (current)" "$current_count")"
     if (( current_count > MAX_CURRENT_WARN )); then
-        printf "  ${YELLOW}over limit (%s)${RESET}" "$MAX_CURRENT_WARN"
+        left+="$(printf "  ${YELLOW}over limit${RESET}")"
     fi
-    printf "\n"
+    left+=$'\n'
 
-    printf "  ${BOLD}%-20s${RESET} %-6s\n" "archive (old)" "$old_count"
-
-    if (( dups > 0 )); then
-        printf "  ${BOLD}%-20s${RESET} %-6s  ${YELLOW}run dedupe${RESET}\n" "duplicates" "$dups"
-    fi
+    left+="$(printf "  ${BOLD}%-20s${RESET} %-6s" "archive (old)" "$old_count")"
+    left+=$'\n'
 
     if (( trash_count > 0 )); then
-        printf "  ${DIM}%-20s %-6s${RESET}\n" "trash" "$trash_count"
+        left+="$(printf "  ${DIM}%-20s %-6s${RESET}" "trash" "$trash_count")"
+        left+=$'\n'
     fi
 
+    left+=$'\n'
+    left+="$(printf "  ${BOLD}%-20s${RESET} %-6s  %s, %ss" \
+           "screensaver" "$saver_state" "$SCREENSAVER_MODE" "$SCREENSAVER_INTERVAL")"
+    left+=$'\n'
+    left+="$(printf "  ${BOLD}%-20s${RESET} %-6s  pool: %s" \
+           "rotation" "on" "$ROTATION_POOL")"
+
+    # Build right column (current wallpaper preview)
+    local right="" current_wp=""
+    if command -v chafa >/dev/null 2>&1; then
+        current_wp=$(get_current_wallpaper 2>/dev/null || true)
+        if [[ -n "$current_wp" && -f "$current_wp" ]] && ! is_live_file "$current_wp"; then
+            local wp_name
+            wp_name=$(basename "$current_wp")
+            # Truncate long filenames
+            if (( ${#wp_name} > 28 )); then
+                wp_name="${wp_name:0:25}..."
+            fi
+            right="$(printf " ${DIM}now playing${RESET}")"
+            right+=$'\n'
+            spinner_tick "rendering preview"
+            right+="$(chafa -f "$(detect_chafa_format)" -s 28x8 "$current_wp" 2>/dev/null || true)"
+            spinner_clear
+            right+=$'\n'
+            right+="$(printf " ${DIM}%s${RESET}" "$wp_name")"
+        elif [[ -n "$current_wp" ]] && is_live_file "$current_wp"; then
+            local wp_name
+            wp_name=$(basename "$current_wp")
+            if (( ${#wp_name} > 28 )); then
+                wp_name="${wp_name:0:25}..."
+            fi
+            right="$(printf " ${DIM}now playing${RESET}")"
+            right+=$'\n'
+            right+="$(printf " ${MAGENTA}[live wallpaper]${RESET}")"
+            right+=$'\n'
+            right+="$(printf " ${DIM}%s${RESET}" "$wp_name")"
+        fi
+    fi
+
+    # Merge columns and output
     printf "\n"
-    printf "  ${BOLD}%-20s${RESET} %-6s  %s, %ss, pool: %s\n" \
-           "screensaver" "$saver_state" "$SCREENSAVER_MODE" "$SCREENSAVER_INTERVAL" "$SCREENSAVER_POOL"
-    printf "  ${BOLD}%-20s${RESET} %-6s  pool: %s\n" \
-           "rotation" "on" "$ROTATION_POOL"
+    if [[ -n "$right" ]]; then
+        merge_columns "$left" "$right" 42 "  "
+    else
+        printf '%s\n' "$left"
+    fi
     printf "\n"
 
     # Return values for suggested action
     DASH_NEW_COUNT="$new_count"
     DASH_CURRENT_COUNT="$current_count"
-    DASH_DUPS="$dups"
+    DASH_DUPS="0"
 }
 
 suggest_action() {
     local suggestion=""
     if (( DASH_NEW_COUNT > 0 )); then
         suggestion="review $DASH_NEW_COUNT inbox wallpapers"
-    elif (( DASH_DUPS > 0 )); then
-        suggestion="run dedupe to clean $DASH_DUPS duplicate(s)"
     elif (( DASH_CURRENT_COUNT > MAX_CURRENT_WARN )); then
         suggestion="archive: current ($DASH_CURRENT_COUNT) is over limit ($MAX_CURRENT_WARN)"
     elif (( DASH_NEW_COUNT == 0 )); then
@@ -779,9 +1554,7 @@ cmd_fetch() {
 
     require_commands curl jq identify sha256sum
     load_config
-    clear
-    print_groot_logo
-    print_header "download wallpapers"
+    draw_screen "download wallpapers"
     if (( ${#GITHUB_SOURCES[@]} > 0 )); then
         TOTAL_STEPS=6
     else
@@ -815,15 +1588,17 @@ cmd_fetch() {
     print_step "fetch wallhaven themed wallpapers"
     local q urls
     wallhaven_batch=$(( limit * 3 ))
-    (( wallhaven_batch < 15 )) && wallhaven_batch=15
+    (( wallhaven_batch < 15 )) && wallhaven_batch=15 || true
     for q in "${KEYWORDS[@]}"; do
-        (( imported >= target )) && break
+        (( imported >= target )) && break || true
+        spinner_cancelled && break
         spinner_tick "wallhaven: $q ($imported/$target)"
         urls=$(curl -A "$USER_AGENT" -sS \
             "https://wallhaven.cc/api/v1/search?q=${q}&categories=111&purity=${WALLHAVEN_PURITY}&sorting=${WALLHAVEN_SORT}&atleast=${MIN_WIDTH}x${MIN_HEIGHT}" \
             | jq -r '.data[].path' | head -n "$wallhaven_batch")
         while IFS= read -r url; do
-            (( imported >= target )) && break
+            (( imported >= target )) && break || true
+            spinner_cancelled && break
             [[ -z "$url" ]] && continue
             local live=0
             is_live_url "$url" && live=1
@@ -845,14 +1620,14 @@ cmd_fetch() {
             fi
         done <<< "$urls"
     done
-    spinner_clear
 
     print_step "fetch reddit themed wallpapers"
     local sub reddit_urls
     reddit_batch=$(( limit * 3 ))
-    (( reddit_batch < 20 )) && reddit_batch=20
+    (( reddit_batch < 20 )) && reddit_batch=20 || true
     for sub in "${REDDIT_SUBS[@]}"; do
-        (( imported >= target )) && break
+        (( imported >= target )) && break || true
+        spinner_cancelled && break
         spinner_tick "reddit: r/$sub ($imported/$target)"
         # Extract image/video URLs from reddit listings
         reddit_urls=$(curl -A "$USER_AGENT" -sS \
@@ -869,7 +1644,8 @@ cmd_fetch() {
             | sed 's/\?.*$//' \
             || true)
         while IFS= read -r url; do
-            (( imported >= target )) && break
+            (( imported >= target )) && break || true
+            spinner_cancelled && break
             [[ -z "$url" ]] && continue
             local live=0
             is_live_url "$url" && live=1
@@ -891,7 +1667,6 @@ cmd_fetch() {
             fi
         done <<< "$reddit_urls"
     done
-    spinner_clear
 
     if (( ${#GITHUB_SOURCES[@]} > 0 )); then
         print_step "fetch github wallpaper repos"
@@ -900,12 +1675,14 @@ cmd_fetch() {
         else
             local source gh_urls
             for source in "${GITHUB_SOURCES[@]}"; do
-                (( imported >= target )) && break
+                (( imported >= target )) && break || true
+                spinner_cancelled && break
                 spinner_tick "github: $source ($imported/$target)"
                 gh_urls=$(github_urls_for_source "$source" \
                     | grep -Ei '\.(jpg|jpeg|png|webp|gif|mp4|webm)$' || true)
                 while IFS= read -r url; do
-                    (( imported >= target )) && break
+                    (( imported >= target )) && break || true
+                    spinner_cancelled && break
                     [[ -z "$url" ]] && continue
                     local live=0
                     is_live_url "$url" && live=1
@@ -934,12 +1711,14 @@ cmd_fetch() {
     print_step "fill remaining slots"
     if (( imported < target )); then
         for q in "${KEYWORDS[@]}"; do
-            (( imported >= target )) && break
+            (( imported >= target )) && break || true
+            spinner_cancelled && break
             urls=$(curl -A "$USER_AGENT" -sS \
                 "https://wallhaven.cc/api/v1/search?q=${q}&categories=111&purity=${WALLHAVEN_PURITY}&sorting=${WALLHAVEN_SORT}&atleast=${MIN_WIDTH}x${MIN_HEIGHT}" \
                 | jq -r '.data[].path' | head -n "$wallhaven_batch")
             while IFS= read -r url; do
-                (( imported >= target )) && break
+                (( imported >= target )) && break || true
+                spinner_cancelled && break
                 [[ -z "$url" ]] && continue
                 processed=$((processed + 1))
                 spinner_tick "fill: $imported/$target"
@@ -971,14 +1750,6 @@ cmd_fetch() {
 # ─────────────────────────────────────────────────────────────────────────────
 # cmd_triage (review)
 # ─────────────────────────────────────────────────────────────────────────────
-
-triage_action_tty() {
-    local action
-    printf "\naction: " >&2
-    read -r -n1 action
-    printf "\n" >&2
-    printf '%s' "$action"
-}
 
 triage_undo() {
     if (( ${#UNDO_ACTIONS[@]} == 0 )); then
@@ -1013,7 +1784,7 @@ triage_undo() {
 }
 
 cmd_triage() {
-    require_commands identify chafa
+    require_commands identify kitten
     load_config
     require_tty "review"
     local source_pool="$REVIEW_POOL"
@@ -1042,202 +1813,545 @@ cmd_triage() {
     UNDO_SRC_PATHS=()
     UNDO_DST_PATHS=()
 
-    clear
-    print_groot_logo
-    print_header "review ($source_pool)"
+    draw_screen "review ($source_pool)"
 
-    shopt -s nullglob
-    local files=("$source_dir"/*)
-    shopt -u nullglob
+    # Load file list
+    triage_refresh_files() {
+        shopt -s nullglob
+        files=("$source_dir"/*)
+        shopt -u nullglob
+        total=${#files[@]}
+    }
 
-    if (( ${#files[@]} == 0 )); then
+    local -a files=()
+    local total=0
+    triage_refresh_files
+
+    if (( total == 0 )); then
         print_info "no files in $source_pool"
         return 0
     fi
 
-    local kept=0 moved_old=0 deleted=0 skipped=0 idx=1 total=${#files[@]} quit_requested=0
-    local file w h size action media_type
-    while (( idx <= total )); do
-        file="${files[$((idx - 1))]}"
+    local kept=0 moved_old=0 deleted=0 quit_requested=0
 
-        if [[ ! -f "$file" ]]; then
-            idx=$((idx + 1))
-            continue
-        fi
+    # Marked indices (0-based into files array) stored as pipe-delimited string
+    local marked=""
 
-        read -r w h <<< "$(get_media_dimensions "$file")"
-        size=$(du -h "$file" | awk '{print $1}')
-        if is_live_file "$file"; then
-            media_type="live"
+    # Helper: toggle mark on a 0-based index
+    triage_toggle_mark() {
+        local idx="$1"
+        if [[ "|${marked}|" == *"|${idx}|"* ]]; then
+            # Remove: rebuild without this index
+            local new_marked="" entry
+            IFS='|' read -ra _m_arr <<< "$marked"
+            for entry in "${_m_arr[@]}"; do
+                [[ "$entry" == "$idx" ]] && continue
+                [[ -z "$entry" ]] && continue
+                new_marked="${new_marked:+${new_marked}|}${entry}"
+            done
+            marked="$new_marked"
         else
-            media_type="static"
+            marked="${marked:+${marked}|}${idx}"
+        fi
+    }
+
+    # Helper: count marked items
+    triage_mark_count() {
+        if [[ -z "$marked" ]]; then
+            echo 0
+            return
+        fi
+        local count=0
+        IFS='|' read -ra _m_arr <<< "$marked"
+        for entry in "${_m_arr[@]}"; do
+            [[ -n "$entry" ]] && count=$((count + 1)) || true
+        done
+        echo "$count"
+    }
+
+    # Helper: perform action on a single file (0-based index)
+    # Returns 0 on success. Caller must refresh files after.
+    triage_act_on_file() {
+        local action="$1" file="$2"
+        local bname
+        bname=$(basename "$file")
+        case "$action" in
+            keep)
+                if [[ "$source_pool" != "current" ]]; then
+                    mv "$file" "$WALLPAPER_DIR_CURRENT/"
+                    UNDO_ACTIONS+=("keep")
+                    UNDO_SRC_PATHS+=("$file")
+                    UNDO_DST_PATHS+=("$WALLPAPER_DIR_CURRENT/$bname")
+                fi
+                kept=$((kept + 1))
+                ;;
+            archive)
+                if [[ "$source_pool" != "old" ]]; then
+                    mv "$file" "$WALLPAPER_DIR_OLD/"
+                    UNDO_ACTIONS+=("archive")
+                    UNDO_SRC_PATHS+=("$file")
+                    UNDO_DST_PATHS+=("$WALLPAPER_DIR_OLD/$bname")
+                fi
+                moved_old=$((moved_old + 1))
+                ;;
+            delete)
+                local trash_name="${source_pool}__${bname}"
+                mkdir -p "$TRASH_DIR"
+                mv "$file" "$TRASH_DIR/$trash_name"
+                UNDO_ACTIONS+=("delete")
+                UNDO_SRC_PATHS+=("$file")
+                UNDO_DST_PATHS+=("$TRASH_DIR/$trash_name")
+                deleted=$((deleted + 1))
+                ;;
+        esac
+    }
+
+    # Helper: bulk action on all marked files
+    triage_bulk_action() {
+        local action="$1"
+        local mc
+        mc=$(triage_mark_count)
+        if (( mc == 0 )); then
+            print_warn "no items marked"
+            sleep 1
+            return
         fi
 
-        while :; do
-            clear
-            print_groot_logo
-            printf "${BOLD}${MAGENTA}[${idx}/${total}]${RESET} %s\n" "$(basename "$file")"
-            printf "%sx%s | %s | %s\n\n" "$w" "$h" "$size" "$media_type"
+        # Confirm
+        local action_label
+        case "$action" in
+            keep) action_label="keep (move to current)" ;;
+            archive) action_label="archive (move to old)" ;;
+            delete) action_label="delete (move to trash)" ;;
+        esac
+        printf "\n  ${BOLD}%s${RESET} %d marked wallpapers? ${DIM}[y/N]${RESET} " "$action_label" "$mc"
+        local yn
+        read -rsn1 yn
+        printf "\n"
+        [[ "$yn" == "y" || "$yn" == "Y" ]] || return
 
-            # Primary keys
-            printf "  ${DIM}<-/${RESET}${LIGHT_MAGENTA}h${RESET} back    "
-            printf "${DIM}->${RESET}/${CYAN}l${RESET} next    "
-            printf "${GREEN}Enter${RESET} keep    "
-            printf "${MAGENTA}a${RESET} archive    "
-            printf "${RED}d${RESET} delete    "
-            printf "${YELLOW}q${RESET} quit\n"
-            printf "  ${DIM}?=more keys${RESET}\n\n"
-
-            if ! is_live_file "$file"; then
-                chafa -f symbols -s 80x24 "$file" || true
-            else
-                printf "  ${DIM}[live wallpaper - press v to preview]${RESET}\n"
-            fi
-
-            action=$(triage_action_tty)
-
-            case "$action" in
-                # Enter key (empty read from -n1)
-                "")
-                    if [[ "$source_pool" != "current" ]]; then
-                        mv "$file" "$WALLPAPER_DIR_CURRENT/"
-                        UNDO_ACTIONS+=("keep")
-                        UNDO_SRC_PATHS+=("$file")
-                        UNDO_DST_PATHS+=("$WALLPAPER_DIR_CURRENT/$(basename "$file")")
-                    fi
-                    kept=$((kept + 1))
-                    idx=$((idx + 1))
-                    break
-                    ;;
-                k|K)
-                    if [[ "$source_pool" != "current" ]]; then
-                        mv "$file" "$WALLPAPER_DIR_CURRENT/"
-                        UNDO_ACTIONS+=("keep")
-                        UNDO_SRC_PATHS+=("$file")
-                        UNDO_DST_PATHS+=("$WALLPAPER_DIR_CURRENT/$(basename "$file")")
-                    fi
-                    kept=$((kept + 1))
-                    idx=$((idx + 1))
-                    break
-                    ;;
-                a|A|j|J|o|O)
-                    if [[ "$source_pool" != "old" ]]; then
-                        mv "$file" "$WALLPAPER_DIR_OLD/"
-                        UNDO_ACTIONS+=("archive")
-                        UNDO_SRC_PATHS+=("$file")
-                        UNDO_DST_PATHS+=("$WALLPAPER_DIR_OLD/$(basename "$file")")
-                    fi
-                    moved_old=$((moved_old + 1))
-                    idx=$((idx + 1))
-                    break
-                    ;;
-                d|D|x|X)
-                    # Soft-delete: move to trash instead of rm
-                    local trash_name="${source_pool}__$(basename "$file")"
-                    mv "$file" "$TRASH_DIR/$trash_name"
-                    UNDO_ACTIONS+=("delete")
-                    UNDO_SRC_PATHS+=("$file")
-                    UNDO_DST_PATHS+=("$TRASH_DIR/$trash_name")
-                    deleted=$((deleted + 1))
-                    idx=$((idx + 1))
-                    break
-                    ;;
-                l|L|s|S)
-                    skipped=$((skipped + 1))
-                    idx=$((idx + 1))
-                    break
-                    ;;
-                h|H|b|B|p|P)
-                    if (( idx > 1 )); then
-                        idx=$((idx - 1))
-                        break
-                    else
-                        print_warn "already at first image"
-                        sleep 1
-                    fi
-                    ;;
-                v|V)
-                    if is_live_file "$file"; then
-                        if command -v mpv >/dev/null 2>&1; then
-                            mpv --loop --no-audio --really-quiet "$file" 2>/dev/null || true
-                        else
-                            print_warn "mpv not installed for video preview"
-                            sleep 1
-                        fi
-                    else
-                        open_image_viewer "$file"
-                    fi
-                    ;;
-                t|T)
-                    if command -v nsxiv >/dev/null 2>&1; then
-                        print_info "thumbnails: move, press m to mark, then q to return"
-                        sleep 1
-                        local new_idx
-                        if new_idx=$(thumbnail_pick_index "$idx" "${files[@]}"); then
-                            idx="$new_idx"
-                            file="${files[$((idx - 1))]}"
-                            read -r w h <<< "$(get_media_dimensions "$file")"
-                            size=$(du -h "$file" | awk '{print $1}')
-                        fi
-                    else
-                        print_warn "nsxiv not installed for thumbnail mode"
-                        sleep 1
-                    fi
-                    ;;
-                u|U)
-                    triage_undo || true
-                    ;;
-                i|I)
-                    local fhash
-                    fhash=$(sha256sum "$file" | awk '{print $1}')
-                    printf "\n${BOLD}file info${RESET}\n"
-                    printf "  path: %s\n" "$file"
-                    printf "  hash: %s\n" "$fhash"
-                    printf "  dims: %sx%s\n" "$w" "$h"
-                    printf "  size: %s\n" "$size"
-                    printf "  type: %s\n" "$media_type"
-                    printf "\nPress Enter..."
-                    read -r _
-                    ;;
-                ?)
-                    printf "\n${BOLD}extended keys${RESET}\n"
-                    printf "  ${BLUE}v${RESET}  open in viewer        "
-                    printf "${LIGHT_BLUE}t${RESET}  thumbnail grid (nsxiv)\n"
-                    printf "  ${LIGHT_GREEN}u${RESET}  undo last action      "
-                    printf "${CYAN}i${RESET}  file info (hash, source)\n"
-                    printf "\nPress Enter..."
-                    read -r _
-                    ;;
-                q|Q)
-                    quit_requested=1
-                    break
-                    ;;
-                *)
-                    print_warn "unknown key (press ? for help)"
-                    sleep 1
-                    ;;
-            esac
+        # Process marked items (iterate in reverse to avoid index shift issues)
+        IFS='|' read -ra _m_arr <<< "$marked"
+        local -a sorted_indices=()
+        for entry in "${_m_arr[@]}"; do
+            [[ -n "$entry" ]] && sorted_indices+=("$entry") || true
         done
+        # Sort descending so removals don't shift indices
+        IFS=$'\n' sorted_indices=($(sort -rn <<< "${sorted_indices[*]}")); unset IFS
 
-        if (( quit_requested == 1 )); then
+        local processed=0
+        for idx in "${sorted_indices[@]}"; do
+            spinner_cancelled && break
+            if (( idx < total )) && [[ -f "${files[$idx]}" ]]; then
+                processed=$((processed + 1))
+                spinner_tick "$action $processed/$mc"
+                triage_act_on_file "$action" "${files[$idx]}"
+            fi
+        done
+        spinner_clear
+
+        marked=""
+        triage_refresh_files
+
+        printf "  ${GREEN}done${RESET}: %s %d items\n" "$action" "$mc"
+        log "triage: bulk $action $mc items"
+        sleep 1
+    }
+
+    # ── Grid view (thumbnail-first) ────────────────────────────────────────
+
+    # Helper: check if global index is in marked string (0=marked, 1=not)
+    _is_marked() {
+        [[ "|${marked}|" == *"|${1}|"* ]]
+    }
+
+    # Helper: update labels after cursor moves (avoids full redraw when on same page)
+    # Usage: cursor=$new_value; _grid_update_cursor
+    # Reads: cursor, old_cursor, page, per_page, page_start, files[], need_full_redraw
+    _grid_update_cursor() {
+        if (( cursor == old_cursor )); then
+            return 0
+        fi
+        if (( cursor / per_page + 1 == page )); then
+            local old_local=$(( old_cursor - page_start ))
+            local new_local=$(( cursor - page_start ))
+            local old_m=0 new_m=0
+            _is_marked "$old_cursor" && old_m=1 || true
+            _is_marked "$cursor" && new_m=1 || true
+            browse_update_label "$old_local" 0 "$old_m" "$(basename "${files[$old_cursor]}")"
+            browse_update_label "$new_local" 1 "$new_m" "$(basename "${files[$cursor]}")"
+        else
+            need_full_redraw=1
+        fi
+    }
+
+    # Helper: repaint status line and footer after mark count changes
+    _grid_update_mark_ui() {
+        local mc
+        mc=$(triage_mark_count)
+        local status_row=$(( SPINNER_ROW + 1 ))
+        local grid_top=$(( SPINNER_ROW + 3 ))
+        local cell_h=$(( BROWSE_THUMB_H + 2 ))
+        local footer_row=$(( grid_top + BROWSE_ROWS * cell_h + 2 ))
+
+        # Save cursor to restore position after status/footer repaint
+        printf '\0337' >/dev/tty 2>/dev/null
+
+        # Repaint status line
+        printf '\033[%d;1H\033[2K' "$status_row" >/dev/tty 2>/dev/null
+        printf '%b' "${BOLD}${MAGENTA}  review${RESET} ${DIM}($source_pool)${RESET}  " >/dev/tty 2>/dev/null
+        printf '%b' "${DIM}page $page/$total_pages  |  $total wallpapers${RESET}" >/dev/tty 2>/dev/null
+        if (( mc > 0 )); then
+            printf '%b' "  ${BOLD}${CYAN}[$mc marked]${RESET}" >/dev/tty 2>/dev/null
+        fi
+
+        # Disable auto-wrap to prevent scroll when writing at bottom of scroll region
+        printf '\033[?7l' >/dev/tty 2>/dev/null
+        # Repaint footer line
+        printf '\033[%d;1H\033[2K' "$footer_row" >/dev/tty 2>/dev/null
+        printf '%b' "  ${DIM}hjkl${RESET}/arrows navigate  " >/dev/tty 2>/dev/null
+        printf '%b' "${CYAN}space${RESET} mark  " >/dev/tty 2>/dev/null
+        printf '%b' "${GREEN}enter${RESET} expand  " >/dev/tty 2>/dev/null
+        if (( mc > 0 )); then
+            printf '%b' "${GREEN}K${RESET} keep  ${MAGENTA}A${RESET} archive  ${RED}D${RESET} delete  " >/dev/tty 2>/dev/null
+        fi
+        printf '%b' "${LIGHT_GREEN}u${RESET} undo  " >/dev/tty 2>/dev/null
+        printf '%b' "${YELLOW}q${RESET} quit" >/dev/tty 2>/dev/null
+        # Re-enable auto-wrap and restore cursor
+        printf '\033[?7h' >/dev/tty 2>/dev/null
+        printf '\0338' >/dev/tty 2>/dev/null
+    }
+
+    local per_page total_pages
+    local page=1
+    local cursor=0  # global index of cursor position
+    local need_full_redraw=1
+
+    while :; do
+        # Recalculate layout (handles terminal resize)
+        browse_calc_layout
+        per_page=$(( BROWSE_COLS * BROWSE_ROWS ))
+        total_pages=$(( (total + per_page - 1) / per_page ))
+        (( total_pages < 1 )) && total_pages=1 || true
+        (( page > total_pages )) && page=$total_pages || true
+
+        if (( total == 0 )); then
+            draw_screen "review ($source_pool)"
+            print_info "all wallpapers processed"
             break
         fi
+
+        # Clamp cursor
+        (( cursor >= total )) && cursor=$((total - 1)) || true
+        (( cursor < 0 )) && cursor=0 || true
+
+        # Check if cursor moved to a different page
+        local new_page=$(( cursor / per_page + 1 ))
+        if (( new_page != page )); then
+            page=$new_page
+            need_full_redraw=1
+        fi
+
+        if (( need_full_redraw )); then
+            local cursor_local=$(( cursor - (page - 1) * per_page ))
+
+            draw_screen
+            local mc
+            mc=$(triage_mark_count)
+            printf '%b' "${BOLD}${MAGENTA}  review${RESET} ${DIM}($source_pool)${RESET}  "
+            printf '%b' "${DIM}page $page/$total_pages  |  $total wallpapers${RESET}"
+            if (( mc > 0 )); then
+                printf '%b' "  ${BOLD}${CYAN}[$mc marked]${RESET}"
+            fi
+            printf "\n\n"
+
+            browse_render_page "$page" "$per_page" "$total" "$total_pages" "$marked" "$cursor_local" "${files[@]}"
+
+            # Position footer using absolute coords to avoid scroll-region scrolling
+            local grid_top_r=$(( SPINNER_ROW + 3 ))
+            local cell_h_r=$(( BROWSE_THUMB_H + 2 ))
+            local footer_row_r=$(( grid_top_r + BROWSE_ROWS * cell_h_r + 2 ))
+            # Disable auto-wrap to prevent scroll when writing at bottom of scroll region
+            printf '\033[?7l' >/dev/tty 2>/dev/null
+            printf '\033[%d;1H\033[2K' "$footer_row_r" >/dev/tty 2>/dev/null
+            printf '%b' "  ${DIM}hjkl${RESET}/arrows navigate  " >/dev/tty 2>/dev/null
+            printf '%b' "${CYAN}space${RESET} mark  " >/dev/tty 2>/dev/null
+            printf '%b' "${GREEN}enter${RESET} expand  " >/dev/tty 2>/dev/null
+            if (( mc > 0 )); then
+                printf '%b' "${GREEN}K${RESET} keep  ${MAGENTA}A${RESET} archive  ${RED}D${RESET} delete  " >/dev/tty 2>/dev/null
+            fi
+            printf '%b' "${LIGHT_GREEN}u${RESET} undo  " >/dev/tty 2>/dev/null
+            printf '%b' "${YELLOW}q${RESET} quit" >/dev/tty 2>/dev/null
+            printf '\033[?7h' >/dev/tty 2>/dev/null
+            need_full_redraw=0
+        fi
+
+        local key
+        IFS= read -rsn1 key
+
+        # Save old cursor for label updates
+        local old_cursor=$cursor
+        local page_start=$(( (page - 1) * per_page ))
+
+        case "$key" in
+            $'\x1b')
+                local seq1 seq2
+                read -rsn1 -t 0.05 seq1 || true
+                read -rsn1 -t 0.05 seq2 || true
+                case "$seq1$seq2" in
+                    '[A') # Up
+                        if (( cursor - BROWSE_COLS >= 0 )); then
+                            cursor=$((cursor - BROWSE_COLS))
+                        fi
+                        ;;
+                    '[B') # Down
+                        if (( cursor + BROWSE_COLS < total )); then
+                            cursor=$((cursor + BROWSE_COLS))
+                        fi
+                        ;;
+                    '[D') # Left
+                        (( cursor > 0 )) && cursor=$((cursor - 1)) || true
+                        ;;
+                    '[C') # Right
+                        (( cursor < total - 1 )) && cursor=$((cursor + 1)) || true
+                        ;;
+                esac
+                _grid_update_cursor
+                ;;
+            h)
+                (( cursor > 0 )) && cursor=$((cursor - 1)) || true
+                _grid_update_cursor
+                ;;
+            l)
+                (( cursor < total - 1 )) && cursor=$((cursor + 1)) || true
+                _grid_update_cursor
+                ;;
+            k)
+                if (( cursor - BROWSE_COLS >= 0 )); then
+                    cursor=$((cursor - BROWSE_COLS))
+                fi
+                _grid_update_cursor
+                ;;
+            j)
+                if (( cursor + BROWSE_COLS < total )); then
+                    cursor=$((cursor + BROWSE_COLS))
+                fi
+                _grid_update_cursor
+                ;;
+            ' ')
+                # Toggle mark on cursor
+                triage_toggle_mark "$cursor"
+                # Update current label to show mark state
+                local cur_local=$(( cursor - page_start ))
+                local cur_m=0
+                _is_marked "$cursor" && cur_m=1 || true
+                # Advance cursor for rapid marking
+                if (( cursor < total - 1 )); then
+                    # Repaint old position (now not cursor)
+                    browse_update_label "$cur_local" 0 "$cur_m" "$(basename "${files[$cursor]}")"
+                    cursor=$((cursor + 1))
+                    if (( cursor / per_page + 1 == page )); then
+                        local new_local=$(( cursor - page_start ))
+                        local new_m=0
+                        _is_marked "$cursor" && new_m=1 || true
+                        browse_update_label "$new_local" 1 "$new_m" "$(basename "${files[$cursor]}")"
+                    else
+                        need_full_redraw=1
+                    fi
+                else
+                    # Last item, just update in place
+                    browse_update_label "$cur_local" 1 "$cur_m" "$(basename "${files[$cursor]}")"
+                fi
+                # Update status line and footer to reflect mark count change
+                if (( ! need_full_redraw )); then
+                    _grid_update_mark_ui
+                fi
+                ;;
+            ''|$'\n')
+                # Enter: expand detail view for cursor item
+                local detail_idx=$cursor
+                local detail_back=0
+                while (( detail_idx >= 0 && detail_idx < total )); do
+                    local file="${files[$detail_idx]}"
+                    if [[ ! -f "$file" ]]; then
+                        break
+                    fi
+
+                    local w h size media_type
+                    read -r w h <<< "$(get_media_dimensions "$file")"
+                    size=$(du -h "$file" | awk '{print $1}')
+                    if is_live_file "$file"; then
+                        media_type="live"
+                    else
+                        media_type="static"
+                    fi
+
+                    local is_marked_str=""
+                    _is_marked "$detail_idx" && is_marked_str="yes" || true
+
+                    draw_screen
+                    printf '%b' "${BOLD}${MAGENTA}[$((detail_idx + 1))/$total]${RESET} $(basename "$file")"
+                    if [[ -n "$is_marked_str" ]]; then
+                        printf '%b' "  ${BOLD}${CYAN}[MARKED]${RESET}"
+                    fi
+                    printf "\n"
+                    printf "%sx%s | %s | %s\n\n" "$w" "$h" "$size" "$media_type"
+
+                    printf '%b' "  ${DIM}h${RESET} prev  ${DIM}l${RESET} next  "
+                    printf '%b' "${CYAN}space${RESET} mark  "
+                    printf '%b' "${GREEN}enter/k${RESET} keep  ${MAGENTA}a${RESET} archive  ${RED}d${RESET} delete  "
+                    printf '%b' "${DIM}v${RESET} view  ${DIM}i${RESET} info  "
+                    printf '%b' "${YELLOW}q${RESET} grid\n\n"
+
+                    # Show preview
+                    local thumb
+                    spinner_tick "generating thumbnail"
+                    thumb=$(get_thumbnail "$file") || true
+                    if [[ -n "$thumb" && -f "$thumb" ]]; then
+                        spinner_tick "rendering preview"
+                        chafa -f "$(detect_chafa_format)" -s 80x24 "$thumb" || true
+                        spinner_clear
+                    else
+                        spinner_clear
+                        printf '%b' "  ${DIM}[no preview available]${RESET}\n"
+                    fi
+
+                    local action
+                    printf "\naction: "
+                    read -r -n1 action
+                    printf "\n"
+
+                    case "$action" in
+                        ""|k|K)
+                            triage_act_on_file "keep" "$file"
+                            triage_refresh_files
+                            (( detail_idx >= total )) && break || true
+                            ;;
+                        a|A)
+                            triage_act_on_file "archive" "$file"
+                            triage_refresh_files
+                            (( detail_idx >= total )) && break || true
+                            ;;
+                        d|D|x|X)
+                            triage_act_on_file "delete" "$file"
+                            triage_refresh_files
+                            (( detail_idx >= total )) && break || true
+                            ;;
+                        l|L)
+                            (( detail_idx < total - 1 )) && detail_idx=$((detail_idx + 1)) || true
+                            ;;
+                        h|H)
+                            (( detail_idx > 0 )) && detail_idx=$((detail_idx - 1)) || true
+                            ;;
+                        ' '|m|M)
+                            triage_toggle_mark "$detail_idx"
+                            ;;
+                        v|V)
+                            if is_live_file "$file"; then
+                                if command -v mpv >/dev/null 2>&1; then
+                                    mpv --loop --no-audio --really-quiet "$file" 2>/dev/null || true
+                                else
+                                    print_warn "mpv not installed for video preview"
+                                    sleep 1
+                                fi
+                            else
+                                open_image_viewer "$file"
+                            fi
+                            ;;
+                        u|U)
+                            triage_undo || true
+                            triage_refresh_files
+                            (( detail_idx >= total )) && break || true
+                            ;;
+                        i|I)
+                            local fhash
+                            fhash=$(sha256sum "$file" | awk '{print $1}')
+                            printf "\n%b\n" "${BOLD}file info${RESET}"
+                            printf "  path: %s\n" "$file"
+                            printf "  hash: %s\n" "$fhash"
+                            printf "  dims: %sx%s\n" "$w" "$h"
+                            printf "  size: %s\n" "$size"
+                            printf "  type: %s\n" "$media_type"
+                            printf "\nPress Enter..."
+                            read -r _
+                            ;;
+                        q|Q|$'\x1b')
+                            detail_back=1
+                            break
+                            ;;
+                        *)
+                            ;;
+                    esac
+                done
+
+                # Return cursor to where detail view ended up
+                if (( detail_back )); then
+                    cursor=$detail_idx
+                fi
+                (( cursor >= total )) && cursor=$((total > 0 ? total - 1 : 0)) || true
+                need_full_redraw=1
+                ;;
+            [1-9])
+                # Quick-jump: number selects slot on current page
+                local slot=$((key))
+                local jump_idx=$(( (page - 1) * per_page + slot - 1 ))
+                if (( jump_idx < total && jump_idx != cursor )); then
+                    cursor=$jump_idx
+                    _grid_update_cursor
+                fi
+                ;;
+            a|A)
+                triage_bulk_action "archive"
+                need_full_redraw=1
+                ;;
+            d|D)
+                triage_bulk_action "delete"
+                need_full_redraw=1
+                ;;
+            K)
+                triage_bulk_action "keep"
+                need_full_redraw=1
+                ;;
+            u|U)
+                triage_undo || true
+                triage_refresh_files
+                need_full_redraw=1
+                ;;
+            \?)
+                printf "\n%b\n" "${BOLD}grid keys${RESET}"
+                printf "  ${GREEN}hjkl${RESET}/arrows  navigate cursor\n"
+                printf "  ${CYAN}space${RESET}        toggle mark on cursor\n"
+                printf "  ${GREEN}enter${RESET}        expand detail view\n"
+                printf "  ${DIM}1-9${RESET}          jump cursor to slot\n"
+                printf "  ${GREEN}K${RESET}            bulk keep marked items\n"
+                printf "  ${MAGENTA}A${RESET}            bulk archive marked items\n"
+                printf "  ${RED}D${RESET}            bulk delete marked items\n"
+                printf "  ${LIGHT_GREEN}u${RESET}            undo last action\n"
+                printf "  ${YELLOW}q${RESET}            quit triage\n"
+                printf "\nPress Enter..."
+                read -r _
+                need_full_redraw=1
+                ;;
+            q|Q)
+                quit_requested=1
+                break
+                ;;
+            *)
+                # ignore unknown keys
+                ;;
+        esac
     done
 
-    clear
-    print_groot_logo
     if (( quit_requested == 1 )); then
-        print_header "review aborted"
+        draw_screen "review aborted"
     else
-        print_header "review summary"
+        draw_screen "review summary"
     fi
     print_success "kept: $kept"
     print_info "archived: $moved_old"
     print_info "deleted (in trash): $deleted"
-    print_info "skipped: $skipped"
-    duplicate_report
     warn_if_over_limit
-    log "triage completed: kept=$kept old=$moved_old deleted=$deleted skipped=$skipped"
+    log "triage completed: kept=$kept old=$moved_old deleted=$deleted"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1246,9 +2360,7 @@ cmd_triage() {
 
 cmd_status() {
     load_config
-    clear
-    print_groot_logo
-    print_header "wallctl status"
+    draw_screen "wallctl status"
     render_dashboard
     printf "  ${DIM}config: %s${RESET}\n" "$CONFIG_FILE"
     printf "  ${DIM}viewer: %s${RESET}\n" "${WALLCTL_VIEWER:-auto}"
@@ -1274,20 +2386,24 @@ cmd_list() {
         *) die "Usage: $SCRIPT_NAME list [new|current|old|all]" ;;
     esac
 
-    clear
-    print_groot_logo
-    print_header "wallctl list"
+    draw_screen "wallctl list"
 
     if [[ -n "$dir" ]]; then
+        spinner_tick "scanning $pool"
         printf "pool: %s\n" "$pool"
         find "$dir" -maxdepth 1 -type f -printf '%f\n' | sort
+        spinner_clear
     else
+        spinner_tick "scanning new"
         printf "pool: new\n"
         find "$WALLPAPER_DIR_NEW" -maxdepth 1 -type f -printf '%f\n' | sort
+        spinner_tick "scanning current"
         printf "\npool: current\n"
         find "$WALLPAPER_DIR_CURRENT" -maxdepth 1 -type f -printf '%f\n' | sort
+        spinner_tick "scanning old"
         printf "\npool: old\n"
         find "$WALLPAPER_DIR_OLD" -maxdepth 1 -type f -printf '%f\n' | sort
+        spinner_clear
     fi
 }
 
@@ -1310,6 +2426,7 @@ cmd_dedupe() {
         esac
     done
 
+    spinner_tick "scanning for duplicates"
     local report
     report=$(python3 - "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_OLD" <<'PY'
 import hashlib
@@ -1345,10 +2462,9 @@ for i, g in enumerate(dup_groups, 1):
         print(f"DROP\t{item[0]}\t{item[1]}")
 PY
 )
+    spinner_clear
 
-    clear
-    print_groot_logo
-    print_header "dedupe"
+    draw_screen "dedupe"
 
     local groups=0 dropped=0
     local line kind a b
@@ -1421,12 +2537,20 @@ cmd_migrate() {
     local moved=0 removed_dupes=0 renamed=0
     local file target hash1 hash2 base name ext n
     local destination_dir="$WALLPAPER_DIR_NEW"
-    [[ "$target_pool" == "current" ]] && destination_dir="$WALLPAPER_DIR_CURRENT"
+    [[ "$target_pool" == "current" ]] && destination_dir="$WALLPAPER_DIR_CURRENT" || true
 
     shopt -s nullglob
-    for file in "$WALLPAPER_DIR_BASE"/*.{jpg,jpeg,png,webp,gif,mp4,webm}; do
+    local -a migrate_files=("$WALLPAPER_DIR_BASE"/*.{jpg,jpeg,png,webp,gif,mp4,webm})
+    shopt -u nullglob
+    local migrate_total=${#migrate_files[@]}
+    local migrate_idx=0
+
+    for file in "${migrate_files[@]}"; do
         [[ -f "$file" ]] || continue
+        spinner_cancelled && break
+        migrate_idx=$((migrate_idx + 1))
         base=$(basename "$file")
+        spinner_tick "migrate $migrate_idx/$migrate_total: $base"
         target="$destination_dir/$base"
 
         if [[ -f "$target" ]]; then
@@ -1454,11 +2578,9 @@ cmd_migrate() {
         fi
         moved=$((moved + 1))
     done
-    shopt -u nullglob
+    spinner_clear
 
-    clear
-    print_groot_logo
-    print_header "migrate summary"
+    draw_screen "migrate summary"
     if (( dry_run == 1 )); then
         print_info "dry-run only; no files moved"
     fi
@@ -1510,9 +2632,7 @@ cmd_archive() {
         esac
     done
 
-    clear
-    print_groot_logo
-    print_header "archive"
+    draw_screen "archive"
 
     local current_count moved=0
     current_count=$(count_media "$WALLPAPER_DIR_CURRENT")
@@ -1524,9 +2644,14 @@ cmd_archive() {
 
     # Collect candidates sorted by mtime (oldest first)
     local candidates=()
+    local scan_idx=0
+    spinner_tick "scanning candidates"
     while IFS= read -r -d '' file; do
+        spinner_cancelled && break
+        scan_idx=$((scan_idx + 1))
         local mtime
         mtime=$(stat -c '%Y' "$file" 2>/dev/null || echo 0)
+        spinner_tick "scanning $scan_idx: $(basename "$file")"
         if (( mtime < cutoff_epoch )) || (( current_count > max_current )); then
             candidates+=("$file")
         fi
@@ -1534,6 +2659,7 @@ cmd_archive() {
                   -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
                   -o -iname '*.mp4' -o -iname '*.webm' \) -printf '%T@\t%p\0' \
               | sort -z -t$'\t' -k1,1n | cut -z -f2-)
+    spinner_clear
 
     if (( ${#candidates[@]} == 0 )); then
         print_success "nothing to archive"
@@ -1541,10 +2667,14 @@ cmd_archive() {
     fi
 
     local file
+    local archive_total=${#candidates[@]}
+    (( archive_total > batch )) && archive_total=$batch || true
     for file in "${candidates[@]}"; do
-        (( moved >= batch )) && break
+        (( moved >= batch )) && break || true
+        spinner_cancelled && break
         local bname
         bname=$(basename "$file")
+        spinner_tick "archiving $((moved + 1))/$archive_total: $bname"
         if (( dry_run == 1 )); then
             printf "  would move: %s\n" "$bname"
         else
@@ -1553,6 +2683,7 @@ cmd_archive() {
         fi
         moved=$((moved + 1))
     done
+    spinner_clear
 
     if (( dry_run == 1 )); then
         print_info "dry-run: would archive $moved file(s)"
@@ -1599,6 +2730,978 @@ set_wallpaper() {
     fi
 }
 
+get_current_wallpaper() {
+    # Try swww query first (most reliable when daemon is running)
+    if command -v swww >/dev/null 2>&1; then
+        local swww_out
+        swww_out=$(swww query 2>/dev/null || true)
+        if [[ -n "$swww_out" ]]; then
+            local path
+            path=$(printf '%s\n' "$swww_out" | head -n1 | sed 's/.*image: //')
+            if [[ -n "$path" && -f "$path" ]]; then
+                printf '%s\n' "$path"
+                return 0
+            fi
+        fi
+    fi
+
+    # Fallback: check swww cache files directly
+    local swww_cache="${XDG_CACHE_HOME:-$HOME/.cache}/swww"
+    if [[ -d "$swww_cache" ]]; then
+        local monitor_file path
+        for monitor_file in "$swww_cache"/*; do
+            [[ -f "$monitor_file" ]] || continue
+            path=$(awk '{print $2}' "$monitor_file" 2>/dev/null || true)
+            if [[ -n "$path" && -f "$path" ]]; then
+                printf '%s\n' "$path"
+                return 0
+            fi
+        done
+    fi
+
+    # Fallback: check for running mpvpaper
+    if command -v mpvpaper >/dev/null 2>&1; then
+        local mpv_path
+        mpv_path=$(ps -eo args= 2>/dev/null | grep -m1 '[m]pvpaper' | awk '{print $NF}' || true)
+        if [[ -n "$mpv_path" && -f "$mpv_path" ]]; then
+            printf '%s\n' "$mpv_path"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_remove (soft-delete current wallpaper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+cmd_remove() {
+    load_config
+    local force=0
+    local no_replace=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -y|--yes)
+                force=1
+                shift
+                ;;
+            --no-replace)
+                no_replace=1
+                shift
+                ;;
+            *)
+                die "Unknown remove flag: $1\nUsage: $SCRIPT_NAME remove [-y|--yes] [--no-replace]"
+                ;;
+        esac
+    done
+
+    draw_screen "remove current wallpaper"
+
+    local current_wp
+    if ! current_wp=$(get_current_wallpaper); then
+        die "could not detect current wallpaper (is swww or mpvpaper running?)"
+    fi
+
+    local bname
+    bname=$(basename "$current_wp")
+
+    # Determine which pool the wallpaper belongs to
+    local pool="unknown"
+    local wp_dir
+    wp_dir=$(dirname "$current_wp")
+    case "$wp_dir" in
+        "$WALLPAPER_DIR_CURRENT") pool="current" ;;
+        "$WALLPAPER_DIR_NEW")     pool="new" ;;
+        "$WALLPAPER_DIR_OLD")     pool="old" ;;
+    esac
+
+    # Show wallpaper info
+    printf "\n"
+    print_info "file: $bname"
+    print_info "path: $current_wp"
+    print_info "pool: $pool"
+    local size
+    size=$(du -h "$current_wp" | awk '{print $1}')
+    print_info "size: $size"
+
+    # Show a preview if it's a static wallpaper and chafa is available
+    if ! is_live_file "$current_wp" && command -v chafa >/dev/null 2>&1; then
+        printf "\n"
+        spinner_tick "rendering preview"
+        chafa -f "$(detect_chafa_format)" -s 60x18 "$current_wp" || true
+        spinner_clear
+        printf "\n"
+    fi
+
+    # Confirm unless --yes
+    if (( force == 0 )); then
+        if [[ -t 0 && -t 1 ]]; then
+            printf "\n${BOLD}${RED}soft-delete this wallpaper?${RESET} [y/N] "
+            local confirm
+            read -r confirm
+            case "$confirm" in
+                y|Y|yes|YES) ;;
+                *) print_info "cancelled"; return 0 ;;
+            esac
+        else
+            die "confirmation required (use -y to skip in non-interactive mode)"
+        fi
+    fi
+
+    # Soft-delete: move to trash
+    local trash_name="${pool}__${bname}"
+    mkdir -p "$TRASH_DIR"
+    mv "$current_wp" "$TRASH_DIR/$trash_name"
+    print_success "trashed: $bname"
+    log "remove: trashed $current_wp -> $TRASH_DIR/$trash_name"
+
+    # Set a new random wallpaper unless --no-replace
+    if (( no_replace == 0 )); then
+        local new_wp
+        if new_wp=$(pick_random_wallpaper "$ROTATION_POOL"); then
+            set_wallpaper "$new_wp"
+        else
+            print_warn "no replacement wallpaper available in pool: $ROTATION_POOL"
+        fi
+    else
+        print_info "skipped replacement (--no-replace)"
+    fi
+
+    print_info "restore with: $SCRIPT_NAME trash (file is in soft-delete trash)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# cmd_browse (inline thumbnail grid browser)
+# ─────────────────────────────────────────────────────────────────────────────
+
+BROWSE_COLS=3
+BROWSE_ROWS=3
+BROWSE_THUMB_W=30
+BROWSE_THUMB_H=10
+declare -A BROWSE_THUMB_CACHE_PATH=()
+declare -A BROWSE_THUMB_CACHE_MTIME=()
+
+browse_calc_layout() {
+    # Dynamically size thumbnails to fill the terminal.
+    local term_cols term_lines
+    term_cols=$(_term_cols)
+    term_lines=$(_term_lines)
+
+    # Pick column count by terminal width
+    if (( term_cols >= 240 )); then
+        BROWSE_COLS=4
+    elif (( term_cols >= 160 )); then
+        BROWSE_COLS=3
+    else
+        BROWSE_COLS=2
+    fi
+
+    # Thumbnail width: fill columns evenly (leave 2-char gap between columns)
+    local gap=2
+    BROWSE_THUMB_W=$(( (term_cols - gap * (BROWSE_COLS - 1)) / BROWSE_COLS ))
+    (( BROWSE_THUMB_W < 20 )) && BROWSE_THUMB_W=20 || true
+    (( BROWSE_THUMB_W > 120 )) && BROWSE_THUMB_W=120 || true
+
+    # Available height for grid content.  The pinned header (logo + header
+    # + spinner) occupies the top SPINNER_ROW rows.  Below that we have a
+    # status line (~2 lines) and footer keybinds (~2 lines).
+    local overhead=$(( SPINNER_ROW + 4 ))
+    local available=$(( term_lines - overhead ))
+    (( available < 10 )) && available=10 || true
+
+    # Pick row count: prefer 3, drop to 2 or 1 if thumbs would be too short.
+    # Each row costs thumb_h + 2 (filename label + gap line).
+    BROWSE_ROWS=3
+    BROWSE_THUMB_H=$(( (available - BROWSE_ROWS * 2) / BROWSE_ROWS ))
+
+    if (( BROWSE_THUMB_H < 8 )); then
+        BROWSE_ROWS=2
+        BROWSE_THUMB_H=$(( (available - BROWSE_ROWS * 2) / BROWSE_ROWS ))
+    fi
+
+    if (( BROWSE_THUMB_H < 8 )); then
+        BROWSE_ROWS=1
+        BROWSE_THUMB_H=$(( available - 2 ))
+    fi
+
+    (( BROWSE_THUMB_H < 8 )) && BROWSE_THUMB_H=8 || true
+    (( BROWSE_THUMB_H > 40 )) && BROWSE_THUMB_H=40 || true
+}
+
+browse_render_page() {
+    # Args: page per_page total total_pages marked_str cursor_local files...
+    # cursor_local = page-local index of cursor (-1 = no cursor)
+    local page="$1" per_page="$2" total="$3" total_pages="$4" marked_str="$5" cursor_local="$6"
+    shift 6
+    local -a files=("$@")
+
+    local start=$(( (page - 1) * per_page ))
+    local end=$(( start + per_page ))
+    (( end > total )) && end=$total || true
+
+    # Collect files for this page
+    local -a page_files=()
+    local i
+    for (( i = start; i < end; i++ )); do
+        page_files+=("${files[$i]}")
+    done
+
+    if (( ${#page_files[@]} == 0 )); then
+        print_info "no images on this page"
+        return
+    fi
+
+    # Grid geometry used for both label-first paint and image placement.
+    local grid_top=$(( SPINNER_ROW + 3 ))   # 0-based row where first thumb goes
+    local gap=2
+    local cell_w=$(( BROWSE_THUMB_W + gap ))
+    local cell_h=$(( BROWSE_THUMB_H + 2 ))  # thumb + label + gap
+
+    # Resolve thumbnails (video -> cached frame, images pass through).
+    # Run thumbnail extraction in small parallel batches for responsiveness.
+    local -a thumb_paths=()
+    local -a thumb_names=()
+    local -a thumb_marks=()
+    local -a page_mtimes=()
+    local page_count=${#page_files[@]}
+    local thumb_jobs=4
+    if command -v nproc >/dev/null 2>&1; then
+        thumb_jobs=$(nproc 2>/dev/null || echo 4)
+        (( thumb_jobs < 2 )) && thumb_jobs=2 || true
+        (( thumb_jobs > 8 )) && thumb_jobs=8 || true
+    fi
+    (( thumb_jobs > page_count )) && thumb_jobs=$page_count || true
+    (( thumb_jobs < 1 )) && thumb_jobs=1 || true
+
+    # Paint labels first so UI appears immediately, then fill images.
+    for (( i = 0; i < page_count; i++ )); do
+        local f="${page_files[$i]}"
+        local bname
+        bname=$(basename "$f")
+        local global_idx=$(( start + i ))
+        local mark=""
+        if [[ "|${marked_str}|" == *"|${global_idx}|"* ]]; then
+            mark="*"
+        fi
+        thumb_paths+=("")
+        thumb_names+=("$bname")
+        thumb_marks+=("$mark")
+
+        local col_idx=$(( i % BROWSE_COLS ))
+        local row_idx=$(( i / BROWSE_COLS ))
+        local x=$(( col_idx * cell_w ))
+        local y=$(( grid_top + row_idx * cell_h ))
+        local label_y=$(( y + BROWSE_THUMB_H ))
+        local is_cursor=0
+        (( i == cursor_local )) && is_cursor=1 || true
+
+        local prefix=""
+        if (( is_cursor )); then
+            prefix="▸ "
+        else
+            prefix="  "
+        fi
+        if [[ -n "$mark" ]]; then
+            prefix+="✓ "
+        fi
+        local label="${prefix}$((i + 1))) ${bname}"
+        (( ${#label} > BROWSE_THUMB_W )) && label="${label:0:$((BROWSE_THUMB_W - 3))}..." || true
+
+        printf '\033[%d;%dH' "$((label_y + 1))" "$((x + 1))" >/dev/tty 2>/dev/null
+        if (( is_cursor )) && [[ -n "$mark" ]]; then
+            printf '%b' "\033[7m${BOLD}${CYAN}${label}${RESET}" >/dev/tty 2>/dev/null
+        elif (( is_cursor )); then
+            printf '%b' "\033[7m${BOLD}${label}${RESET}" >/dev/tty 2>/dev/null
+        elif [[ -n "$mark" ]]; then
+            printf '%b' "${BOLD}${CYAN}${label}${RESET}" >/dev/tty 2>/dev/null
+        else
+            printf '%b' "${DIM}${label}${RESET}" >/dev/tty 2>/dev/null
+        fi
+    done
+
+    local thumb_tmp
+    thumb_tmp=$(mktemp -d)
+    local -a _thumb_pids=()
+    local _running=0
+    local _done=0
+    local _cancelled=0
+
+    spinner_tick "loading thumbnails"
+    for (( i = 0; i < page_count; i++ )); do
+        if spinner_cancelled; then
+            _cancelled=1
+            break
+        fi
+
+        local f="${page_files[$i]}"
+        local f_mtime
+        f_mtime=$(stat -c '%Y' "$f" 2>/dev/null || echo 0)
+        page_mtimes[$i]="$f_mtime"
+        # Reuse resolved thumbnail in this browse session when file mtime matches.
+        if [[ "${BROWSE_THUMB_CACHE_MTIME[$f]:-}" == "$f_mtime" ]]; then
+            local cached_thumb="${BROWSE_THUMB_CACHE_PATH[$f]:-}"
+            if [[ -n "$cached_thumb" && "$cached_thumb" != "__NONE__" && -f "$cached_thumb" ]]; then
+                thumb_paths[$i]="$cached_thumb"
+            fi
+            _done=$((_done + 1))
+            spinner_tick "loading thumbnails"
+            continue
+        fi
+
+        # Static images don't need thumbnail generation; avoid background job overhead.
+        if ! is_live_file "$f"; then
+            thumb_paths[$i]="$f"
+            BROWSE_THUMB_CACHE_PATH[$f]="$f"
+            BROWSE_THUMB_CACHE_MTIME[$f]="$f_mtime"
+            _done=$((_done + 1))
+            spinner_tick "loading thumbnails"
+            continue
+        fi
+
+        while (( _running >= thumb_jobs )); do
+            local _reaped=0 _j _pid
+            for _j in "${!_thumb_pids[@]}"; do
+                _pid="${_thumb_pids[$_j]}"
+                [[ -n "$_pid" ]] || continue
+                if ! kill -0 "$_pid" 2>/dev/null; then
+                    wait "$_pid" 2>/dev/null || true
+                    unset '_thumb_pids[_j]'
+                    _running=$((_running - 1))
+                    _done=$((_done + 1))
+                    spinner_tick "loading thumbnails"
+                    _reaped=1
+                fi
+            done
+            if (( !_reaped )); then
+                spinner_tick "loading thumbnails"
+                if spinner_cancelled; then
+                    _cancelled=1
+                    break
+                fi
+                _sleep_ms 40
+            fi
+        done
+        (( _cancelled )) && break
+
+        (
+            local _thumb
+            _thumb=$(get_thumbnail "$f") || true
+            if [[ -n "$_thumb" && -f "$_thumb" ]]; then
+                printf '%s' "$_thumb" > "${thumb_tmp}/${i}.path"
+            else
+                : > "${thumb_tmp}/${i}.path"
+            fi
+        ) &
+        _thumb_pids+=("$!")
+        _running=$((_running + 1))
+    done
+
+    if (( _cancelled )); then
+        local _pid
+        for _pid in "${_thumb_pids[@]}"; do
+            kill "$_pid" 2>/dev/null || true
+        done
+    fi
+
+    while (( _running > 0 )); do
+        local _reaped=0 _j _pid
+        for _j in "${!_thumb_pids[@]}"; do
+            _pid="${_thumb_pids[$_j]}"
+            [[ -n "$_pid" ]] || continue
+            if ! kill -0 "$_pid" 2>/dev/null; then
+                wait "$_pid" 2>/dev/null || true
+                unset '_thumb_pids[_j]'
+                _running=$((_running - 1))
+                _done=$((_done + 1))
+                spinner_tick "loading thumbnails"
+                _reaped=1
+            fi
+        done
+        if (( !_reaped )); then
+            spinner_tick "loading thumbnails"
+            if spinner_cancelled; then
+                for _pid in "${_thumb_pids[@]}"; do
+                    [[ -n "$_pid" ]] && kill "$_pid" 2>/dev/null || true
+                done
+            fi
+            _sleep_ms 40
+        fi
+    done
+
+    for (( i = 0; i < page_count; i++ )); do
+        local f="${page_files[$i]}"
+        local f_mtime="${page_mtimes[$i]:-0}"
+        local _thumb_path=""
+        [[ -f "${thumb_tmp}/${i}.path" ]] && _thumb_path=$(<"${thumb_tmp}/${i}.path") || true
+        if [[ -z "${thumb_paths[$i]}" && -n "$_thumb_path" && -f "$_thumb_path" ]]; then
+            thumb_paths[$i]="$_thumb_path"
+            BROWSE_THUMB_CACHE_PATH[$f]="$_thumb_path"
+            BROWSE_THUMB_CACHE_MTIME[$f]="$f_mtime"
+        elif [[ -z "${thumb_paths[$i]}" ]]; then
+            BROWSE_THUMB_CACHE_PATH[$f]="__NONE__"
+            BROWSE_THUMB_CACHE_MTIME[$f]="$f_mtime"
+        fi
+    done
+    rm -rf "$thumb_tmp" 2>/dev/null || true
+    spinner_clear fast
+
+    # Render images using kitten icat --place for pixel-perfect positioning.
+    # --place WxH@X,Y  (0-based cell coords from top-left of terminal)
+
+    local count=${#thumb_paths[@]}
+    for (( i = 0; i < count; i++ )); do
+        spinner_cancelled && break
+        local col_idx=$(( i % BROWSE_COLS ))
+        local row_idx=$(( i / BROWSE_COLS ))
+
+        local x=$(( col_idx * cell_w ))
+        local y=$(( grid_top + row_idx * cell_h ))
+
+        local thumb="${thumb_paths[$i]}"
+        if [[ -n "$thumb" ]]; then
+            kitten icat --place "${BROWSE_THUMB_W}x${BROWSE_THUMB_H}@${x}x${y}" \
+                        --scale-up --transfer-mode=stream \
+                        "$thumb" </dev/tty >/dev/tty 2>/dev/null || true
+        fi
+    done
+
+    # Move cursor below the grid so subsequent output doesn't overlap
+    local bottom=$(( grid_top + BROWSE_ROWS * cell_h ))
+    printf '\033[%d;1H' "$((bottom + 1))" >/dev/tty 2>/dev/null
+}
+
+# Repaint a single cell's label in-place (no full redraw).
+# Args: local_idx is_cursor is_marked filename
+# Requires BROWSE_COLS, BROWSE_THUMB_W, BROWSE_THUMB_H, SPINNER_ROW to be set.
+browse_update_label() {
+    local idx="$1" is_cursor="$2" is_marked="$3" bname="$4"
+
+    local gap=2
+    local cell_w=$(( BROWSE_THUMB_W + gap ))
+    local cell_h=$(( BROWSE_THUMB_H + 2 ))
+    local grid_top=$(( SPINNER_ROW + 3 ))
+
+    local col_idx=$(( idx % BROWSE_COLS ))
+    local row_idx=$(( idx / BROWSE_COLS ))
+    local x=$(( col_idx * cell_w ))
+    local y=$(( grid_top + row_idx * cell_h ))
+    local label_y=$(( y + BROWSE_THUMB_H ))
+
+    local prefix=""
+    if (( is_cursor )); then
+        prefix="▸ "
+    else
+        prefix="  "
+    fi
+    if (( is_marked )); then
+        prefix+="✓ "
+    fi
+    local label="${prefix}$((idx + 1))) ${bname}"
+    (( ${#label} > BROWSE_THUMB_W )) && label="${label:0:$((BROWSE_THUMB_W - 3))}..." || true
+
+    # Pad label to full cell width to overwrite old content
+    local pad_len=$(( BROWSE_THUMB_W - ${#label} ))
+    (( pad_len < 0 )) && pad_len=0 || true
+    local padding=""
+    printf -v padding "%*s" "$pad_len" ""
+
+    printf '\033[%d;%dH' "$((label_y + 1))" "$((x + 1))" >/dev/tty 2>/dev/null
+    if (( is_cursor )) && (( is_marked )); then
+        printf '%b' "\033[7m${BOLD}${CYAN}${label}${RESET}${padding}" >/dev/tty 2>/dev/null
+    elif (( is_cursor )); then
+        printf '%b' "\033[7m${BOLD}${label}${RESET}${padding}" >/dev/tty 2>/dev/null
+    elif (( is_marked )); then
+        printf '%b' "${BOLD}${CYAN}${label}${RESET}${padding}" >/dev/tty 2>/dev/null
+    else
+        printf '%b' "${DIM}${label}${RESET}${padding}" >/dev/tty 2>/dev/null
+    fi
+}
+
+cmd_browse() {
+    require_commands kitten
+    load_config
+    require_tty "browse"
+
+    local pool="current"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --pool)
+                [[ $# -ge 2 ]] || die "--pool requires: new|current|old"
+                case "$2" in
+                    new|n) pool="new" ;;
+                    current|c) pool="current" ;;
+                    old|o) pool="old" ;;
+                    *) die "Invalid browse pool: $2" ;;
+                esac
+                shift 2
+                ;;
+            *)
+                die "Unknown browse flag: $1"
+                ;;
+        esac
+    done
+
+    local source_dir
+    source_dir=$(pool_dir "$pool") || die "Invalid pool: $pool"
+
+    browse_refresh() {
+        shopt -s nullglob
+        files=("$source_dir"/*)
+        shopt -u nullglob
+        total=${#files[@]}
+    }
+
+    local -a files=()
+    local total=0
+    browse_refresh
+
+    if (( total == 0 )); then
+        draw_screen "browse ($pool)"
+        print_info "no files in $pool"
+        return 0
+    fi
+
+    local per_page total_pages
+    local page=1
+    local marked=""
+    local cursor=0  # global index of cursor position
+    local need_full_redraw=1
+    local browse_bootstrapped=0
+    local last_per_page=0
+
+    # Helper: check if global index is in marked string
+    _is_marked() {
+        [[ "|${marked}|" == *"|${1}|"* ]]
+    }
+
+    # Helper: update labels after cursor moves (avoids full redraw when on same page)
+    _grid_update_cursor() {
+        if (( cursor == old_cursor )); then
+            return 0
+        fi
+        if (( cursor / per_page + 1 == page )); then
+            local old_local=$(( old_cursor - page_start ))
+            local new_local=$(( cursor - page_start ))
+            local old_m=0 new_m=0
+            _is_marked "$old_cursor" && old_m=1 || true
+            _is_marked "$cursor" && new_m=1 || true
+            browse_update_label "$old_local" 0 "$old_m" "$(basename "${files[$old_cursor]}")"
+            browse_update_label "$new_local" 1 "$new_m" "$(basename "${files[$cursor]}")"
+        else
+            need_full_redraw=1
+        fi
+    }
+
+    # Helper: repaint status line and footer after mark count changes
+    _grid_update_mark_ui() {
+        local mc
+        mc=$(browse_mark_count)
+        local status_row=$(( SPINNER_ROW + 1 ))
+        local grid_top=$(( SPINNER_ROW + 3 ))
+        local cell_h=$(( BROWSE_THUMB_H + 2 ))
+        local footer_row=$(( grid_top + BROWSE_ROWS * cell_h + 2 ))
+
+        # Save cursor to restore position after status/footer repaint
+        printf '\0337' >/dev/tty 2>/dev/null
+
+        # Repaint status line
+        printf '\033[%d;1H\033[2K' "$status_row" >/dev/tty 2>/dev/null
+        printf '%b' "${BOLD}${MAGENTA}  browse${RESET} ${DIM}($pool)${RESET}  " >/dev/tty 2>/dev/null
+        printf '%b' "${DIM}page $page/$total_pages  |  $total wallpapers${RESET}" >/dev/tty 2>/dev/null
+        if (( mc > 0 )); then
+            printf '%b' "  ${BOLD}${CYAN}[$mc marked]${RESET}" >/dev/tty 2>/dev/null
+        fi
+
+        # Disable auto-wrap to prevent scroll when writing at bottom of scroll region
+        printf '\033[?7l' >/dev/tty 2>/dev/null
+        # Repaint footer line
+        printf '\033[%d;1H\033[2K' "$footer_row" >/dev/tty 2>/dev/null
+        printf '%b' "  ${DIM}hjkl${RESET}/arrows navigate  " >/dev/tty 2>/dev/null
+        printf '%b' "${CYAN}space${RESET} mark  " >/dev/tty 2>/dev/null
+        printf '%b' "${GREEN}enter${RESET} expand  " >/dev/tty 2>/dev/null
+        if (( mc > 0 )); then
+            printf '%b' "${MAGENTA}A${RESET} archive  ${RED}D${RESET} delete  " >/dev/tty 2>/dev/null
+        fi
+        printf '%b' "${YELLOW}q${RESET} quit" >/dev/tty 2>/dev/null
+        # Re-enable auto-wrap and restore cursor
+        printf '\033[?7h' >/dev/tty 2>/dev/null
+        printf '\0338' >/dev/tty 2>/dev/null
+    }
+
+    # Reuse mark helpers (same pattern as triage)
+    browse_toggle_mark() {
+        local idx="$1"
+        if [[ "|${marked}|" == *"|${idx}|"* ]]; then
+            local new_marked="" entry
+            IFS='|' read -ra _m_arr <<< "$marked"
+            for entry in "${_m_arr[@]}"; do
+                [[ "$entry" == "$idx" ]] && continue
+                [[ -z "$entry" ]] && continue
+                new_marked="${new_marked:+${new_marked}|}${entry}"
+            done
+            marked="$new_marked"
+        else
+            marked="${marked:+${marked}|}${idx}"
+        fi
+    }
+
+    browse_mark_count() {
+        if [[ -z "$marked" ]]; then echo 0; return; fi
+        local count=0
+        IFS='|' read -ra _m_arr <<< "$marked"
+        for entry in "${_m_arr[@]}"; do
+            [[ -n "$entry" ]] && count=$((count + 1)) || true
+        done
+        echo "$count"
+    }
+
+    browse_bulk_action() {
+        local action="$1"
+        local mc
+        mc=$(browse_mark_count)
+        if (( mc == 0 )); then print_warn "no items marked"; sleep 1; return; fi
+
+        local action_label
+        case "$action" in
+            archive) action_label="archive (move to old)" ;;
+            delete) action_label="delete (move to trash)" ;;
+            apply) action_label="apply (set wallpaper)" ;;
+        esac
+        printf "\n  ${BOLD}%s${RESET} %d marked wallpapers? ${DIM}[y/N]${RESET} " "$action_label" "$mc"
+        local yn
+        read -rsn1 yn
+        printf "\n"
+        [[ "$yn" == "y" || "$yn" == "Y" ]] || return
+
+        IFS='|' read -ra _m_arr <<< "$marked"
+        local -a sorted_indices=()
+        for entry in "${_m_arr[@]}"; do
+            [[ -n "$entry" ]] && sorted_indices+=("$entry") || true
+        done
+        IFS=$'\n' sorted_indices=($(sort -rn <<< "${sorted_indices[*]}")); unset IFS
+
+        local processed=0
+        for idx in "${sorted_indices[@]}"; do
+            spinner_cancelled && break
+            if (( idx < total )) && [[ -f "${files[$idx]}" ]]; then
+                processed=$((processed + 1))
+                spinner_tick "$action $processed/$mc"
+                local f="${files[$idx]}"
+                local bname
+                bname=$(basename "$f")
+                case "$action" in
+                    archive)
+                        if [[ "$pool" != "old" ]]; then
+                            mv "$f" "$WALLPAPER_DIR_OLD/"
+                            log "browse: archived $f"
+                        fi
+                        ;;
+                    delete)
+                        local trash_name="${pool}__${bname}"
+                        mkdir -p "$TRASH_DIR"
+                        mv "$f" "$TRASH_DIR/$trash_name"
+                        log "browse: trashed $f"
+                        ;;
+                    apply)
+                        set_wallpaper "$f"
+                        ;;
+                esac
+            fi
+        done
+        spinner_clear
+
+        marked=""
+        browse_refresh
+        printf "  ${GREEN}done${RESET}: %s %d items\n" "$action" "$mc"
+        sleep 1
+    }
+
+    while :; do
+        # Recalculate layout (handles terminal resize)
+        browse_calc_layout
+        per_page=$(( BROWSE_COLS * BROWSE_ROWS ))
+        if (( !browse_bootstrapped || per_page != last_per_page )); then
+            need_full_redraw=1
+        fi
+        last_per_page=$per_page
+        total_pages=$(( (total + per_page - 1) / per_page ))
+        (( total_pages < 1 )) && total_pages=1 || true
+        (( page > total_pages )) && page=$total_pages || true
+
+        if (( total == 0 )); then
+            draw_screen "browse ($pool)"
+            print_info "pool is empty"
+            break
+        fi
+
+        # Clamp cursor
+        (( cursor >= total )) && cursor=$((total - 1)) || true
+        (( cursor < 0 )) && cursor=0 || true
+
+        # Check if cursor moved to a different page
+        local new_page=$(( cursor / per_page + 1 ))
+        if (( new_page != page )); then
+            page=$new_page
+            need_full_redraw=1
+        fi
+
+        if (( need_full_redraw )); then
+            local cursor_local=$(( cursor - (page - 1) * per_page ))
+            local status_row=$(( SPINNER_ROW + 1 ))
+            local grid_top_r=$(( SPINNER_ROW + 3 ))
+            local cell_h_r=$(( BROWSE_THUMB_H + 2 ))
+            local footer_row_r=$(( grid_top_r + BROWSE_ROWS * cell_h_r + 2 ))
+
+            if (( !browse_bootstrapped )); then
+                draw_screen
+                browse_bootstrapped=1
+            else
+                kitten icat --clear >/dev/tty 2>/dev/null || true
+                printf '\033[?7l' >/dev/tty 2>/dev/null
+                local _r
+                for (( _r = status_row; _r <= footer_row_r; _r++ )); do
+                    printf '\033[%d;1H\033[2K' "$_r" >/dev/tty 2>/dev/null
+                done
+                printf '\033[?7h' >/dev/tty 2>/dev/null
+            fi
+
+            _grid_update_mark_ui
+            browse_render_page "$page" "$per_page" "$total" "$total_pages" "$marked" "$cursor_local" "${files[@]}"
+            need_full_redraw=0
+        fi
+
+        local key
+        IFS= read -rsn1 key
+
+        # Save old cursor for label updates
+        local old_cursor=$cursor
+        local page_start=$(( (page - 1) * per_page ))
+
+        case "$key" in
+            $'\x1b')
+                local seq1 seq2
+                read -rsn1 -t 0.05 seq1 || true
+                read -rsn1 -t 0.05 seq2 || true
+                case "$seq1$seq2" in
+                    '[A') # Up
+                        if (( cursor - BROWSE_COLS >= 0 )); then
+                            cursor=$((cursor - BROWSE_COLS))
+                        fi
+                        ;;
+                    '[B') # Down
+                        if (( cursor + BROWSE_COLS < total )); then
+                            cursor=$((cursor + BROWSE_COLS))
+                        fi
+                        ;;
+                    '[D') # Left
+                        (( cursor > 0 )) && cursor=$((cursor - 1)) || true
+                        ;;
+                    '[C') # Right
+                        (( cursor < total - 1 )) && cursor=$((cursor + 1)) || true
+                        ;;
+                esac
+                _grid_update_cursor
+                ;;
+            h)
+                (( cursor > 0 )) && cursor=$((cursor - 1)) || true
+                _grid_update_cursor
+                ;;
+            l)
+                (( cursor < total - 1 )) && cursor=$((cursor + 1)) || true
+                _grid_update_cursor
+                ;;
+            k)
+                if (( cursor - BROWSE_COLS >= 0 )); then
+                    cursor=$((cursor - BROWSE_COLS))
+                fi
+                _grid_update_cursor
+                ;;
+            j)
+                if (( cursor + BROWSE_COLS < total )); then
+                    cursor=$((cursor + BROWSE_COLS))
+                fi
+                _grid_update_cursor
+                ;;
+            ' ')
+                # Toggle mark on cursor
+                browse_toggle_mark "$cursor"
+                # Update current label to show mark state
+                local cur_local=$(( cursor - page_start ))
+                local cur_m=0
+                _is_marked "$cursor" && cur_m=1 || true
+                # Advance cursor for rapid marking
+                if (( cursor < total - 1 )); then
+                    # Repaint old position (now not cursor)
+                    browse_update_label "$cur_local" 0 "$cur_m" "$(basename "${files[$cursor]}")"
+                    cursor=$((cursor + 1))
+                    if (( cursor / per_page + 1 == page )); then
+                        local new_local=$(( cursor - page_start ))
+                        local new_m=0
+                        _is_marked "$cursor" && new_m=1 || true
+                        browse_update_label "$new_local" 1 "$new_m" "$(basename "${files[$cursor]}")"
+                    else
+                        need_full_redraw=1
+                    fi
+                else
+                    # Last item, just update in place
+                    browse_update_label "$cur_local" 1 "$cur_m" "$(basename "${files[$cursor]}")"
+                fi
+                # Update status line and footer to reflect mark count change
+                if (( ! need_full_redraw )); then
+                    _grid_update_mark_ui
+                fi
+                ;;
+            ''|$'\n')
+                # Enter: expand detail view for cursor item
+                local detail_idx=$cursor
+                local detail_back=0
+                while (( detail_idx >= 0 && detail_idx < total )); do
+                    local file="${files[$detail_idx]}"
+                    if [[ ! -f "$file" ]]; then
+                        break
+                    fi
+
+                    local w h size media_type
+                    read -r w h <<< "$(get_media_dimensions "$file")"
+                    size=$(du -h "$file" | awk '{print $1}')
+                    if is_live_file "$file"; then
+                        media_type="live"
+                    else
+                        media_type="static"
+                    fi
+
+                    local is_marked=""
+                    if [[ "|${marked}|" == *"|${detail_idx}|"* ]]; then
+                        is_marked="yes"
+                    fi
+
+                    draw_screen
+                    printf '%b' "${BOLD}${MAGENTA}[$((detail_idx + 1))/$total]${RESET} $(basename "$file")"
+                    if [[ -n "$is_marked" ]]; then
+                        printf '%b' "  ${BOLD}${CYAN}[MARKED]${RESET}"
+                    fi
+                    printf "\n"
+                    printf "%sx%s | %s | %s\n\n" "$w" "$h" "$size" "$media_type"
+
+                    printf '%b' "  ${DIM}h${RESET} prev  ${DIM}l${RESET} next  "
+                    printf '%b' "${CYAN}space${RESET} mark  "
+                    printf '%b' "${GREEN}enter${RESET} apply  "
+                    printf '%b' "${MAGENTA}a${RESET} archive  ${RED}d${RESET} delete  "
+                    printf '%b' "${DIM}v${RESET} view  "
+                    printf '%b' "${YELLOW}q${RESET} grid\n\n"
+
+                    # Show preview
+                    local thumb
+                    spinner_tick "generating thumbnail"
+                    thumb=$(get_thumbnail "$file") || true
+                    if [[ -n "$thumb" && -f "$thumb" ]]; then
+                        spinner_tick "rendering preview"
+                        chafa -f "$(detect_chafa_format)" -s 80x24 "$thumb" || true
+                        spinner_clear
+                    else
+                        spinner_clear
+                        printf '%b' "  ${DIM}[no preview available]${RESET}\n"
+                    fi
+
+                    local action
+                    printf "\naction: "
+                    read -r -n1 action
+                    printf "\n"
+
+                    case "$action" in
+                        ""|$'\n')
+                            # Enter = apply as wallpaper
+                            set_wallpaper "$file"
+                            sleep 1
+                            ;;
+                        a|A)
+                            if [[ "$pool" != "old" ]]; then
+                                local bname
+                                bname=$(basename "$file")
+                                mv "$file" "$WALLPAPER_DIR_OLD/"
+                                print_success "archived: $bname"
+                                log "browse: archived $file"
+                                browse_refresh
+                                (( detail_idx >= total )) && break || true
+                            else
+                                print_info "already in old pool"
+                                sleep 1
+                            fi
+                            ;;
+                        d|D|x|X)
+                            local bname
+                            bname=$(basename "$file")
+                            local trash_name="${pool}__${bname}"
+                            mkdir -p "$TRASH_DIR"
+                            mv "$file" "$TRASH_DIR/$trash_name"
+                            print_success "trashed: $bname"
+                            log "browse: trashed $file"
+                            browse_refresh
+                            (( detail_idx >= total )) && break || true
+                            ;;
+                        l|L)
+                            (( detail_idx < total - 1 )) && detail_idx=$((detail_idx + 1)) || true
+                            ;;
+                        h|H)
+                            (( detail_idx > 0 )) && detail_idx=$((detail_idx - 1)) || true
+                            ;;
+                        ' '|m|M)
+                            browse_toggle_mark "$detail_idx"
+                            ;;
+                        v|V)
+                            if is_live_file "$file"; then
+                                if command -v mpv >/dev/null 2>&1; then
+                                    mpv --loop --no-audio --really-quiet "$file" 2>/dev/null || true
+                                else
+                                    print_warn "mpv not installed for video preview"
+                                    sleep 1
+                                fi
+                            else
+                                open_image_viewer "$file"
+                            fi
+                            ;;
+                        q|Q|$'\x1b')
+                            detail_back=1
+                            break
+                            ;;
+                        *)
+                            ;;
+                    esac
+                done
+
+                # Return cursor to where detail view ended up
+                if (( detail_back )); then
+                    cursor=$detail_idx
+                fi
+                (( cursor >= total )) && cursor=$((total > 0 ? total - 1 : 0)) || true
+                need_full_redraw=1
+                ;;
+            [1-9])
+                # Quick-jump: number selects slot on current page
+                local slot=$((key))
+                local jump_idx=$(( (page - 1) * per_page + slot - 1 ))
+                if (( jump_idx < total && jump_idx != cursor )); then
+                    cursor=$jump_idx
+                    _grid_update_cursor
+                fi
+                ;;
+            a|A)
+                browse_bulk_action "archive"
+                need_full_redraw=1
+                ;;
+            d|D)
+                browse_bulk_action "delete"
+                need_full_redraw=1
+                ;;
+            q|Q) break ;;
+            *)
+                ;;
+        esac
+    done
+}
+
 cmd_apply() {
     load_config
     local mode="random"
@@ -1626,13 +3729,13 @@ cmd_apply() {
         esac
     done
 
-    clear
-    print_groot_logo
-    print_header "apply wallpaper"
+    draw_screen "apply wallpaper"
 
     case "$mode" in
         file)
+            spinner_tick "applying wallpaper"
             set_wallpaper "$target_file"
+            spinner_clear
             ;;
         pick)
             if ! command -v nsxiv >/dev/null 2>&1; then
@@ -1650,14 +3753,19 @@ cmd_apply() {
                 print_info "no wallpaper selected"
                 return 0
             fi
+            spinner_tick "applying wallpaper"
             set_wallpaper "$picked"
+            spinner_clear
             ;;
         random)
+            spinner_tick "picking random wallpaper"
             local wallpaper
             if ! wallpaper=$(pick_random_wallpaper "$ROTATION_POOL"); then
                 die "no wallpapers available in pool: $ROTATION_POOL"
             fi
+            spinner_tick "applying wallpaper"
             set_wallpaper "$wallpaper"
+            spinner_clear
             ;;
     esac
 }
@@ -1679,9 +3787,12 @@ screensaver_loop_wallpaper() {
 build_screensaver_filelist() {
     local dir file
     : > "$SCREENSAVER_LIST_FILE"
+    spinner_tick "building file list"
     while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
         while IFS= read -r -d '' file; do
+            spinner_cancelled && break
+            spinner_tick "checking $(basename "$file")"
             if is_selectable_wallpaper "$file"; then
                 printf '%s\n' "$file" >> "$SCREENSAVER_LIST_FILE"
             fi
@@ -1689,6 +3800,7 @@ build_screensaver_filelist() {
                       -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
                       -o -iname '*.mp4' -o -iname '*.webm' \) -print0)
     done < <(list_pool_dirs "$SCREENSAVER_POOL")
+    spinner_clear
 }
 
 start_overlay_screensaver() {
@@ -1720,6 +3832,7 @@ start_overlay_screensaver() {
 
 cmd_screensaver() {
     load_config
+    draw_screen "screensaver"
     local action="${1:-}"
     case "$action" in
         start)
@@ -1803,9 +3916,7 @@ cmd_config() {
     require_tty "config"
 
     while :; do
-        clear
-        print_groot_logo
-        print_header "config"
+        draw_screen "config"
 
         print_section "Quality"
         printf "   1) min resolution       %sx%s\n" "$MIN_WIDTH" "$MIN_HEIGHT"
@@ -1865,17 +3976,17 @@ cmd_config() {
             3)
                 printf "keywords (space-separated): "
                 read -r value
-                [[ -n "$value" ]] && read -ra KEYWORDS <<< "$value"
+                [[ -n "$value" ]] && read -ra KEYWORDS <<< "$value" || true
                 ;;
             4)
                 printf "reddit subs (space-separated): "
                 read -r value
-                [[ -n "$value" ]] && read -ra REDDIT_SUBS <<< "$value"
+                [[ -n "$value" ]] && read -ra REDDIT_SUBS <<< "$value" || true
                 ;;
             5)
                 printf "github sources (repo:path[@ref], space-separated): "
                 read -r value
-                [[ -n "$value" ]] && read -ra GITHUB_SOURCES <<< "$value"
+                [[ -n "$value" ]] && read -ra GITHUB_SOURCES <<< "$value" || true
                 ;;
             6)
                 printf "fetch limit: "
@@ -1952,7 +4063,7 @@ cmd_config() {
             18)
                 printf "user agent: "
                 read -r value
-                [[ -n "$value" ]] && USER_AGENT="$value"
+                [[ -n "$value" ]] && USER_AGENT="$value" || true
                 ;;
             e|E)
                 ${EDITOR:-nano} "$CONFIG_FILE"
@@ -1987,83 +4098,94 @@ cmd_menu() {
     local choice
     while :; do
         printf '\033[?25h'
-        clear
-        print_groot_logo
-        print_header "wallctl"
+        draw_screen "wallctl"
         render_dashboard
-
-        printf "  1) download           fetch new wallpapers\n"
-        printf "  2) review             triage inbox (%s pending)\n" "$DASH_NEW_COUNT"
-        printf "  3) archive            move aging wallpapers to old\n"
-        printf "  4) dedupe             find/remove duplicates\n"
-        printf "  5) screensaver        start | stop | toggle\n"
-        printf "  6) apply              set a wallpaper now\n"
-        printf "  7) config             edit settings\n"
-        printf "  h) help   q) quit\n"
-        printf "\n"
         suggest_action
-        printf "choice: "
-        read -r choice
 
-        case "$choice" in
-            1|download|fetch)
+        local menu_choice=0
+        if menu_select menu_choice \
+            "1) download           fetch new wallpapers" \
+            "2) review             triage inbox ($DASH_NEW_COUNT pending)" \
+            "3) browse             thumbnail grid browser" \
+            "4) archive            move aging wallpapers to old" \
+            "5) dedupe             find/remove duplicates" \
+            "6) screensaver        start | stop | toggle" \
+            "7) apply              set a wallpaper now" \
+            "8) remove             trash current wallpaper" \
+            "9) config             edit settings"; then
+            :
+        else
+            break  # q pressed
+        fi
+
+        case "$menu_choice" in
+            1)
                 cmd_fetch
                 ;;
-            2|review|triage)
+            2)
                 cmd_triage --pool "$REVIEW_POOL"
                 ;;
-            3|archive)
+            3)
+                local browse_choice=0
+                printf "\n"
+                if menu_select browse_choice \
+                    "current         active rotation pool" \
+                    "new             unreviewed inbox" \
+                    "old             archived wallpapers"; then
+                    case "$browse_choice" in
+                        1) cmd_browse --pool current ;;
+                        2) cmd_browse --pool new ;;
+                        3) cmd_browse --pool old ;;
+                    esac
+                fi
+                ;;
+            4)
                 cmd_archive
                 ;;
-            4|dedupe)
+            5)
                 cmd_dedupe
                 ;;
-            5|screensaver|ss)
-                printf "  1) start  2) stop  3) toggle  4) status\n"
-                printf "  choice: "
-                local ss_choice
-                read -r ss_choice
-                case "$ss_choice" in
-                    1|start) cmd_screensaver start ;;
-                    2|stop) cmd_screensaver stop ;;
-                    3|toggle) cmd_screensaver toggle ;;
-                    4|status) cmd_screensaver status ;;
-                    *) print_warn "invalid screensaver action" ; sleep 1 ;;
-                esac
+            6)
+                local ss_choice=0
+                printf "\n"
+                if menu_select ss_choice \
+                    "start" \
+                    "stop" \
+                    "toggle" \
+                    "status"; then
+                    case "$ss_choice" in
+                        1) cmd_screensaver start ;;
+                        2) cmd_screensaver stop ;;
+                        3) cmd_screensaver toggle ;;
+                        4) cmd_screensaver status ;;
+                    esac
+                fi
                 ;;
-            6|apply)
-                printf "  1) random  2) pick from thumbnails  3) enter path\n"
-                printf "  choice: "
-                local apply_choice
-                read -r apply_choice
-                case "$apply_choice" in
-                    1|random) cmd_apply random ;;
-                    2|pick) cmd_apply --pick ;;
-                    3|path)
-                        printf "  path: "
-                        local apply_path
-                        read -r apply_path
-                        cmd_apply "$apply_path"
-                        ;;
-                    *) print_warn "invalid apply action" ; sleep 1 ;;
-                esac
+            7)
+                local apply_choice=0
+                printf "\n"
+                if menu_select apply_choice \
+                    "random          set a random wallpaper" \
+                    "pick            choose from thumbnails" \
+                    "path            enter a file path"; then
+                    case "$apply_choice" in
+                        1) cmd_apply random ;;
+                        2) cmd_apply --pick ;;
+                        3)
+                            printf '\033[?25h'
+                            printf "  path: "
+                            local apply_path
+                            read -r apply_path
+                            cmd_apply "$apply_path"
+                            ;;
+                    esac
+                fi
                 ;;
-            7|config)
+            8)
+                cmd_remove
+                ;;
+            9)
                 cmd_config
-                ;;
-            h|H|help)
-                clear
-                print_groot_logo
-                usage
-                printf "\nPress Enter to return to menu..."
-                read -r _
-                ;;
-            q|quit)
-                break
-                ;;
-            *)
-                print_warn "unknown option"
-                sleep 1
                 ;;
         esac
     done
@@ -2084,7 +4206,7 @@ Commands:
   menu                          Interactive menu (default)
   fetch [--limit N]             Download into inbox (new pool)
   triage [--pool new|current|old]
-                                Review wallpapers one at a time
+                                 Thumbnail grid review with bulk actions
   apply [file|random|--pick]    Set a wallpaper immediately
   archive [--apply] [--age-days N] [--batch N] [--max-current N]
                                 Move aging wallpapers to old pool
@@ -2094,13 +4216,20 @@ Commands:
   migrate [--dry-run] [--to-new|--to-current]
                                 Move loose wallpapers into a pool
   trash [--list|--purge]        View or empty the soft-delete trash
+  remove [-y|--yes] [--no-replace]
+                                Soft-delete the current wallpaper
+  browse [--pool new|current|old]
+                                Thumbnail grid browser with actions
   config                        Edit runtime configuration
   screensaver {start|stop|toggle|status}
                                 Control pseudo-screensaver loop
   help                          Show this help
 
-Review keys:
-  Enter=keep  a=archive  d=delete  h=back  l=next  q=quit  ?=more
+Review keys (grid):
+  1-9=review  space=mark  k=keep  a=archive  d=delete  h/l=page  q=quit
+
+Review keys (detail):
+  Enter=keep  a=archive  d=delete  h/l=nav  v=viewer  q=grid
 
 Config:
   $CONFIG_FILE
@@ -2143,6 +4272,8 @@ main() {
         dedupe) cmd_dedupe "$@" ;;
         migrate) cmd_migrate "$@" ;;
         trash) cmd_trash "$@" ;;
+        remove|rm|delete) cmd_remove "$@" ;;
+        browse|thumbnails) cmd_browse "$@" ;;
         config) cmd_config "$@" ;;
         screensaver) cmd_screensaver "$@" ;;
         screensaver-start) cmd_screensaver start ;;
