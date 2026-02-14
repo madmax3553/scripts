@@ -30,6 +30,22 @@ TERMINAL="${TERMINAL:-ghostty}"
 TITLE_PREFIX="${TITLE_PREFIX:-Journal}"
 LOG_FILE="${JOURNAL_LOG_FILE:-${XDG_STATE_HOME:-${HOME}/.local/state}/journal.log}"
 
+# Load configuration file
+CONFIG_FILE="${JOURNAL_DIR}/config/journal.conf"
+if [[ -f "${CONFIG_FILE}" ]]; then
+    source "${CONFIG_FILE}"
+fi
+
+# Set defaults if config not loaded
+JOURNAL_WORD_THRESHOLD="${JOURNAL_WORD_THRESHOLD:-1}"
+TASK_REGISTRY="${TASK_REGISTRY:-${JOURNAL_DIR}/tasks/active.md}"
+TASK_HISTORY="${TASK_HISTORY:-${JOURNAL_DIR}/tasks/history}"
+REMINDER_INTERVAL="${REMINDER_INTERVAL:-7200}"
+REMINDER_START_HOUR="${REMINDER_START_HOUR:-7}"
+REMINDER_END_HOUR="${REMINDER_END_HOUR:-21}"
+REMINDER_CHECK_INTERVAL="${REMINDER_CHECK_INTERVAL:-10}"
+REMOVED_DIR="${REMOVED_DIR:-${DIARY_DIR}/.removed}"
+
 # Today's info
 TODAY="$(date +%Y-%m-%d)"
 YESTERDAY="$(date -d "yesterday" +%Y-%m-%d)"
@@ -723,6 +739,201 @@ cmd_cleanup() {
     cmd_index
 }
 
+# ===== Task Management Functions =====
+
+check_journalled() {
+    local file="${1:-.}"
+    
+    # Count actual content words (exclude headers, task lines, metadata)
+    local content_words
+    content_words=$(grep -v "^#\|^-\|^$\|^!!\|^---\|^!\[\|^\[" "$file" 2>/dev/null | wc -w || echo 0)
+    
+    # Trim whitespace
+    content_words=$(echo "$content_words" | tr -d ' ')
+    
+    if [[ $content_words -ge $JOURNAL_WORD_THRESHOLD ]]; then
+        return 0  # Journalled!
+    else
+        return 1  # Not journalled yet
+    fi
+}
+
+cleanup_non_journalled() {
+    log_info "Scanning for non-journalled entries..."
+    
+    mkdir -p "${REMOVED_DIR}"
+    local cleaned=0
+    local temp_file="/tmp/cleanup_list_$$.txt"
+    
+    # Generate list of files to remove
+    find "${DIARY_DIR}" -maxdepth 1 -name "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md" -type f | sort > "$temp_file"
+    
+    while IFS= read -r file; do
+        local filename
+        filename=$(basename "$file")
+        
+        # Skip today's file
+        if [[ "$filename" == "${TODAY}.md" ]]; then
+            continue
+        fi
+        
+        # Check if file meets journalled threshold
+        local content_words
+        content_words=$(grep -v "^#\|^-\|^$\|^!!\|^---\|^!\[\|^\[" "$file" 2>/dev/null | wc -w || echo 0)
+        content_words=$(echo "$content_words" | tr -d ' ')
+        
+        if [[ -z "$content_words" ]]; then
+            content_words=0
+        fi
+        
+        if (( content_words < JOURNAL_WORD_THRESHOLD )); then
+            # Archive to .removed directory
+            if mv "$file" "${REMOVED_DIR}/${filename}.bak" 2>/dev/null; then
+                cleaned=$((cleaned + 1))
+                journal_log "cleanup: removed non-journalled entry ${filename}"
+            fi
+        fi
+    done < "$temp_file"
+    
+    rm -f "$temp_file"
+    
+    if [[ $cleaned -gt 0 ]]; then
+        log_success "Cleaned up $cleaned non-journalled entries"
+    fi
+}
+
+task_next_id() {
+    # Generate next sequential task ID
+    if [[ ! -f "${TASK_REGISTRY}" ]]; then
+        echo "task_1"
+        return 0
+    fi
+    
+    local last_id
+    last_id=$(grep "^ID: task_" "${TASK_REGISTRY}" 2>/dev/null | tail -1 | sed 's/^ID: task_//' || echo "0")
+    echo "task_$((last_id + 1))"
+}
+
+task_add() {
+    local title="${1:-}"
+    
+    if [[ -z "$title" ]]; then
+        log_error "Task title required"
+        return 1
+    fi
+    
+    mkdir -p "$(dirname "${TASK_REGISTRY}")"
+    
+    local task_id
+    task_id=$(task_next_id)
+    local timestamp
+    timestamp=$(date +%Y-%m-%d)
+    
+    # Add to registry
+    {
+        echo ""
+        echo "## Task: $title"
+        echo "ID: $task_id"
+        echo "Created: $timestamp"
+        echo "Status: [ ]"
+        echo "Source: diary/${TODAY}.md"
+    } >> "${TASK_REGISTRY}"
+    
+    # Add to today's journal
+    if [[ -f "${JOURNAL_FILE}" ]]; then
+        # Find the "Tasks for Tomorrow" or appropriate section and add before it
+        if grep -q "^## Tasks for Tomorrow" "${JOURNAL_FILE}"; then
+            sed -i "/^## Tasks for Tomorrow/i - [ ] [$task_id] $title" "${JOURNAL_FILE}"
+        elif grep -q "^## Next Week Prep" "${JOURNAL_FILE}"; then
+            sed -i "/^## Next Week Prep/i - [ ] [$task_id] $title" "${JOURNAL_FILE}"
+        else
+            # Append to end if no matching section
+            echo "- [ ] [$task_id] $title" >> "${JOURNAL_FILE}"
+        fi
+    fi
+    
+    log_success "Task added: $task_id - $title"
+}
+
+task_check() {
+    local task_id="${1:-}"
+    
+    if [[ -z "$task_id" ]]; then
+        log_error "Task ID required"
+        return 1
+    fi
+    
+    if [[ ! -f "${TASK_REGISTRY}" ]]; then
+        log_error "Task registry not found"
+        return 1
+    fi
+    
+    # Mark as completed in registry
+    if grep -q "^ID: $task_id$" "${TASK_REGISTRY}"; then
+        sed -i "/^ID: $task_id$/,/^---$/s/^Status: \[ \]$/Status: [x]/" "${TASK_REGISTRY}"
+        log_success "Task marked complete: $task_id"
+    else
+        log_error "Task not found: $task_id"
+        return 1
+    fi
+}
+
+task_list_active() {
+    if [[ ! -f "${TASK_REGISTRY}" ]]; then
+        echo "No active tasks"
+        return 0
+    fi
+    
+    echo -e "${BOLD}Active Tasks:${RESET}"
+    echo ""
+    
+    awk '
+        /^## Task:/ {
+            task=$0; gsub(/^## Task: /, "", task)
+            getline; id=$0; gsub(/^ID: /, "", id)
+            getline; created=$0; gsub(/^Created: /, "", created)
+            getline; status=$0; gsub(/^Status: /, "", status)
+            getline; source=$0; gsub(/^Source: /, "", source)
+            
+            if (status ~ /\[ \]/) {
+                printf "  [%s] %s (%s)\n", id, task, created
+            }
+        }
+    ' "${TASK_REGISTRY}"
+    echo ""
+}
+
+update_dashboard() {
+    log_info "Updating journal dashboard..."
+    
+    local dashboard_file="${JOURNAL_DIR}/index.md"
+    
+    # Generate dashboard
+    {
+        echo "# Journal Dashboard"
+        echo ""
+        echo "*Last updated: $(date '+%Y-%m-%d %H:%M')*"
+        echo ""
+        echo "## 📊 Habit Metrics"
+        echo ""
+        echo "- **Current Streak:** Calculating..."
+        echo "- **This Month:** Calculating..."
+        echo ""
+        echo "## 📋 Outstanding Tasks"
+        echo ""
+        echo "- Task system ready"
+        echo ""
+        echo "## 🔗 Quick Links"
+        echo ""
+        echo "- [[diary/${TODAY}|Today]]"
+        echo "- [[diary/index|All Entries]]"
+        echo "- [[TODO|Main TODO List]]"
+        
+    } > "$dashboard_file"
+    
+    log_success "Dashboard updated: $dashboard_file"
+}
+
 # ===== Menu Command =====
 
 cmd_menu() {
@@ -774,15 +985,16 @@ ${BOLD}Usage:${RESET}
     journal.sh [COMMAND]
 
 ${BOLD}Commands:${RESET}
-    ${CYAN}open${RESET}        - Open today's journal entry (default)
-    ${CYAN}surface${RESET}     - Focus existing journal or open if not found
-    ${CYAN}plan${RESET}        - Generate today's daily plan
-    ${CYAN}review${RESET}      - Review outstanding TODOs
-    ${CYAN}index${RESET}       - Generate diary index
-    ${CYAN}weekly${RESET}      - Generate weekly summary (stats, completed tasks, etc.)
-    ${CYAN}cleanup${RESET}     - Remove empty/template-only diary entries
-    ${CYAN}menu${RESET}        - Show interactive menu
-    ${CYAN}help${RESET}        - Show this help message
+    ${CYAN}open${RESET}                   - Open today's journal entry (default)
+    ${CYAN}surface${RESET}                - Focus existing journal or open if not found
+    ${CYAN}plan${RESET}                   - Generate today's daily plan
+    ${CYAN}review${RESET}                 - Review outstanding TODOs
+    ${CYAN}index${RESET}                  - Generate diary index
+    ${CYAN}weekly${RESET}                 - Generate weekly summary (stats, completed tasks, etc.)
+    ${CYAN}cleanup_non_journalled${RESET} - Remove non-journalled entries (cron-safe)
+    ${CYAN}update_dashboard${RESET}       - Update journal dashboard with stats and tasks
+    ${CYAN}menu${RESET}                   - Show interactive menu
+    ${CYAN}help${RESET}                   - Show this help message
 
 ${BOLD}Examples:${RESET}
     journal.sh open          # Open today's journal
@@ -827,9 +1039,11 @@ main() {
         weekly)
             cmd_weekly
             ;;
-        cleanup)
-            shift
-            cmd_cleanup "$@"
+        cleanup_non_journalled)
+            cleanup_non_journalled
+            ;;
+        update_dashboard)
+            update_dashboard
             ;;
         menu)
             cmd_menu

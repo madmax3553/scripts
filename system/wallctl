@@ -103,7 +103,7 @@ cleanup() {
         kill "$_pid" 2>/dev/null || true
     done < <(jobs -pr 2>/dev/null || true)
 
-    _spinner_kill 2>/dev/null
+    spinner_stop 2>/dev/null
 
     if command -v pkill >/dev/null 2>&1; then
         pkill -KILL -P $$ 2>/dev/null || true
@@ -135,22 +135,32 @@ print_step() {
     printf "${BOLD}${MAGENTA}[%d/%d]${RESET} %s\n" "$STEP" "$TOTAL_STEPS" "$1"
 }
 
-SPINNER_STATE=0
+SPINNER_FRAME_INDEX=0
 SPINNER_ACTIVE=0
+SPINNER_IDLE_MODE=1
 SPINNER_CANCELLED=0
-SPINNER_STARTED_MS=0
-SPINNER_MIN_ACTIVE_MS=700
-SPINNER_PULSES=0
-SPINNER_MIN_PULSES=4
-SPINNER_LAST_DRAW_MS=0
-SPINNER_MIN_FRAME_MS=80
-SPINNER_ROW=11
-SPINNER_WIDTH=36
-SPINNER_BAR_W=12           # width of the cylon bar track
-SPINNER_DIR=1              # 1 = sweeping right, -1 = sweeping left
 SPINNER_PID=""
-SPINNER_FIFO=""
-SPINNER_MSG_FILE=""
+
+# Braille animation frames
+SPINNER_FRAMES=('⠋' '⠙' '⠚' '⠞' '⠖' '⠦' '⠴' '⠲' '⠳' '⠓')
+
+# Logo colors for random cycling
+declare -a SPINNER_COLORS=(
+    "$RED"
+    "$LIGHT_RED"
+    "$YELLOW"
+    "$LIGHT_GREEN"
+    "$GREEN"
+    "$LIGHT_CYAN"
+    "$CYAN"
+    "$LIGHT_BLUE"
+    "$LIGHT_MAGENTA"
+)
+
+# Spinner timing
+SPINNER_ROW=11
+SPINNER_ACTIVE_FRAME_MS=150     # Normal speed when active
+SPINNER_IDLE_FRAME_MS=400       # Slow speed when idle
 
 DUP_COUNT_CACHE_VALUE=""
 DUP_COUNT_CACHE_MS=0
@@ -199,370 +209,94 @@ _sleep_ms() {
     sleep "${sec}.$(printf '%03d' "$rem")"
 }
 
-# ── Background cylon spinner ─────────────────────────────────────────────────
-# The spinner runs as a background subprocess with its own render loop at
-# ~15 fps.  The main process communicates via a tmpfile for the label and
-# a FIFO for commands (start/stop/cancel/quit).
-#
-# API (unchanged for callers):
-#   spinner_tick "msg"          — start/update the spinner label
-#   spinner_cancelled && break  — check if user pressed q/Esc
-#   spinner_clear               — stop animation, show idle track
-#   spinner_idle                — draw idle track (no background process)
+# ── Concurrent Braille Spinner with Random Colors ──────────────────────────
+# Runs as independent background process spinning continuously.
+# Main script controls it via signals (SIGUSR1 = active, SIGUSR2 = idle)
+# Positioned at row 11, right edge of terminal.
 
-_spinner_render_bar() {
-    # Build and render one frame of the cylon bar.
-    # Reads/writes SPINNER_STATE and SPINNER_DIR from the subprocess env.
-    local pos=$SPINNER_STATE
-    local bar="" i dist
-    for (( i = 0; i < SPINNER_BAR_W; i++ )); do
-        dist=$(( pos - i ))
-        (( dist < 0 )) && dist=$(( -dist )) || true
-        case "$dist" in
-            0) bar+="\033[1m\033[0;36m█\033[0m" ;;
-            1) bar+="\033[0;36m▄\033[0m" ;;
-            2) bar+="\033[2m\033[0;36m_\033[0m" ;;
-            3) bar+="\033[2m.\033[0m" ;;
-            *) bar+=" " ;;
-        esac
-    done
-
-    # Advance position, bounce at edges
-    if (( SPINNER_DIR == 1 )); then
-        SPINNER_STATE=$(( pos + 1 ))
-        if (( SPINNER_STATE >= SPINNER_BAR_W )); then
-            SPINNER_STATE=$(( SPINNER_BAR_W - 2 ))
-            SPINNER_DIR=-1
-        fi
-    else
-        SPINNER_STATE=$(( pos - 1 ))
-        if (( SPINNER_STATE < 0 )); then
-            SPINNER_STATE=1
-            SPINNER_DIR=1
-        fi
-    fi
-
-    # Position and render
-    local cols
-    read -r _ cols < <(stty size </dev/tty 2>/dev/null) || cols=80
-    local bar_col=$(( cols - SPINNER_BAR_W ))
-    (( bar_col < 1 )) && bar_col=1 || true
-    local widget_col=$(( cols - SPINNER_WIDTH ))
-    (( widget_col < 1 )) && widget_col=1 || true
-
-    # Read current label from shared file
-    local msg=""
-    [[ -f "$1" ]] && msg=$(<"$1") || true
-    local label_w=$(( SPINNER_WIDTH - SPINNER_BAR_W - 2 ))
-    (( label_w < 4 )) && label_w=4 || true
-    (( ${#msg} > label_w )) && msg="${msg:0:$((label_w - 3))}..." || true
-    local label
-    printf -v label "%-${label_w}s" "$msg"
-
-    printf '\033[?25l\0337' >/dev/tty 2>/dev/null || return 0
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
-    printf '%*s' "$SPINNER_WIDTH" '' >/dev/tty 2>/dev/null
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
-    printf '\033[2m%s\033[0m ' "$label" >/dev/tty 2>/dev/null
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$bar_col" >/dev/tty 2>/dev/null
-    printf '%b' "$bar" >/dev/tty 2>/dev/null
-    printf '\0338' >/dev/tty 2>/dev/null
-}
-
-_spinner_render_cancelled() {
-    local cols
-    read -r _ cols < <(stty size </dev/tty 2>/dev/null) || cols=80
-    local bar_col=$(( cols - SPINNER_BAR_W ))
-    (( bar_col < 1 )) && bar_col=1 || true
-    local widget_col=$(( cols - SPINNER_WIDTH ))
-    (( widget_col < 1 )) && widget_col=1 || true
-    local label_w=$(( SPINNER_WIDTH - SPINNER_BAR_W - 2 ))
-    (( label_w < 4 )) && label_w=4 || true
-    local cancel_label
-    printf -v cancel_label "%-${label_w}s" "cancelled"
-    # Build dim gradient block bar in yellow for cancelled state
-    local dead_bar="" _i _edge
-    for (( _i = 0; _i < SPINNER_BAR_W; _i++ )); do
-        _edge=$_i
-        (( (SPINNER_BAR_W - 1 - _i) < _edge )) && _edge=$(( SPINNER_BAR_W - 1 - _i )) || true
-        case "$_edge" in
-            0) dead_bar+="░" ;;
-            1) dead_bar+="▒" ;;
-            2) dead_bar+="▓" ;;
-            *) dead_bar+="█" ;;
-        esac
-    done
-    printf '\0337' >/dev/tty 2>/dev/null || return 0
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
-    printf '%*s' "$SPINNER_WIDTH" '' >/dev/tty 2>/dev/null
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
-    printf '\033[1;33m%s\033[0m ' "$cancel_label" >/dev/tty 2>/dev/null
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$bar_col" >/dev/tty 2>/dev/null
-    printf '\033[2;33m%s\033[0m' "$dead_bar" >/dev/tty 2>/dev/null
-    printf '\0338' >/dev/tty 2>/dev/null
-}
-
-# The background loop.  Runs in a subshell, communicates via FIFO + tmpfile.
 _spinner_loop() {
-    local fifo="$1" msg_file="$2" cancel_file="$3"
-    local running=0
-    SPINNER_STATE=0
-    SPINNER_DIR=1
-
-    # Keep FIFO open read/write so read timeouts work without blocking on open.
-    exec 9<>"$fifo" || return 0
-
+    # Background spinner process - runs indefinitely, controlled by signals
+    local frame_index=0
+    local idle_mode=1
+    
+    # Set up signal handlers to switch between active and idle modes
+    trap 'idle_mode=0' SIGUSR1  # SIGUSR1 = go active
+    trap 'idle_mode=1' SIGUSR2  # SIGUSR2 = go idle
+    trap 'exit 0' TERM          # TERM = stop spinner
+    
     while true; do
-        # Check FIFO for commands (non-blocking)
-        local cmd=""
-        if read -r -t 0.06 -u 9 cmd 2>/dev/null; then
-            case "$cmd" in
-                start)  running=1 ;;
-                stop)   running=0; SPINNER_STATE=0; SPINNER_DIR=1 ;;
-                cancel) printf '1' > "$cancel_file"; _spinner_render_cancelled; running=0 ;;
-                quit)   break ;;
-            esac
-        fi
-
-        # Check for cancel key (non-blocking) while running
-        if (( running )); then
-            local _key=""
-            if read -rsn1 -t 0.005 _key </dev/tty 2>/dev/null; then
-                case "$_key" in
-                    q|Q|$'\x1b')
-                        printf '1' > "$cancel_file"
-                        _spinner_render_cancelled
-                        running=0
-                        ;;
-                esac
-            fi
-        fi
-
-        # Render frame
-        if (( running )); then
-            _spinner_render_bar "$msg_file"
+        # Get current frame and random color
+        local frame="${SPINNER_FRAMES[$((frame_index % ${#SPINNER_FRAMES[@]}))]}"
+        local color="${SPINNER_COLORS[$((RANDOM % ${#SPINNER_COLORS[@]}))]}"
+        frame_index=$((frame_index + 1))
+        
+        # Position at row 11, right side of terminal (terminal_width - 3)
+        local cols
+        cols=$(_term_cols)
+        local col=$((cols - 3))
+        (( col < 1 )) && col=1 || true
+        
+        # Render braille character with random color
+        printf '\033[?25l\0337' >/dev/tty 2>/dev/null || true
+        printf '\033[%d;%dH' "$SPINNER_ROW" "$col" >/dev/tty 2>/dev/null || true
+        printf '%b%s%b' "$color" "$frame" "$RESET" >/dev/tty 2>/dev/null || true
+        printf '\0338' >/dev/tty 2>/dev/null || true
+        
+        # Sleep based on mode
+        if (( idle_mode )); then
+            sleep 0.4  # Slow during idle
+        else
+            sleep 0.15  # Fast during active
         fi
     done
-
-    exec 9>&-
-    exec 9<&-
 }
 
-# Start the background spinner process
-_spinner_ensure_bg() {
-    [[ -n "$SPINNER_PID" ]] && kill -0 "$SPINNER_PID" 2>/dev/null && return 0
-
-    SPINNER_FIFO=$(mktemp -u)
-    mkfifo "$SPINNER_FIFO"
-    SPINNER_MSG_FILE=$(mktemp)
-    SPINNER_CANCEL_FILE=$(mktemp)
-    printf '0' > "$SPINNER_CANCEL_FILE"
-
-    _spinner_loop "$SPINNER_FIFO" "$SPINNER_MSG_FILE" "$SPINNER_CANCEL_FILE" &
+# Start the background spinner
+spinner_start() {
+    [[ -e /dev/tty ]] || return 0
+    
+    # Kill any existing spinner first
+    spinner_stop 2>/dev/null || true
+    
+    # Start new spinner in background
+    _spinner_loop &
     SPINNER_PID=$!
+    
+    # Start in idle mode (slow spin)
+    SPINNER_IDLE_MODE=1
 }
 
-_spinner_send() {
+# Stop the background spinner
+spinner_stop() {
+    [[ -n "$SPINNER_PID" ]] || return 0
+    if kill -0 "$SPINNER_PID" 2>/dev/null; then
+        kill -TERM "$SPINNER_PID" 2>/dev/null || true
+        wait "$SPINNER_PID" 2>/dev/null || true
+    fi
+    SPINNER_PID=""
+    # Show cursor again
+    printf '\033[?25h' >/dev/tty 2>/dev/null || true
+}
+
+# Set spinner to active mode (fast spin)
+spinner_active() {
     [[ -n "$SPINNER_PID" ]] || return 0
     kill -0 "$SPINNER_PID" 2>/dev/null || return 0
-    [[ -n "$SPINNER_FIFO" && -p "$SPINNER_FIFO" ]] || return 0
-    printf '%s\n' "$1" > "$SPINNER_FIFO" 2>/dev/null || true
+    SPINNER_IDLE_MODE=0
+    kill -USR1 "$SPINNER_PID" 2>/dev/null || true
 }
 
-_spinner_kill() {
-    if [[ -n "$SPINNER_PID" ]]; then
-        kill "$SPINNER_PID" 2>/dev/null || true
-        wait "$SPINNER_PID" 2>/dev/null || true
-        SPINNER_PID=""
-    fi
-    [[ -n "$SPINNER_FIFO" ]] && rm -f "$SPINNER_FIFO" 2>/dev/null || true
-    [[ -n "$SPINNER_MSG_FILE" ]] && rm -f "$SPINNER_MSG_FILE" 2>/dev/null || true
-    [[ -n "${SPINNER_CANCEL_FILE:-}" ]] && rm -f "$SPINNER_CANCEL_FILE" 2>/dev/null || true
-    SPINNER_FIFO=""
-    SPINNER_MSG_FILE=""
-    SPINNER_CANCEL_FILE=""
-}
-
-# ── Public API (same interface as before) ─────────────────────────────────────
-
-spinner_tick() {
-    [[ -e /dev/tty ]] || return 0
-    local now
-    now=$(_now_ms)
-    if (( SPINNER_ACTIVE )) && (( now - SPINNER_LAST_DRAW_MS < SPINNER_MIN_FRAME_MS )); then
-        return 0
-    fi
-
-    # Ensure cancel state file exists for spinner_cancelled checks.
-    if [[ -z "${SPINNER_CANCEL_FILE:-}" || ! -f "$SPINNER_CANCEL_FILE" ]]; then
-        SPINNER_CANCEL_FILE=$(mktemp)
-        printf '0' > "$SPINNER_CANCEL_FILE"
-    fi
-
-    # Poll cancel keys during long loops.
-    local _key=""
-    if read -rsn1 -t 0.001 _key </dev/tty 2>/dev/null; then
-        case "$_key" in
-            q|Q|$'\x1b')
-                printf '1' > "$SPINNER_CANCEL_FILE"
-                _spinner_render_cancelled
-                SPINNER_CANCELLED=1
-                return 0
-                ;;
-        esac
-    fi
-
-    if (( ! SPINNER_ACTIVE )); then
-        SPINNER_ACTIVE=1
-        SPINNER_STARTED_MS=$now
-        SPINNER_PULSES=0
-        SPINNER_STATE=0
-        SPINNER_DIR=1
-        _spinner_render_idle
-        SPINNER_LAST_DRAW_MS=$now
-        return 0
-    fi
-
-    _spinner_render_cylon
-    SPINNER_LAST_DRAW_MS=$now
-}
-
-_spinner_render_idle() {
-    local cols
-    cols=$(_term_cols)
-    local bar_col=$(( cols - SPINNER_BAR_W ))
-    (( bar_col < 1 )) && bar_col=1 || true
-    local widget_col=$(( cols - SPINNER_WIDTH ))
-    (( widget_col < 1 )) && widget_col=1 || true
-
-    local lead_w=$(( SPINNER_WIDTH - SPINNER_BAR_W ))
-    (( lead_w < 0 )) && lead_w=0 || true
-
-    # Build a dim gradient block bar: ░▒▓██...██▓▒░
-    local track="" i edge
-    for (( i = 0; i < SPINNER_BAR_W; i++ )); do
-        edge=$i
-        (( (SPINNER_BAR_W - 1 - i) < edge )) && edge=$(( SPINNER_BAR_W - 1 - i )) || true
-        case "$edge" in
-            0) track+="░" ;;
-            1) track+="▒" ;;
-            2) track+="▓" ;;
-            *) track+="█" ;;
-        esac
-    done
-
-    printf '\0337' >/dev/tty 2>/dev/null || return 0
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
-    printf '%*s' "$SPINNER_WIDTH" '' >/dev/tty 2>/dev/null
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
-    printf '%*s' "$lead_w" '' >/dev/tty 2>/dev/null
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$bar_col" >/dev/tty 2>/dev/null
-    printf '%b' "${DIM}\033[0;36m${track}${RESET}" >/dev/tty 2>/dev/null
-    printf '\0338' >/dev/tty 2>/dev/null
-}
-
-_spinner_render_cylon() {
-    local pos=$SPINNER_STATE
-    local bar="" i dist edge base
-
-    for (( i = 0; i < SPINNER_BAR_W; i++ )); do
-        edge=$i
-        (( (SPINNER_BAR_W - 1 - i) < edge )) && edge=$(( SPINNER_BAR_W - 1 - i )) || true
-        case "$edge" in
-            0) base="░" ;;
-            1) base="▒" ;;
-            2) base="▓" ;;
-            *) base="█" ;;
-        esac
-
-        dist=$(( pos - i ))
-        (( dist < 0 )) && dist=$(( -dist )) || true
-        case "$dist" in
-            0) bar+="\033[1m\033[0;36m█\033[0m" ;;
-            1) bar+="\033[0;36m▓\033[0m" ;;
-            2) bar+="\033[0;36m▒\033[0m" ;;
-            3) bar+="\033[0;36m░\033[0m" ;;
-            *) bar+="\033[2m\033[0;36m${base}\033[0m" ;;
-        esac
-    done
-
-    if (( SPINNER_DIR == 1 )); then
-        SPINNER_STATE=$(( pos + 1 ))
-        if (( SPINNER_STATE >= SPINNER_BAR_W )); then
-            SPINNER_STATE=$(( SPINNER_BAR_W - 2 ))
-            SPINNER_DIR=-1
-            SPINNER_PULSES=$((SPINNER_PULSES + 1))
-        fi
-    else
-        SPINNER_STATE=$(( pos - 1 ))
-        if (( SPINNER_STATE < 0 )); then
-            SPINNER_STATE=1
-            SPINNER_DIR=1
-            SPINNER_PULSES=$((SPINNER_PULSES + 1))
-        fi
-    fi
-
-    local cols
-    cols=$(_term_cols)
-    local bar_col=$(( cols - SPINNER_BAR_W ))
-    (( bar_col < 1 )) && bar_col=1 || true
-    local widget_col=$(( cols - SPINNER_WIDTH ))
-    (( widget_col < 1 )) && widget_col=1 || true
-
-    local lead_w=$(( SPINNER_WIDTH - SPINNER_BAR_W ))
-    (( lead_w < 0 )) && lead_w=0 || true
-
-    printf '\033[?25l\0337' >/dev/tty 2>/dev/null || return 0
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
-    printf '%*s' "$SPINNER_WIDTH" '' >/dev/tty 2>/dev/null
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$widget_col" >/dev/tty 2>/dev/null
-    printf '%*s' "$lead_w" '' >/dev/tty 2>/dev/null
-    printf '\033[%d;%dH' "$SPINNER_ROW" "$bar_col" >/dev/tty 2>/dev/null
-    printf '%b' "$bar" >/dev/tty 2>/dev/null
-    printf '\0338' >/dev/tty 2>/dev/null
-}
-
+# Set spinner to idle mode (slow spin)
 spinner_idle() {
-    [[ -e /dev/tty ]] || return 0
-    SPINNER_ACTIVE=0
-    SPINNER_PULSES=0
-    _spinner_render_idle
-    SPINNER_LAST_DRAW_MS=$(_now_ms)
+    [[ -n "$SPINNER_PID" ]] || return 0
+    kill -0 "$SPINNER_PID" 2>/dev/null || return 0
+    SPINNER_IDLE_MODE=1
+    kill -USR2 "$SPINNER_PID" 2>/dev/null || true
 }
 
-spinner_clear() {
-    [[ -e /dev/tty ]] || return 0
-    local mode="${1:-normal}"
-    if (( SPINNER_ACTIVE )); then
-        if [[ "$mode" != "fast" ]]; then
-            local now elapsed wait_ms
-
-            while (( SPINNER_PULSES < SPINNER_MIN_PULSES )); do
-                _sleep_ms "$SPINNER_MIN_FRAME_MS"
-                _spinner_render_cylon
-            done
-
-            now=$(_now_ms)
-            elapsed=$(( now - SPINNER_STARTED_MS ))
-            wait_ms=$(( SPINNER_MIN_ACTIVE_MS - elapsed ))
-            _sleep_ms "$wait_ms"
-        fi
-        SPINNER_ACTIVE=0
-    fi
-    SPINNER_CANCELLED=0
-    [[ -n "${SPINNER_CANCEL_FILE:-}" && -f "$SPINNER_CANCEL_FILE" ]] && printf '0' > "$SPINNER_CANCEL_FILE" || true
-    printf '\033[?25h' >/dev/tty 2>/dev/null
-    spinner_idle
-}
-
+# Check if user cancelled (placeholder for future key detection)
 spinner_cancelled() {
-    [[ -f "${SPINNER_CANCEL_FILE:-}" ]] || return 1
-    local val
-    val=$(<"$SPINNER_CANCEL_FILE") || true
-    if [[ "$val" == "1" ]]; then
-        SPINNER_CANCELLED=1
-        return 0
-    fi
+    [[ "$SPINNER_CANCELLED" == "1" ]] && return 0
     return 1
 }
 
@@ -823,7 +557,7 @@ open_image_viewer() {
         return 1
     }
 
-    spinner_clear fast
+    spinner_idle
     printf '\033[?25h'
     case "$viewer" in
         xdg-open)
@@ -1067,11 +801,11 @@ pick_random_wallpaper() {
     local dir file
     local candidates=()
 
-    spinner_tick "picking wallpaper"
+    spinner_active
     while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
         while IFS= read -r -d '' file; do
-            spinner_tick "scanning $(basename "$file")"
+            spinner_active
             if is_selectable_wallpaper "$file"; then
                 candidates+=("$file")
             fi
@@ -1079,7 +813,7 @@ pick_random_wallpaper() {
                       -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
                       -o -iname '*.mp4' -o -iname '*.webm' \) -print0)
     done < <(list_pool_dirs "$pool")
-    spinner_clear fast
+    spinner_idle
 
     if (( ${#candidates[@]} == 0 )); then
         return 1
@@ -1144,7 +878,7 @@ duplicate_report() {
 
 purge_seen_hash_log() {
     [[ -f "$SEEN_HASH_LOG" ]] || return 0
-    spinner_tick "purging hash log"
+    spinner_active
     python3 - "$SEEN_HASH_LOG" "$HASH_RETENTION_DAYS" <<'PY'
 import time, sys
 from pathlib import Path
@@ -1176,7 +910,8 @@ with path.open('w') as f:
     for ts, h, src in out:
         f.write(f"{ts}\t{h}\t{src}\n")
 PY
-    spinner_clear
+    spinner_idle
+
 }
 
 hash_seen_recent() {
@@ -1193,14 +928,15 @@ record_seen_hash() {
 
 build_hash_cache() {
     : > "$STATE_DIR/hashes.txt"
-    spinner_tick "hashing files"
+    spinner_active
     find "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_OLD" \
          -maxdepth 1 -type f -print0 2>/dev/null | while IFS= read -r -d '' file; do
-        spinner_tick "hashing $(basename "$file")"
+        spinner_active
         spinner_cancelled && break
         sha256sum "$file"
     done >> "$STATE_DIR/hashes.txt" || true
-    spinner_clear
+    spinner_idle
+
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1284,12 +1020,13 @@ github_urls_for_source() {
 
 purge_trash() {
     if [[ -d "$TRASH_DIR" ]]; then
-        spinner_tick "counting trash"
+        spinner_active
         local count
         count=$(find "$TRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
-        spinner_tick "purging $count file(s)"
+        spinner_active
         rm -rf "${TRASH_DIR:?}"/*
-        spinner_clear
+        spinner_idle
+
         if (( count > 0 )); then
             print_info "purged $count file(s) from trash"
         fi
@@ -1303,10 +1040,11 @@ cmd_trash() {
         --list|list)
             draw_screen "trash"
             if [[ -d "$TRASH_DIR" ]]; then
-                spinner_tick "scanning trash"
+                spinner_active
                 local count
                 count=$(find "$TRASH_DIR" -maxdepth 1 -type f 2>/dev/null | wc -l)
-                spinner_clear
+                spinner_idle
+
                 print_info "$count file(s) in trash"
                 find "$TRASH_DIR" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort
             else
@@ -1485,9 +1223,10 @@ render_dashboard() {
             fi
             right="$(printf " ${DIM}now playing${RESET}")"
             right+=$'\n'
-            spinner_tick "rendering preview"
+            spinner_active
             right+="$(chafa -f "$(detect_chafa_format)" -s 28x8 "$current_wp" 2>/dev/null || true)"
-            spinner_clear
+            spinner_idle
+
             right+=$'\n'
             right+="$(printf " ${DIM}%s${RESET}" "$wp_name")"
         elif [[ -n "$current_wp" ]] && is_live_file "$current_wp"; then
@@ -1592,7 +1331,7 @@ cmd_fetch() {
     for q in "${KEYWORDS[@]}"; do
         (( imported >= target )) && break || true
         spinner_cancelled && break
-        spinner_tick "wallhaven: $q ($imported/$target)"
+        spinner_active
         urls=$(curl -A "$USER_AGENT" -sS \
             "https://wallhaven.cc/api/v1/search?q=${q}&categories=111&purity=${WALLHAVEN_PURITY}&sorting=${WALLHAVEN_SORT}&atleast=${MIN_WIDTH}x${MIN_HEIGHT}" \
             | jq -r '.data[].path' | head -n "$wallhaven_batch")
@@ -1609,7 +1348,7 @@ cmd_fetch() {
                 continue
             fi
             processed=$((processed + 1))
-            spinner_tick "download: $imported/$target (live $imported_live/$target_live, static $imported_static/$target_static)"
+            spinner_active
             if download_image "$url"; then
                 imported=$((imported + 1))
                 if (( live == 1 )); then
@@ -1628,7 +1367,7 @@ cmd_fetch() {
     for sub in "${REDDIT_SUBS[@]}"; do
         (( imported >= target )) && break || true
         spinner_cancelled && break
-        spinner_tick "reddit: r/$sub ($imported/$target)"
+        spinner_active
         # Extract image/video URLs from reddit listings
         reddit_urls=$(curl -A "$USER_AGENT" -sS \
             "https://www.reddit.com/r/${sub}/top.json?t=month&limit=${reddit_batch}" \
@@ -1656,7 +1395,7 @@ cmd_fetch() {
                 continue
             fi
             processed=$((processed + 1))
-            spinner_tick "download: $imported/$target (live $imported_live/$target_live, static $imported_static/$target_static)"
+            spinner_active
             if download_image "$url"; then
                 imported=$((imported + 1))
                 if (( live == 1 )); then
@@ -1677,7 +1416,7 @@ cmd_fetch() {
             for source in "${GITHUB_SOURCES[@]}"; do
                 (( imported >= target )) && break || true
                 spinner_cancelled && break
-                spinner_tick "github: $source ($imported/$target)"
+                spinner_active
                 gh_urls=$(github_urls_for_source "$source" \
                     | grep -Ei '\.(jpg|jpeg|png|webp|gif|mp4|webm)$' || true)
                 while IFS= read -r url; do
@@ -1693,7 +1432,7 @@ cmd_fetch() {
                         continue
                     fi
                     processed=$((processed + 1))
-                    spinner_tick "download: $imported/$target (live $imported_live/$target_live, static $imported_static/$target_static)"
+                    spinner_active
                     if download_image "$url"; then
                         imported=$((imported + 1))
                         if (( live == 1 )); then
@@ -1705,7 +1444,8 @@ cmd_fetch() {
                 done <<< "$gh_urls"
             done
         fi
-        spinner_clear
+        spinner_idle
+
     fi
 
     print_step "fill remaining slots"
@@ -1721,7 +1461,7 @@ cmd_fetch() {
                 spinner_cancelled && break
                 [[ -z "$url" ]] && continue
                 processed=$((processed + 1))
-                spinner_tick "fill: $imported/$target"
+                spinner_active
                 if download_image "$url"; then
                     imported=$((imported + 1))
                     if is_live_url "$url"; then
@@ -1732,7 +1472,8 @@ cmd_fetch() {
                 fi
             done <<< "$urls"
         done
-        spinner_clear
+        spinner_idle
+
     else
         print_info "fill skipped (target already met)"
     fi
@@ -1944,11 +1685,12 @@ cmd_triage() {
             spinner_cancelled && break
             if (( idx < total )) && [[ -f "${files[$idx]}" ]]; then
                 processed=$((processed + 1))
-                spinner_tick "$action $processed/$mc"
+                spinner_active
                 triage_act_on_file "$action" "${files[$idx]}"
             fi
         done
-        spinner_clear
+        spinner_idle
+
 
         marked=""
         triage_refresh_files
@@ -2205,14 +1947,16 @@ cmd_triage() {
 
                     # Show preview
                     local thumb
-                    spinner_tick "generating thumbnail"
+                    spinner_active
                     thumb=$(get_thumbnail "$file") || true
                     if [[ -n "$thumb" && -f "$thumb" ]]; then
-                        spinner_tick "rendering preview"
+                        spinner_active
                         chafa -f "$(detect_chafa_format)" -s 80x24 "$thumb" || true
-                        spinner_clear
+                        spinner_idle
+
                     else
-                        spinner_clear
+                        spinner_idle
+
                         printf '%b' "  ${DIM}[no preview available]${RESET}\n"
                     fi
 
@@ -2389,21 +2133,23 @@ cmd_list() {
     draw_screen "wallctl list"
 
     if [[ -n "$dir" ]]; then
-        spinner_tick "scanning $pool"
+        spinner_active
         printf "pool: %s\n" "$pool"
         find "$dir" -maxdepth 1 -type f -printf '%f\n' | sort
-        spinner_clear
+        spinner_idle
+
     else
-        spinner_tick "scanning new"
+        spinner_active
         printf "pool: new\n"
         find "$WALLPAPER_DIR_NEW" -maxdepth 1 -type f -printf '%f\n' | sort
-        spinner_tick "scanning current"
+        spinner_active
         printf "\npool: current\n"
         find "$WALLPAPER_DIR_CURRENT" -maxdepth 1 -type f -printf '%f\n' | sort
-        spinner_tick "scanning old"
+        spinner_active
         printf "\npool: old\n"
         find "$WALLPAPER_DIR_OLD" -maxdepth 1 -type f -printf '%f\n' | sort
-        spinner_clear
+        spinner_idle
+
     fi
 }
 
@@ -2426,7 +2172,7 @@ cmd_dedupe() {
         esac
     done
 
-    spinner_tick "scanning for duplicates"
+    spinner_active
     local report
     report=$(python3 - "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_OLD" <<'PY'
 import hashlib
@@ -2462,7 +2208,8 @@ for i, g in enumerate(dup_groups, 1):
         print(f"DROP\t{item[0]}\t{item[1]}")
 PY
 )
-    spinner_clear
+    spinner_idle
+
 
     draw_screen "dedupe"
 
@@ -2550,7 +2297,7 @@ cmd_migrate() {
         spinner_cancelled && break
         migrate_idx=$((migrate_idx + 1))
         base=$(basename "$file")
-        spinner_tick "migrate $migrate_idx/$migrate_total: $base"
+        spinner_active
         target="$destination_dir/$base"
 
         if [[ -f "$target" ]]; then
@@ -2578,7 +2325,8 @@ cmd_migrate() {
         fi
         moved=$((moved + 1))
     done
-    spinner_clear
+    spinner_idle
+
 
     draw_screen "migrate summary"
     if (( dry_run == 1 )); then
@@ -2645,13 +2393,13 @@ cmd_archive() {
     # Collect candidates sorted by mtime (oldest first)
     local candidates=()
     local scan_idx=0
-    spinner_tick "scanning candidates"
+    spinner_active
     while IFS= read -r -d '' file; do
         spinner_cancelled && break
         scan_idx=$((scan_idx + 1))
-        local mtime
+         local mtime
         mtime=$(stat -c '%Y' "$file" 2>/dev/null || echo 0)
-        spinner_tick "scanning $scan_idx: $(basename "$file")"
+        spinner_active
         if (( mtime < cutoff_epoch )) || (( current_count > max_current )); then
             candidates+=("$file")
         fi
@@ -2659,7 +2407,8 @@ cmd_archive() {
                   -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
                   -o -iname '*.mp4' -o -iname '*.webm' \) -printf '%T@\t%p\0' \
               | sort -z -t$'\t' -k1,1n | cut -z -f2-)
-    spinner_clear
+    spinner_idle
+
 
     if (( ${#candidates[@]} == 0 )); then
         print_success "nothing to archive"
@@ -2674,7 +2423,7 @@ cmd_archive() {
         spinner_cancelled && break
         local bname
         bname=$(basename "$file")
-        spinner_tick "archiving $((moved + 1))/$archive_total: $bname"
+        spinner_active
         if (( dry_run == 1 )); then
             printf "  would move: %s\n" "$bname"
         else
@@ -2683,7 +2432,8 @@ cmd_archive() {
         fi
         moved=$((moved + 1))
     done
-    spinner_clear
+    spinner_idle
+
 
     if (( dry_run == 1 )); then
         print_info "dry-run: would archive $moved file(s)"
@@ -2703,6 +2453,28 @@ kill_live_wallpaper() {
     if command -v mpvpaper >/dev/null 2>&1; then
         pkill -x mpvpaper 2>/dev/null || true
     fi
+}
+
+# Helper to verify swww daemon is running and operational
+verify_swww_daemon() {
+    if ! pgrep -x "swww-daemon" >/dev/null 2>&1; then
+        return 1
+    fi
+    # Check if daemon is responsive
+    swww query >/dev/null 2>&1
+}
+
+# Helper to ensure swww daemon is running before applying wallpapers
+ensure_swww_ready() {
+    if verify_swww_daemon; then
+        return 0
+    fi
+    # Daemon not running or not responsive, try to start it
+    swww-daemon >/dev/null 2>&1 &
+    # Give it time to initialize
+    sleep 1
+    # Check again
+    verify_swww_daemon
 }
 
 set_wallpaper() {
@@ -2725,8 +2497,26 @@ set_wallpaper() {
             die "swww required for static wallpapers"
         fi
         kill_live_wallpaper
-        swww img "$file" --transition-type wipe --transition-duration 1 >/dev/null 2>&1 || true
-        print_success "wallpaper set: $(basename "$file")"
+        
+        # Ensure swww daemon is ready before applying
+        if ! ensure_swww_ready; then
+            die "swww daemon failed to start or become operational"
+        fi
+        
+        # Apply wallpaper
+        if swww img "$file" --transition-type wipe --transition-duration 1 >/dev/null 2>&1; then
+            # Verify wallpaper was actually applied
+            sleep 0.5
+            if CURRENT=$(swww query 2>/dev/null); then
+                # Success - wallpaper was applied and swww confirmed it
+                print_success "wallpaper set: $(basename "$file")"
+            else
+                # swww command succeeded but query failed - daemon may have crashed
+                print_warning "wallpaper set but swww query failed - daemon may be unstable"
+            fi
+        else
+            die "failed to apply wallpaper: $(basename "$file")"
+        fi
     fi
 }
 
@@ -2829,9 +2619,10 @@ cmd_remove() {
     # Show a preview if it's a static wallpaper and chafa is available
     if ! is_live_file "$current_wp" && command -v chafa >/dev/null 2>&1; then
         printf "\n"
-        spinner_tick "rendering preview"
+        spinner_active
         chafa -f "$(detect_chafa_format)" -s 60x18 "$current_wp" || true
-        spinner_clear
+        spinner_idle
+
         printf "\n"
     fi
 
@@ -3028,7 +2819,7 @@ browse_render_page() {
     local _done=0
     local _cancelled=0
 
-    spinner_tick "loading thumbnails"
+    spinner_active
     for (( i = 0; i < page_count; i++ )); do
         if spinner_cancelled; then
             _cancelled=1
@@ -3046,7 +2837,7 @@ browse_render_page() {
                 thumb_paths[$i]="$cached_thumb"
             fi
             _done=$((_done + 1))
-            spinner_tick "loading thumbnails"
+            spinner_active
             continue
         fi
 
@@ -3056,7 +2847,7 @@ browse_render_page() {
             BROWSE_THUMB_CACHE_PATH[$f]="$f"
             BROWSE_THUMB_CACHE_MTIME[$f]="$f_mtime"
             _done=$((_done + 1))
-            spinner_tick "loading thumbnails"
+            spinner_active
             continue
         fi
 
@@ -3070,12 +2861,12 @@ browse_render_page() {
                     unset '_thumb_pids[_j]'
                     _running=$((_running - 1))
                     _done=$((_done + 1))
-                    spinner_tick "loading thumbnails"
+                    spinner_active
                     _reaped=1
                 fi
             done
             if (( !_reaped )); then
-                spinner_tick "loading thumbnails"
+                spinner_active
                 if spinner_cancelled; then
                     _cancelled=1
                     break
@@ -3115,12 +2906,12 @@ browse_render_page() {
                 unset '_thumb_pids[_j]'
                 _running=$((_running - 1))
                 _done=$((_done + 1))
-                spinner_tick "loading thumbnails"
+                spinner_active
                 _reaped=1
             fi
         done
         if (( !_reaped )); then
-            spinner_tick "loading thumbnails"
+            spinner_active
             if spinner_cancelled; then
                 for _pid in "${_thumb_pids[@]}"; do
                     [[ -n "$_pid" ]] && kill "$_pid" 2>/dev/null || true
@@ -3145,7 +2936,7 @@ browse_render_page() {
         fi
     done
     rm -rf "$thumb_tmp" 2>/dev/null || true
-    spinner_clear fast
+    spinner_idle
 
     # Render images using kitten icat --place for pixel-perfect positioning.
     # --place WxH@X,Y  (0-based cell coords from top-left of terminal)
@@ -3387,7 +3178,7 @@ cmd_browse() {
             spinner_cancelled && break
             if (( idx < total )) && [[ -f "${files[$idx]}" ]]; then
                 processed=$((processed + 1))
-                spinner_tick "$action $processed/$mc"
+                spinner_active
                 local f="${files[$idx]}"
                 local bname
                 bname=$(basename "$f")
@@ -3410,7 +3201,8 @@ cmd_browse() {
                 esac
             fi
         done
-        spinner_clear
+        spinner_idle
+
 
         marked=""
         browse_refresh
@@ -3594,14 +3386,16 @@ cmd_browse() {
 
                     # Show preview
                     local thumb
-                    spinner_tick "generating thumbnail"
+                    spinner_active
                     thumb=$(get_thumbnail "$file") || true
                     if [[ -n "$thumb" && -f "$thumb" ]]; then
-                        spinner_tick "rendering preview"
+                        spinner_active
                         chafa -f "$(detect_chafa_format)" -s 80x24 "$thumb" || true
-                        spinner_clear
+                        spinner_idle
+
                     else
-                        spinner_clear
+                        spinner_idle
+
                         printf '%b' "  ${DIM}[no preview available]${RESET}\n"
                     fi
 
@@ -3733,9 +3527,10 @@ cmd_apply() {
 
     case "$mode" in
         file)
-            spinner_tick "applying wallpaper"
+            spinner_active
             set_wallpaper "$target_file"
-            spinner_clear
+            spinner_idle
+
             ;;
         pick)
             if ! command -v nsxiv >/dev/null 2>&1; then
@@ -3753,19 +3548,21 @@ cmd_apply() {
                 print_info "no wallpaper selected"
                 return 0
             fi
-            spinner_tick "applying wallpaper"
+            spinner_active
             set_wallpaper "$picked"
-            spinner_clear
+            spinner_idle
+
             ;;
         random)
-            spinner_tick "picking random wallpaper"
+            spinner_active
             local wallpaper
             if ! wallpaper=$(pick_random_wallpaper "$ROTATION_POOL"); then
                 die "no wallpapers available in pool: $ROTATION_POOL"
             fi
-            spinner_tick "applying wallpaper"
+            spinner_active
             set_wallpaper "$wallpaper"
-            spinner_clear
+            spinner_idle
+
             ;;
     esac
 }
@@ -3787,12 +3584,12 @@ screensaver_loop_wallpaper() {
 build_screensaver_filelist() {
     local dir file
     : > "$SCREENSAVER_LIST_FILE"
-    spinner_tick "building file list"
+    spinner_active
     while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
         while IFS= read -r -d '' file; do
             spinner_cancelled && break
-            spinner_tick "checking $(basename "$file")"
+            spinner_active
             if is_selectable_wallpaper "$file"; then
                 printf '%s\n' "$file" >> "$SCREENSAVER_LIST_FILE"
             fi
@@ -3800,7 +3597,8 @@ build_screensaver_filelist() {
                       -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
                       -o -iname '*.mp4' -o -iname '*.webm' \) -print0)
     done < <(list_pool_dirs "$SCREENSAVER_POOL")
-    spinner_clear
+    spinner_idle
+
 }
 
 start_overlay_screensaver() {
@@ -4250,6 +4048,9 @@ main() {
     if [[ $# -gt 0 ]]; then
         shift
     fi
+
+    # Start the background spinner (starts in idle mode)
+    spinner_start
 
     if [[ "$cmd" == "help" || "$cmd" == "-h" || "$cmd" == "--help" ]]; then
         CLEAR_ON_EXIT=0

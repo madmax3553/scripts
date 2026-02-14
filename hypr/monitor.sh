@@ -2,12 +2,12 @@
 #  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
 # ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
 #▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
-#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
-#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
-# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
-#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
-#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
-#      ░    ░         ░ ░      ░ ░           
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
+#      ░    ░         ░ ░      ░ ░
 # Script: monitor.sh
 # Purpose: Hyprland monitor configuration
 # Dependencies: hyprctl
@@ -17,6 +17,7 @@
 set -euo pipefail
 DOCKED_MONITOR="HDMI-A-1"
 MOBILE_MONITOR="eDP-1"
+DOCKED=0
 
 CONFIG_FILE="/home/groot/.config/hypr/dynamic-monitors.conf"
 LOG_FILE="/var/log/monitor-switch.log"
@@ -25,7 +26,6 @@ LOG_FILE="/var/log/monitor-switch.log"
 case "$1" in
     systemd)
         # Logic for systemd/boot
-        DOCKED=0
         for d in /sys/class/drm/*/status; do
             name=$(basename "$(dirname "$d")")
             status=$(cat "$d")

@@ -89,6 +89,10 @@ case "${1:-}" in
         cache_clear "$CACHE_NAME"
         cache_update_with_lock "$CACHE_NAME" generate_output &
         ;;
+    cache-clear)
+        cache_clear "$CACHE_NAME"
+        cache_update_with_lock "$CACHE_NAME" generate_output &
+        ;;
     install)
         if ! command -v yay >/dev/null 2>&1; then
             echo "yay not found" >&2
