@@ -318,13 +318,6 @@ commit_repos() {
     local failed=()
     local total=${#repos_to_commit[@]}
     local current=0
-    
-    # Check if auto-commit-push script exists
-    local commit_script="${HOME}/.local/bin/auto-commit-push"
-    if [ ! -x "$commit_script" ]; then
-        dialog --title "Error" --msgbox "auto-commit-push script not found.\n\nMake sure it's installed at: $commit_script" 8 50
-        return 1
-    fi
 
     for repo_path in "${repos_to_commit[@]}"; do
         cd "$repo_path"
@@ -338,8 +331,21 @@ commit_repos() {
 
         # Only commit dirty repos
         if [ "$status" = "dirty" ]; then
-            if "$commit_script" --force -m "Update %s: $(date '+%Y-%m-%d')" "$repo_name" >/dev/null 2>&1; then
-                committed=$((committed + 1))
+            # Stage all changes
+            git add -A
+            
+            # Create commit message
+            local commit_msg="Update $repo_name: $(date '+%Y-%m-%d')"
+            
+            # Attempt commit
+            if git commit -m "$commit_msg" >/dev/null 2>&1; then
+                # Attempt push
+                if git push >/dev/null 2>&1; then
+                    committed=$((committed + 1))
+                else
+                    # Commit succeeded but push failed
+                    failed+=("$repo_name (push failed)")
+                fi
             else
                 failed+=("$repo_name")
             fi
