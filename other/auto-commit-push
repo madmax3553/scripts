@@ -165,8 +165,8 @@ process_repo() {
 
     cd "$path"
 
-    # Check if there are changes
-    if git diff --quiet && git diff --cached --quiet; then
+    # Check if there are changes (including untracked files)
+    if git diff --quiet && git diff --cached --quiet && [ -z "$(git ls-files --others --exclude-standard)" ]; then
         info "$name: No changes"
         return 0
     fi
