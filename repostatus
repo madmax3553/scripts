@@ -132,6 +132,10 @@ get_repo_status() {
     local repo_dir="$1"
     cd "$repo_dir"
 
+    # Refresh git index to ensure stat information is up-to-date
+    # This prevents false "dirty" detection due to stale index stat entries
+    git update-index --refresh >/dev/null 2>&1 || true
+
     # Check if there are any remote branches
     if [ -z "$(git branch -r)" ]; then
         echo "uninitialized"
