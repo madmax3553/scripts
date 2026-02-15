@@ -173,17 +173,17 @@ cache_update_with_lock() {
 }
 
 cache_update_background() {
-    local name="$1"
-    local cmd="$2"
-    
-    # Spawn background process properly detached from parent
-    {
-        source "${WAYBAR_CACHE_LIB:-/home/groot/projects/scripts/lib/waybar-cache.sh}"
-        cache_update_with_lock "$name" "$cmd"
-        cache_debug_log "cache_update_background: Background update completed for '$name'"
-    } &>/dev/null &
-    
-    disown 2>/dev/null || true
+     local name="$1"
+     local cmd="$2"
+     
+     # Spawn background process properly detached from parent
+     {
+         source "${WAYBAR_CACHE_LIB:-/home/groot/projects/scripts/lib/waybar-cache.sh}"
+         cache_update_with_lock "$name" "$cmd"
+         cache_debug_log "cache_update_background: Background update completed for '$name'"
+     } &>/dev/null &
+     
+     disown 2>/dev/null || true
 }
 
 # ===== Stale Indicator Functions =====

@@ -12,7 +12,7 @@
 # Purpose: Waybar repo status indicator with caching
 # Dependencies: jq, repostatus, flock
 # Author: groot
-# Modified: 2026-01-25
+# Modified: 2026-02-14
 
 set -euo pipefail
 
@@ -33,46 +33,14 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 0
 fi
 
-generate_output() {
-    local json_data overall_status status_counts repos
-    json_data=$(repostatus --json-summary 2>/dev/null) || return 1
-    [[ -z "$json_data" ]] && return 1
+# Use the helper script to generate output (avoids shell quoting issues)
+GENERATE_CMD="/home/groot/projects/scripts/waybar/repostatus-generate.sh"
 
-    overall_status=$(echo "$json_data" | jq -r '.overall_status // "unknown"')
-    status_counts=$(echo "$json_data" | jq '.status_counts // {}')
-    repos=$(echo "$json_data" | jq -c '.repos[]?' 2>/dev/null)
-
-    local good_count dirty_count bad_count uninitialized_count
-    good_count=$(echo "$status_counts" | jq -r '.clean // 0')
-    dirty_count=$(( $(echo "$status_counts" | jq -r '.dirty // 0') + $(echo "$status_counts" | jq -r '.ahead // 0') ))
-    bad_count=$(( $(echo "$status_counts" | jq -r '.behind // 0') + $(echo "$status_counts" | jq -r '.diverged // 0') ))
-    uninitialized_count=$(echo "$status_counts" | jq -r '.uninitialized // 0')
-
-    local green_color="#a6e3a1"
-    local yellow_color="#f9e2af"
-    local red_color="#f38ba8"
-    local grey_color="#6c7086"
-
-    local text
-    text="<span foreground='$green_color'>●</span> $good_count <span foreground='$yellow_color'>●</span> $dirty_count <span foreground='$red_color'>●</span> $bad_count <span foreground='$grey_color'>●</span> $uninitialized_count"
-
-    local tooltip=""
-    if [ -n "$repos" ]; then
-        while IFS= read -r repo; do
-            local name status
-            name=$(echo "$repo" | jq -r '.name')
-            status=$(echo "$repo" | jq -r '.status')
-            tooltip="$tooltip$name: $status\n"
-        done <<< "$repos"
-    fi
-
-    if [ -z "$tooltip" ]; then
-        tooltip="All repositories are clean."
-    fi
-
-    printf '{"text": "%s", "class": "%s", "tooltip": "%s"}\n' "$text" "$overall_status" "$tooltip"
-}
+if [[ ! -x "$GENERATE_CMD" ]]; then
+    waybar_output "Err!" "Helper script not found" "error"
+    exit 0
+fi
 
 # Try to serve from cache, show default on first boot
-output=$(cache_serve "$CACHE_NAME" generate_output "$STALE_THRESHOLD" "$DEFAULT_OUTPUT") || output="$DEFAULT_OUTPUT"
+output=$(cache_serve "$CACHE_NAME" "$GENERATE_CMD" "$STALE_THRESHOLD" "$DEFAULT_OUTPUT") || output="$DEFAULT_OUTPUT"
 echo "$output"
