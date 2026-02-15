@@ -22,7 +22,7 @@ source "/home/groot/projects/scripts/lib/common.sh"
 
 # ===== Configuration =====
 
-JOURNAL_DIR="${JOURNAL_DIR:-${HOME}/journal}"
+JOURNAL_DIR="${JOURNAL_DIR:-${HOME}/projects/journal}"
 DIARY_DIR="${JOURNAL_DIR}/diary"
 TODO_FILE="${JOURNAL_DIR}/TODO.md"
 NOTES_DIR="${JOURNAL_DIR}/notes"

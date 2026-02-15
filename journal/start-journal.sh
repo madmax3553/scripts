@@ -22,7 +22,7 @@ set -euo pipefail
 #   start-journal.sh          # ensure today's file and open (default)
 #   start-journal.sh surface  # focus existing journal window or open if absent
 
-JOURNAL_DIR="${JOURNAL_DIR:-${HOME}/journal/diary}"
+JOURNAL_DIR="${JOURNAL_DIR:-${HOME}/projects/journal/diary}"
 TERMINAL="${TERMINAL:-ghostty}"
 TITLE_PREFIX="${TITLE_PREFIX:-Journal}"
 TODAY="$(date +%Y-%m-%d)"
