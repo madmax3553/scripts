@@ -217,31 +217,8 @@ focus_existing_window() {
 }
 
 launch_journal() {
-  local cmd=()
-  local nvim_cmds=("+set notitle")
-  if [[ -n "${JUMP_SECTION}" ]]; then
-    nvim_cmds+=("+silent!/^## ${JUMP_SECTION}")
-  fi
-  local nvim_full=(nvim "${nvim_cmds[@]}" "${JOURNAL_FILE}")
-  log "launch: terminal=${TERMINAL} title=\"${TITLE}\" jump=\"${JUMP_SECTION}\" file=${JOURNAL_FILE}"
-
-  case "${TERMINAL}" in
-    ghostty)
-      cmd=(ghostty --title="${TITLE}" -e "${nvim_full[@]}")
-      ;;
-    kitty)
-      cmd=(kitty --class Journal --title "${TITLE}" "${nvim_full[@]}")
-      ;;
-    alacritty)
-      cmd=(alacritty --class Journal --title "${TITLE}" -e "${nvim_full[@]}")
-      ;;
-    *)
-      cmd=("${TERMINAL}" -e "${nvim_full[@]}")
-      ;;
-  esac
-
-  setsid "${cmd[@]}" >/dev/null 2>&1 &
-  float_and_center "${FOUND_ADDR}"
+  log "launch: opening journal file=${JOURNAL_FILE}"
+  setsid xdg-open "${JOURNAL_FILE}" >/dev/null 2>&1 &
 }
 
 mode="${1:-open}"
