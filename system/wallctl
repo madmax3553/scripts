@@ -3612,19 +3612,29 @@ start_overlay_screensaver() {
         return 1
     fi
 
-    local shuffled
+    local shuffled temp_playlist
     shuffled=$(shuf "$SCREENSAVER_LIST_FILE")
     if [[ -z "$shuffled" ]]; then
         return 1
     fi
 
+    # Write shuffled playlist to a persistent file (not temp, so mpv can read it later)
+    temp_playlist="$CACHE_DIR/screensaver_playlist.m3u"
+    printf '%s\n' "$shuffled" > "$temp_playlist" || return 1
+
     # mpv handles both images and video natively
     # --image-display-duration controls how long each image shows
     # videos play to completion then advance
+    # Start mpv with proper environment variables, disown it, and redirect output
+    env WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" DISPLAY="${DISPLAY:-:0}" \
     mpv --fullscreen --loop-playlist --no-audio --really-quiet \
         --image-display-duration="$SCREENSAVER_INTERVAL" \
-        --playlist=<(printf '%s\n' "$shuffled") >/dev/null 2>&1 &
-    printf '%s:mpv\n' "$!" > "$LOCK_FILE"
+        --x11-bypass-compositor=no \
+        --playlist="$temp_playlist" >> "$LOG_FILE" 2>&1 &
+    local mpv_pid=$!
+    disown $mpv_pid 2>/dev/null
+    printf '%s:mpv\n' "$mpv_pid" > "$LOCK_FILE"
+    
     return 0
 }
 

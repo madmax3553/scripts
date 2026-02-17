@@ -749,7 +749,7 @@ check_journalled() {
     content_words=$(grep -v "^#\|^-\|^$\|^!!\|^---\|^!\[\|^\[" "$file" 2>/dev/null | wc -w || echo 0)
     
     # Trim whitespace
-    content_words=$(echo "$content_words" | tr -d ' ')
+    content_words=$(echo "$content_words" | xargs)
     
     if [[ $content_words -ge $JOURNAL_WORD_THRESHOLD ]]; then
         return 0  # Journalled!
@@ -779,12 +779,9 @@ cleanup_non_journalled() {
         
         # Check if file meets journalled threshold
         local content_words
-        content_words=$(grep -v "^#\|^-\|^$\|^!!\|^---\|^!\[\|^\[" "$file" 2>/dev/null | wc -w || echo 0)
-        content_words=$(echo "$content_words" | tr -d ' ')
-        
-        if [[ -z "$content_words" ]]; then
-            content_words=0
-        fi
+        content_words=$(grep -v "^#\|^-\|^$\|^!!\|^---\|^!\[\|^\[" "$file" 2>/dev/null | wc -w)
+        content_words=${content_words:-0}
+        content_words=$((content_words))  # Force numeric conversion
         
         if (( content_words < JOURNAL_WORD_THRESHOLD )); then
             # Archive to .removed directory
