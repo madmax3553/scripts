@@ -3625,9 +3625,11 @@ start_overlay_screensaver() {
     # mpv handles both images and video natively
     # --image-display-duration controls how long each image shows
     # videos play to completion then advance
-    # Start mpv with proper environment variables, disown it, and redirect output
+    # Use setsid to detach mpv into its own session so the cleanup trap
+    # (pkill -P $$) does not kill it when wallctl exits.
     env WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" DISPLAY="${DISPLAY:-:0}" \
-    mpv --fullscreen --loop-playlist --no-audio --really-quiet \
+    setsid mpv --fullscreen --loop-playlist --no-audio --really-quiet \
+        --title=wallctl-screensaver \
         --image-display-duration="$SCREENSAVER_INTERVAL" \
         --x11-bypass-compositor=no \
         --playlist="$temp_playlist" >> "$LOG_FILE" 2>&1 &
@@ -3640,7 +3642,13 @@ start_overlay_screensaver() {
 
 cmd_screensaver() {
     load_config
-    draw_screen "screensaver"
+    # Screensaver is typically invoked non-interactively by hypridle;
+    # skip terminal output and pausing when there is no TTY.
+    NO_PAUSE=1
+    CLEAR_ON_EXIT=0
+    if [[ -t 1 ]]; then
+        draw_screen "screensaver"
+    fi
     local action="${1:-}"
     case "$action" in
         start)
