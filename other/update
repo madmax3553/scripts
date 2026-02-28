@@ -69,14 +69,14 @@ run_with_spinner() {
     local msg="$1"
     shift
     local pid
-    
+
     # Run command in background, redirect output to log
     ("$@") >> "$LOG_FILE" 2>&1 &
     pid=$!
-    
+
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     printf "%b==>%b %s " "${BOLD}${BLUE}" "${RESET}" "$msg"
-    
+
     while kill -0 "$pid" 2>/dev/null; do
         for (( i=0; i<${#frames}; i++ )); do
             printf "%b%s%b" "${BOLD}${CYAN}" "${frames:$i:1}" "${RESET}"
@@ -85,7 +85,7 @@ run_with_spinner() {
             if ! kill -0 "$pid" 2>/dev/null; then break; fi
         done
     done
-    
+
     wait "$pid"
     local exit_code=$?
     if [ $exit_code -eq 0 ]; then
@@ -132,7 +132,7 @@ fi
 update_mirrors() {
     if [[ "$DISTRO" != "arch" ]]; then return 0; fi
     header "Phase: Update Mirrors (reflector)"
-    
+
     if ! command -v reflector >/dev/null 2>&1; then
         warn "reflector not found"
         return 0
@@ -160,7 +160,7 @@ update_npm() {
     local tmp_outdated=$(mktemp)
     (ncu -g --reject "npm,corepack,node-gyp" > "$tmp_outdated" 2>&1) &
     local pid=$!
-    
+
     # Simple inline spinner for this capture
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     while kill -0 "$pid" 2>/dev/null; do
@@ -171,17 +171,17 @@ update_npm() {
     wait "$pid"
     outdated=$(cat "$tmp_outdated")
     rm "$tmp_outdated"
-    
+
     if [[ "$outdated" == *"All global packages are up-to-date"* ]] || [[ -z "$outdated" ]]; then
         ok
         return 0
     fi
-    
+
     printf "\n%s\n" "$outdated"
-    
+
     local packages
     packages=$(ncu -g --reject "npm,corepack,node-gyp" --jsonUpgraded | jq -r 'keys[]' 2>/dev/null || true)
-    
+
     for pkg in $packages; do
         run_with_spinner "Updating $pkg..." sudo npm install -g "$pkg@latest" || {
             NPM_ERRORS="${NPM_ERRORS}Failed to update $pkg\n"
@@ -241,7 +241,7 @@ update_python() {
     wait "$pid"
     packages=$(cat "$tmp_pip")
     rm "$tmp_pip"
-    
+
     if [[ -z "$packages" ]]; then ok; printf "All pip packages are up-to-date.\n"; return 0; fi
     ok
 
@@ -307,7 +307,7 @@ main() {
     if [[ "$DISTRO" == "arch" ]]; then
         info "Updating system (yay)..."
         # We DON'T use spinner here because yay is interactive
-        if yay -Syu --noconfirm; then
+        if yay -Syyu --noconfirm; then
             ok
         else
             fail "System update failed"; SYSTEM_ERRORS="${SYSTEM_ERRORS}yay -Syu failed\n"; ERRORS_OCCURRED=1
