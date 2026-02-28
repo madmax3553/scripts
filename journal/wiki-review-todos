@@ -15,4 +15,4 @@
 # Modified: 2026-02-04
 
 # This script is now a thin wrapper around journal.sh for backwards compatibility
-exec ~/bin/journal review "$@"
+exec ~/.local/bin/journal.sh review "$@"

@@ -17,8 +17,8 @@
 set -euo pipefail
 
 # Source common libraries
-source "/home/groot/projects/scripts/lib/colors.sh"
-source "/home/groot/projects/scripts/lib/common.sh"
+source "${HOME}/projects/scripts/lib/colors.sh"
+source "${HOME}/projects/scripts/lib/common.sh"
 
 # ===== Configuration =====
 
@@ -1038,6 +1038,10 @@ main() {
             ;;
         cleanup_non_journalled)
             cleanup_non_journalled
+            ;;
+        cleanup)
+            shift
+            cmd_cleanup "$@"
             ;;
         update_dashboard)
             update_dashboard

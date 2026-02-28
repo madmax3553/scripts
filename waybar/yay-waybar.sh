@@ -10,7 +10,7 @@
 #      ░    ░         ░ ░      ░ ░           
 # Script: yay-waybar.sh
 # Purpose: Waybar yay updates indicator with caching
-# Dependencies: yay, jq, flock, kitty, tofi (optional)
+# Dependencies: yay, jq, flock, kitty, fuzzel (optional)
 # Author: groot
 # Modified: 2026-01-24
 
@@ -21,7 +21,6 @@ source "/home/groot/projects/scripts/lib/waybar-cache.sh"
 IGNORE_FILE="$HOME/.config/yay/ignored_packages"
 CACHE_NAME="yay-updates"
 STALE_THRESHOLD="${WAYBAR_STALE_THRESHOLD:-3600}"
-TOFI_CONFIG="${TOFI_CONFIG:-$HOME/.config/tofi/config}"
 
 DEFAULT_OUTPUT=$(waybar_output "⏳ Checking..." "Checking for updates..." "loading")
 
@@ -70,8 +69,8 @@ generate_output() {
 
 prompt_package() {
     local package=""
-    if command -v tofi >/dev/null 2>&1; then
-        package=$(printf '' | tofi --config "$TOFI_CONFIG" --prompt-text "Install package:" --require-match=false 2>/dev/null || true)
+    if command -v fuzzel >/dev/null 2>&1; then
+        package=$(printf '' | fuzzel --dmenu --prompt "Install package: " --width 40 --lines 0 2>/dev/null || true)
     else
         read -r -p "Install package: " package
     fi
