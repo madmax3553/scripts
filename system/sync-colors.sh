@@ -394,11 +394,13 @@ wtf:
       feeds:
       - https://www.espn.com/espn/rss/nfl/news
       - https://sports.yahoo.com/nfl/rss.xml
-      feedLimit: 8
+      - https://www.youtube.com/feeds/videos.xml?channel_id=UCifWD4FBa4eaKK7HLF0PlTA
+      - https://blog.fantasypros.com/rss/
+      feedLimit: 12
       position:
         top: 1
         left: 0
-        width: 1
+        width: 2
         height: 2
       refreshInterval: 900
       title: "NFL"
@@ -408,27 +410,26 @@ wtf:
       feeds:
       - https://feeds.arstechnica.com/arstechnica/index
       - https://hnrss.org/frontpage
-      feedLimit: 8
+      feedLimit: 7
       position:
         top: 1
-        left: 1
+        left: 2
         width: 1
-        height: 2
+        height: 1
       refreshInterval: 1200
       title: "Tech"
     geopolitics:
       enabled: true
       type: "feedreader"
       feeds:
-      - https://feeds.npr.org/1004/rss.xml
       - https://rss.dw.com/rdf/rss-en-top
       - https://www.aljazeera.com/xml/rss/all.xml
-      feedLimit: 8
+      feedLimit: 6
       position:
-        top: 1
+        top: 2
         left: 2
         width: 1
-        height: 2
+        height: 1
       refreshInterval: 1800
       title: "Geopolitics"
     ipinfo:
@@ -438,7 +439,7 @@ wtf:
       enabled: true
       position:
         top: 3
-        left: 0
+        left: 1
         height: 1
         width: 1
       refreshInterval: 150
@@ -446,7 +447,7 @@ wtf:
       enabled: true
       position:
         top: 3
-        left: 1
+        left: 2
         height: 1
         width: 1
       refreshInterval: 15
@@ -457,7 +458,7 @@ wtf:
       enabled: true
       position:
         top: 3
-        left: 2
+        left: 0
         height: 1
         width: 1
       refreshInterval: 30
