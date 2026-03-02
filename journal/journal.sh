@@ -28,6 +28,7 @@ TODO_FILE="${JOURNAL_DIR}/TODO.md"
 NOTES_DIR="${JOURNAL_DIR}/notes"
 TERMINAL="${TERMINAL:-ghostty}"
 TITLE_PREFIX="${TITLE_PREFIX:-Journal}"
+JOURNAL_FLOAT_CENTER="${JOURNAL_FLOAT_CENTER:-0}"
 LOG_FILE="${JOURNAL_LOG_FILE:-${XDG_STATE_HOME:-${HOME}/.local/state}/journal.log}"
 
 # Load configuration file
@@ -283,7 +284,9 @@ launch_journal() {
     esac
 
     setsid "${cmd[@]}" >/dev/null 2>&1 &
-    float_and_center "${FOUND_ADDR}"
+    if [[ "${JOURNAL_FLOAT_CENTER}" == "1" ]]; then
+        float_and_center "${FOUND_ADDR}"
+    fi
 }
 
 # ===== Daily Plan Command =====
@@ -1008,6 +1011,7 @@ ${BOLD}Configuration:${RESET}
     JOURNAL_DIR   - Base journal directory (default: ~/journal)
     TERMINAL      - Terminal to use (default: ghostty)
     TITLE_PREFIX  - Window title prefix (default: Journal)
+    JOURNAL_FLOAT_CENTER - Force float+center after launch (default: 0)
 
 EOF
 }

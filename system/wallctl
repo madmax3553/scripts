@@ -130,6 +130,30 @@ log() {
     printf "[%s] %s\n" "$(date +'%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE"
 }
 
+log_screensaver_dispatch() {
+    local action="${1:-unknown}"
+    local dispatch_log="${STATE_DIR}/screensaver-dispatch.log"
+    local parent="unknown"
+    local session="${XDG_SESSION_ID:-unknown}"
+    local tty_name="${XDG_VTNR:-none}"
+
+    if [[ -r "/proc/${PPID}/comm" ]]; then
+        parent="$(<"/proc/${PPID}/comm")"
+    fi
+
+    mkdir -p "$STATE_DIR"
+    printf '[%s] action=%s pid=%s ppid=%s parent=%s wayland=%s display=%s session=%s tty=%s\n' \
+        "$(date +'%Y-%m-%d %H:%M:%S')" \
+        "$action" \
+        "$$" \
+        "$PPID" \
+        "$parent" \
+        "${WAYLAND_DISPLAY:-unset}" \
+        "${DISPLAY:-unset}" \
+        "$session" \
+        "$tty_name" >> "$dispatch_log"
+}
+
 print_step() {
     STEP=$((STEP + 1))
     printf "${BOLD}${MAGENTA}[%d/%d]${RESET} %s\n" "$STEP" "$TOTAL_STEPS" "$1"
@@ -3641,6 +3665,8 @@ start_overlay_screensaver() {
 }
 
 cmd_screensaver() {
+    local action="${1:-}"
+    log_screensaver_dispatch "$action"
     load_config
     # Screensaver is typically invoked non-interactively by hypridle;
     # skip terminal output and pausing when there is no TTY.
@@ -3649,31 +3675,37 @@ cmd_screensaver() {
     if [[ -t 1 ]]; then
         draw_screen "screensaver"
     fi
-    local action="${1:-}"
     case "$action" in
         start)
             if screensaver_is_running; then
+                log "screensaver start ignored: already running"
                 print_info "screensaver already running"
                 return 0
             fi
             if [[ "$SCREENSAVER_MODE" == "overlay" ]]; then
                 if start_overlay_screensaver; then
+                    log "screensaver start ok: mode=overlay engine=mpv"
                     print_success "screensaver overlay started (mpv)"
                 else
+                    log "screensaver start fallback: overlay unavailable, trying wallpaper mode"
                     print_warn "overlay mode unavailable; falling back to wallpaper mode"
                     if ! command -v swww >/dev/null 2>&1; then
+                        log "screensaver start failed: swww missing for wallpaper fallback"
                         die "swww required for wallpaper screensaver mode"
                     fi
                     screensaver_loop_wallpaper &
                     printf '%s:swww\n' "$!" > "$LOCK_FILE"
+                    log "screensaver start ok: mode=wallpaper engine=swww pid=$!"
                     print_success "screensaver wallpaper loop started"
                 fi
             else
                 if ! command -v swww >/dev/null 2>&1; then
+                    log "screensaver start failed: swww missing in wallpaper mode"
                     die "swww required for wallpaper screensaver mode"
                 fi
                 screensaver_loop_wallpaper &
                 printf '%s:swww\n' "$!" > "$LOCK_FILE"
+                log "screensaver start ok: mode=wallpaper engine=swww pid=$!"
                 print_success "screensaver wallpaper loop started"
             fi
             ;;
@@ -3696,8 +3728,10 @@ cmd_screensaver() {
                 esac
                 rm -f "$LOCK_FILE"
                 rm -f "$SCREENSAVER_LIST_FILE"
+                log "screensaver stop ok: engine=${lock_type:-unknown} pid=${pid:-unknown}"
                 print_success "screensaver stopped"
             else
+                log "screensaver stop ignored: not running"
                 print_info "screensaver not running"
             fi
             ;;
