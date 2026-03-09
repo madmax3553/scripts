@@ -60,7 +60,7 @@ generate_output() {
     fi
 
     if [ -s "$IGNORE_FILE" ]; then
-        tooltip_text="${tooltip_text}\nIgnoring: $(get_ignored_packages)"
+        tooltip_text="${tooltip_text}"$'\n'"Ignoring: $(get_ignored_packages)"
     fi
 
     text="${update_count} updates"

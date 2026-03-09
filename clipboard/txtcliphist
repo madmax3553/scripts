@@ -1,22 +1,12 @@
 #!/usr/bin/env bash
-#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
-# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
-#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
-#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
-#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
-# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
-#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
-#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
-#      ░    ░         ░ ░      ░ ░           
 # Script: txtcliphist
-# Purpose: Clipboard history actions with cliphist
-# Dependencies: cliphist, wl-clipboard, tofi
+# Purpose: Clipboard history actions with cliphist (using fuzzel)
+# Dependencies: cliphist, wl-clipboard, fuzzel
 # Author: groot
-# Modified: 2026-01-24
+# Modified: 2026-03-07
 
 set -euo pipefail
 
-TOFI_CONFIG="${TOFI_CONFIG:-$HOME/.config/tofi/config}"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cliphist"
 
 require_command() {
@@ -31,7 +21,7 @@ ensure_cache_dir() {
 }
 
 usage() {
-    cat <<EOF
+    cat <<EOH
 Usage: $(basename "$0") [command] [limit]
 
 Commands:
@@ -41,20 +31,20 @@ Commands:
   list         Print clipboard history list
   out          Store stdin into cliphist (used by watcher)
   help         Show this help message
-EOF
+EOH
 }
 
 select_entry() {
     local limit="${1:-}"
-    if ! require_command tofi; then
-        echo "tofi not installed" >&2
-        exit 1
-    fi
-
-    if [[ -n "$limit" ]]; then
-        cliphist list | head -n "$limit" | tofi --config "$TOFI_CONFIG" --prompt-text "Clipboard" --require-match=true
+    if require_command fuzzel; then
+        if [[ -n "$limit" ]]; then
+            cliphist list | head -n "$limit" | fuzzel --dmenu --prompt="Clipboard: "
+        else
+            cliphist list | fuzzel --dmenu --prompt="Clipboard: "
+        fi
     else
-        cliphist list | tofi --config "$TOFI_CONFIG" --prompt-text "Clipboard" --require-match=true
+        echo "fuzzel not installed" >&2
+        exit 1
     fi
 }
 

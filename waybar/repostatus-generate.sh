@@ -26,12 +26,20 @@ if [ -n "$repos" ]; then
     while IFS= read -r repo; do
         name=$(echo "$repo" | jq -r ".name")
         status=$(echo "$repo" | jq -r ".status")
-        tooltip="$tooltip$name: $status\n"
+        tooltip+="$name: $status"$'\n'
     done <<< "$repos"
 fi
+
+# Trim trailing newline
+tooltip="${tooltip%$'\n'}"
 
 if [ -z "$tooltip" ]; then
     tooltip="All repositories are clean."
 fi
 
-printf '{"text": "%s", "class": "%s", "tooltip": "%s"}\n' "$text" "$overall_status" "$tooltip"
+# Use jq to generate JSON output safely
+jq -nc \
+    --arg text "$text" \
+    --arg class "$overall_status" \
+    --arg tooltip "$tooltip" \
+    '{text: $text, class: $class, tooltip: $tooltip}'
