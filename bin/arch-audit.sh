@@ -2,19 +2,19 @@
 #  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
 # ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
 #▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
-#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
-#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
-# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
-#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
-#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
-#      ░    ░         ░ ░      ░ ░           
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
+#      ░    ░         ░ ░      ░ ░
 # Script: arch-audit.sh
 # Purpose: Utility: arc  audit
 # Dependencies: <fill in as needed>
 # Author: Custom
 # Modified: 2026-01-24
 
-set -euo pipefail
+set -uo pipefail
 COLOR_BLUE="\e[34m"
 COLOR_GREEN="\e[32m"
 COLOR_YELLOW="\e[33m"
@@ -60,8 +60,8 @@ else
     for i in "${!orphan_array[@]}"; do
         pkg=${orphan_array[$i]}
         printf "\n${STYLE_BOLD}--- Orphan %s of %s: %s ---${STYLE_RESET}\n" "$((i+1))" "${#orphan_array[@]}" "$pkg"
-        pacman -Qi "$pkg"
-        echo
+            pacman -Qi "$pkg" || echo "Warning: $pkg info not found."
+            echo
 
         while true; do
             read -p "$(printf "${STYLE_BOLD}${COLOR_YELLOW}:: Remove this package? [y/n/a/q] ${STYLE_RESET}")" ynaq

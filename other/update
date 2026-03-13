@@ -150,15 +150,13 @@ update_npm() {
     header "Phase: Global npm Packages"
     if ! command -v npm >/dev/null 2>&1; then return 0; fi
 
-    if ! command -v ncu >/dev/null 2>&1; then
-        run_with_spinner "Installing npm-check-updates..." sudo npm install -g npm-check-updates
-    fi
-
-    local outdated
+    # We only update things that are NOT managed by pacman to avoid conflicts.
+    # npm itself should ALWAYS be managed by pacman on Arch.
+    local packages
     info "Checking for outdated global packages... "
-    # We use a temp file because capturing output and spinner together is tricky
     local tmp_outdated=$(mktemp)
-    (ncu -g --reject "npm,corepack,node-gyp" > "$tmp_outdated" 2>&1) &
+    # Exclude npm and corepack to prevent system conflicts
+    (npm outdated -g --json | jq -r 'keys[]' 2>/dev/null | grep -vE "^(npm|corepack)$" > "$tmp_outdated" || true) &
     local pid=$!
 
     # Simple inline spinner for this capture
@@ -169,20 +167,22 @@ update_npm() {
         done
     done
     wait "$pid"
-    outdated=$(cat "$tmp_outdated")
+    packages=$(cat "$tmp_outdated")
     rm "$tmp_outdated"
 
-    if [[ "$outdated" == *"All global packages are up-to-date"* ]] || [[ -z "$outdated" ]]; then
+    if [[ -z "$packages" ]]; then
         ok
         return 0
     fi
-
-    printf "\n%s\n" "$outdated"
-
-    local packages
-    packages=$(ncu -g --reject "npm,corepack,node-gyp" --jsonUpgraded | jq -r 'keys[]' 2>/dev/null || true)
+    ok
 
     for pkg in $packages; do
+        # If it's owned by a package, skip it
+        if pacman -Qo "/usr/lib/node_modules/$pkg" >/dev/null 2>&1; then
+            echo "Skipping pacman-managed npm package: $pkg" >> "$LOG_FILE"
+            continue
+        fi
+
         run_with_spinner "Updating $pkg..." sudo npm install -g "$pkg@latest" || {
             NPM_ERRORS="${NPM_ERRORS}Failed to update $pkg\n"
             ERRORS_OCCURRED=1
@@ -190,47 +190,20 @@ update_npm() {
     done
 }
 
-handle_npm_conflicts() {
-    if [[ "$DISTRO" != "arch" ]]; then return 0; fi
-    header "Phase: npm Conflict Detection"
-    local npm_base="/usr/lib/node_modules/npm"
-    local conflict_files=()
-    local known_conflicts=(
-        "docs/content/commands/npm-get.md" "docs/content/commands/npm-ll.md" "docs/content/commands/npm-set.md"
-        "docs/content/commands/npm-trust.md" "docs/output/commands/npm-get.html" "docs/output/commands/npm-ll.html"
-        "docs/output/commands/npm-set.html" "docs/output/commands/npm-trust.html" "lib/commands/trust/github.js"
-        "lib/commands/trust/gitlab.js" "lib/commands/trust/index.js" "lib/commands/trust/list.js"
-        "lib/commands/trust/revoke.js" "lib/trust-cmd.js" "node_modules/glob/dist/commonjs/index.min.js"
-        "node_modules/glob/dist/esm/index.min.js" "node_modules/isexe/LICENSE.md" "node_modules/isexe/dist/commonjs/index.js"
-        "node_modules/isexe/dist/commonjs/index.min.js" "node_modules/isexe/dist/commonjs/options.js"
-        "node_modules/isexe/dist/commonjs/package.json" "node_modules/isexe/dist/commonjs/posix.js"
-        "node_modules/isexe/dist/commonjs/win32.js" "node_modules/isexe/dist/esm/index.js"
-        "node_modules/isexe/dist/esm/index.min.js" "node_modules/isexe/dist/esm/options.js"
-        "node_modules/isexe/dist/esm/package.json" "node_modules/isexe/dist/esm/posix.js"
-        "node_modules/isexe/dist/esm/win32.js"
-    )
-
-    for file in "${known_conflicts[@]}"; do
-        if [[ -e "$npm_base/$file" ]]; then conflict_files+=("$npm_base/$file"); fi
-    done
-
-    if [[ ${#conflict_files[@]} -eq 0 ]]; then return 0; fi
-
-    warn "Found ${#conflict_files[@]} conflicting npm files"
-    run_with_spinner "Removing conflicting files..." sudo rm -rf "${conflict_files[@]}" && NPM_REINSTALL_REQUIRED=1 || {
-        SYSTEM_ERRORS="${SYSTEM_ERRORS}Failed to remove conflicting npm files\n"
-        ERRORS_OCCURRED=1
-    }
-}
+# ------------------------------------------------------------------
+# Phase: System Package Updates
+# ------------------------------------------------------------------
 
 update_python() {
     header "Phase: Python (pip) Packages"
     if ! command -v pip >/dev/null 2>&1; then return 0; fi
 
+    # PEP 668: Arch Linux and most distros now prevent global pip installs.
+    # We only check for user-installed (--user) packages.
     local packages
-    info "Checking for outdated pip packages... "
+    info "Checking for outdated user pip packages... "
     local tmp_pip=$(mktemp)
-    (python -m pip list --outdated --format=json | jq -r '.[].name' > "$tmp_pip" 2>/dev/null) &
+    (python -m pip list --outdated --user --format=json | jq -r '.[].name' > "$tmp_pip" 2>/dev/null) &
     local pid=$!
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     while kill -0 "$pid" 2>/dev/null; do
@@ -242,18 +215,12 @@ update_python() {
     packages=$(cat "$tmp_pip")
     rm "$tmp_pip"
 
-    if [[ -z "$packages" ]]; then ok; printf "All pip packages are up-to-date.\n"; return 0; fi
+    if [[ -z "$packages" ]]; then ok; printf "All user pip packages are up-to-date.\n"; return 0; fi
     ok
 
     for pkg in $packages; do
-        # Skip if the package is managed by pacman (prevents externally-managed-environment errors)
-        if pacman -Qs "python-$pkg" >/dev/null 2>&1 || pacman -Qs "$pkg" | grep -q "local/python-$pkg"; then
-            echo "Skipping system-managed package: $pkg" >> "$LOG_FILE"
-            continue
-        fi
-
         run_with_spinner "Updating $pkg..." python -m pip install -U --user "$pkg" || \
-            PIP_ERRORS="${PIP_ERRORS}Failed to update pip package: $pkg\n"
+            PIP_ERRORS="${PIP_ERRORS}Failed to update user pip package: $pkg\n"
     done
 }
 
@@ -301,7 +268,6 @@ main() {
 
     update_mirrors
     update_npm
-    handle_npm_conflicts
 
     header "Phase: System Package Updates"
     if [[ "$DISTRO" == "arch" ]]; then
@@ -314,9 +280,6 @@ main() {
         fi
 
         run_with_spinner "Cleaning up orphans..." yay -Yc --noconfirm
-        if [[ $NPM_REINSTALL_REQUIRED -eq 1 ]]; then
-            run_with_spinner "Restoring npm integrity..." sudo pacman -S --noconfirm npm
-        fi
     fi
 
     update_python
