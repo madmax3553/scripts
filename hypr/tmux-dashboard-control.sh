@@ -44,21 +44,29 @@ close_dashboard_window() {
     hyprctl dispatch closewindow "address:${address}" >/dev/null 2>&1 || true
 }
 
-launch_dashboard_window() {
-    setsid ghostty --title="$TITLE" --window-width=180 --window-height=52 -e "$DASHBOARD_CMD" >/dev/null 2>&1 &
+wait_for_window_close() {
+    local address="${1:-}"
+    local attempt
+    [[ -z "$address" ]] && return 0
+
+    for attempt in {1..20}; do
+        if [[ -z "$(find_dashboard_window || true)" ]]; then
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    return 1
 }
 
-ensure_session() {
-    if ! tmux has-session -t "$SESSION_NAME" 2>/dev/null; then
-        "$DASHBOARD_CMD" launch-detached >/dev/null 2>&1 || true
-    fi
+launch_dashboard_window() {
+    setsid ghostty --title="$TITLE" --window-width=180 --window-height=52 -e "$DASHBOARD_CMD" >/dev/null 2>&1 &
 }
 
 load_dashboard() {
     if [[ -n "$(find_dashboard_window)" ]]; then
         return 0
     fi
-    ensure_session
     launch_dashboard_window
 }
 
@@ -76,8 +84,9 @@ reload_dashboard() {
     local address=""
     address="$(find_dashboard_window || true)"
     close_dashboard_window "$address"
+    wait_for_window_close "$address" || true
     tmux kill-session -t "$SESSION_NAME" >/dev/null 2>&1 || true
-    load_dashboard
+    launch_dashboard_window
 }
 
 show_menu() {

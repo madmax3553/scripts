@@ -107,6 +107,12 @@ NEWS_FEEDS=(
     "https://www.espn.com/espn/rss/news"
 )
 
+SPORTS_NEWS_FEEDS=(
+    "https://www.espn.com/espn/rss/news"
+    "https://www.cbssports.com/rss/headlines/"
+    "https://feeds.foxnews.com/foxnews/sports"
+)
+
 CLOCK_NAMES=(
     "Dubai"
     "UTC"
@@ -511,13 +517,11 @@ render_header() {
     printf '%b%*s%b\n\n' "$DASH_MUTED" "${#title}" '' "$DASH_RESET" | tr ' ' '-'
 }
 
-render_ticker() {
-    local news_json
-    news_json="$(read_news_cache_json)"
+render_feed_ticker_from_json() {
+    local news_json="$1"
 
     NEWS_JSON="$news_json" python3 - <<'PY'
 import html
-from urllib.parse import urlparse
 import json
 import os
 
@@ -528,33 +532,268 @@ items = []
 def clean(text):
     return html.unescape(" ".join((text or "").split())).strip()
 
-def short_link(url):
-    if not url:
-        return ""
-    parsed = urlparse(url)
-    host = parsed.netloc.replace("www.", "")
-    path = parsed.path.rstrip("/")
-    if path:
-        parts = [p for p in path.split("/") if p][:2]
-        path = "/" + "/".join(parts)
-    return f"{host}{path}" if host else url
+def normalize_source(source):
+    source_l = source.lower()
+    if "just in news" in source_l or "the hill" in source_l:
+        return "HILL"
+    if "fox sports" in source_l:
+        return "FOX SPORTS"
+    if "fox news" in source_l:
+        return "FOX"
+    if "espn" in source_l:
+        return "ESPN"
+    if "cbs sports" in source_l:
+        return "CBS SPORTS"
+    if "cbs" in source_l:
+        return "CBS"
+    if "straight arrow" in source_l:
+        return "STRAIGHT"
+    return source.upper()
+
+def classify_source(source, title):
+    source_l = source.lower()
+    title_l = title.lower()
+    if any(token in source_l for token in ("espn", "fox sports", "cbs sports")):
+        return "sports"
+    if any(token in title_l for token in ("nfl", "nba", "nhl", "mlb", "ncaa", "march madness", "super bowl")):
+        return "sports"
+    if any(token in title_l for token in ("trump", "senate", "house", "campaign", "election", "white house", "gop", "democrat", "policy")):
+        return "politics"
+    if any(token in title_l for token in ("iran", "israel", "ukraine", "russia", "china", "embassy", "war", "conflict", "military")):
+        return "world"
+    if any(token in title_l for token in ("market", "stocks", "economy", "inflation", "gas prices", "jobs", "business")):
+        return "business"
+    return "general"
 
 for idx, story in enumerate(stories[:12], start=1):
     title = clean(story.get("title", ""))
     source = clean(story.get("source", "Feed"))
-    link = story.get("link", "")
     if not title:
         continue
-    if link:
-        items.append(f"{idx}. {source}: {title} [{short_link(link)}]")
-    else:
-        items.append(f"{idx}. {source}: {title}")
+    item_type = classify_source(source, title)
+    items.append({"index": idx, "source": normalize_source(source), "title": title, "type": item_type})
 
 if not items:
-    print("No headlines available right now.")
+    print(json.dumps([{"text": "No headlines available right now.", "color": "general"}]))
 else:
-    print(" | ".join(items))
+    segments = []
+    color_map = {
+        "sports": "sports",
+        "politics": "politics",
+        "world": "world",
+        "business": "business",
+        "general": "general",
+    }
+    for item in items:
+        segments.append({"text": f"{item['index']}. ", "color": "muted"})
+        segments.append({"text": f"{item['source']}: ", "color": color_map.get(item['type'], 'general')})
+        segments.append({"text": item['title'], "color": "fg"})
+        segments.append({"text": " | ", "color": "muted"})
+    if segments:
+        segments.pop()
+    print(json.dumps(segments))
 PY
+}
+
+read_sports_news_json() {
+    ensure_cache_dir
+    local cache_file="$NEWS_CACHE_DIR/sports-news.json"
+
+    if [[ ! -s "$cache_file" ]] || [[ $(( $(date +%s) - $(stat -c %Y "$cache_file" 2>/dev/null || echo 0) )) -ge 300 ]]; then
+        python3 - "$cache_file" "${SPORTS_NEWS_FEEDS[@]}" <<'PY'
+import html
+import json
+import re
+import sys
+import urllib.request
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+
+output_path = sys.argv[1]
+feeds = sys.argv[2:]
+stories = []
+seen = set()
+source_counts = {}
+
+def clean(text):
+    text = html.unescape(text or "")
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def extract_link(entry):
+    node = entry.find("link")
+    if node is not None:
+        href = node.attrib.get("href")
+        if href:
+            return href.strip()
+        if node.text:
+            return node.text.strip()
+    for atom_link in entry.findall("{http://www.w3.org/2005/Atom}link"):
+        href = atom_link.attrib.get("href")
+        rel = atom_link.attrib.get("rel", "alternate")
+        if href and rel == "alternate":
+            return href.strip()
+    guid = entry.find("guid")
+    if guid is not None and guid.text and guid.text.startswith("http"):
+        return guid.text.strip()
+    return ""
+
+for url in feeds:
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "tmux-dashboard/1.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = resp.read()
+        root = ET.fromstring(data)
+    except Exception:
+        continue
+
+    channel_title = "Sports"
+    channel = root.find("channel")
+    if channel is not None:
+        title_node = channel.find("title")
+        if title_node is not None and title_node.text:
+            channel_title = clean(title_node.text)
+
+    entries = root.findall(".//item")
+    if not entries:
+        entries = root.findall(".//{http://www.w3.org/2005/Atom}entry")
+
+    for entry in entries:
+        title_node = entry.find("title")
+        if title_node is None:
+            title_node = entry.find("{http://www.w3.org/2005/Atom}title")
+        summary_node = entry.find("description")
+        if summary_node is None:
+            summary_node = entry.find("summary")
+        if summary_node is None:
+            summary_node = entry.find("{http://www.w3.org/2005/Atom}summary")
+
+        title = clean(title_node.text if title_node is not None else "")
+        summary = clean(summary_node.text if summary_node is not None else "")
+        link = extract_link(entry)
+        if not title or title in seen:
+            continue
+
+        count = source_counts.get(channel_title, 0)
+        if count >= 3:
+            continue
+
+        seen.add(title)
+        source_counts[channel_title] = count + 1
+        stories.append({"source": channel_title, "title": title, "summary": summary, "link": link})
+        if len(stories) >= 20:
+            break
+    if len(stories) >= 20:
+        break
+
+with open(output_path, "w", encoding="utf-8") as handle:
+    json.dump({"updated_at": datetime.now(timezone.utc).isoformat(), "stories": stories}, handle)
+PY
+    fi
+
+    if [[ ! -s "$cache_file" ]]; then
+        printf '{"updated_at":"","stories":[]}'
+        return
+    fi
+
+    python3 - "$cache_file" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as handle:
+        data = json.load(handle)
+except Exception:
+    data = {"updated_at": "", "stories": []}
+print(json.dumps(data))
+PY
+}
+
+render_ticker() {
+    local news_json
+    news_json="$(read_news_cache_json)"
+    render_feed_ticker_from_json "$news_json"
+}
+
+render_sports_news_ticker() {
+    local news_json
+    news_json="$(read_sports_news_json)"
+    render_feed_ticker_from_json "$news_json"
+}
+
+run_simple_scroller() {
+    local renderer="$1"
+    local color="$2"
+    local refresh_interval="$3"
+    local text=""
+    local offset=0
+    local refresh_counter=0
+    local width
+
+    while true; do
+        if [[ $refresh_counter -le 0 || -z "$text" ]]; then
+            text="$($renderer)"
+            refresh_counter="$refresh_interval"
+        fi
+
+        width=$(tput cols 2>/dev/null || printf '80')
+        width=$((width > 2 ? width - 1 : width))
+
+        mapfile -t line_out < <(SCROLLER_SEGMENTS="$text" SCROLLER_WIDTH="$width" SCROLLER_OFFSET="$offset" SCROLLER_FG="$DASH_FG" SCROLLER_MUTED="$DASH_MUTED" SCROLLER_GENERAL="$DASH_BLUE" SCROLLER_SPORTS="$DASH_GREEN" SCROLLER_POLITICS="$DASH_PINK" SCROLLER_WORLD="$DASH_RED" SCROLLER_BUSINESS="$DASH_YELLOW" SCROLLER_RESET="$DASH_RESET" python3 - <<'PY'
+import json
+import os
+
+segments = json.loads(os.environ.get("SCROLLER_SEGMENTS", "[]") or "[]")
+width = max(int(os.environ.get("SCROLLER_WIDTH", "80")), 20)
+offset = int(os.environ.get("SCROLLER_OFFSET", "0"))
+colors = {
+    "fg": os.environ.get("SCROLLER_FG", ""),
+    "muted": os.environ.get("SCROLLER_MUTED", ""),
+    "general": os.environ.get("SCROLLER_GENERAL", ""),
+    "sports": os.environ.get("SCROLLER_SPORTS", ""),
+    "politics": os.environ.get("SCROLLER_POLITICS", ""),
+    "world": os.environ.get("SCROLLER_WORLD", ""),
+    "business": os.environ.get("SCROLLER_BUSINESS", ""),
+}
+reset = os.environ.get("SCROLLER_RESET", "")
+
+if not segments:
+    segments = [{"text": "No headlines available right now.", "color": "general"}]
+
+padding = [{"text": "   ***   ", "color": "muted"}]
+all_segments = segments + padding + segments + padding
+
+visible = []
+for segment in all_segments:
+    color = colors.get(segment.get("color", "fg"), colors["fg"])
+    for ch in segment.get("text", ""):
+        visible.append((ch, color))
+
+cycle = sum(len(seg.get("text", "")) for seg in segments + padding)
+if cycle <= 0:
+    cycle = len(visible)
+start = offset % cycle
+window = visible[start:start + width]
+if len(window) < width:
+    window += visible[:width - len(window)]
+
+out = []
+current = None
+for ch, color in window:
+    if color != current:
+        out.append(color)
+        current = color
+    out.append(ch)
+out.append(reset)
+print("".join(out))
+PY
+)
+
+        printf '\033[H%b%s%b' "$color" "$(printf '%-*.*s' "$width" "$width" "${line_out[0]:-No headlines available right now.}")" "$DASH_RESET"
+        offset=$((offset + 1))
+        refresh_counter=$((refresh_counter - 1))
+        sleep 0.12
+    done
 }
 
 run_ticker_loop() {
@@ -594,12 +833,12 @@ run_ticker_loop() {
         local title='[= GROOTWARE PRESENTS :: DASHBOARD 64 =]'
         local inner_width left_fill right_fill
 
-        if (( target_width <= ${#title} + 2 )); then
+        if (( target_width <= ${#title} + 1 )); then
             printf '%s' "$(pad_line "$title" "$target_width")"
             return
         fi
 
-        inner_width=$((target_width - ${#title} - 2))
+        inner_width=$((target_width - ${#title} - 1))
         left_fill=$((inner_width / 2))
         right_fill=$((inner_width - left_fill))
 
@@ -619,47 +858,111 @@ run_ticker_loop() {
         width=$(tput cols 2>/dev/null || printf '80')
         width=$((width > 2 ? width - 1 : width))
 
-        mapfile -t ticker_lines < <(TICKER_TEXT="$ticker_text" TICKER_WIDTH="$width" TICKER_OFFSET="$ticker_offset" python3 - <<'PY'
+        mapfile -t ticker_lines < <(SCROLLER_SEGMENTS="$ticker_text" SCROLLER_WIDTH="$width" SCROLLER_OFFSET="$ticker_offset" SCROLLER_FG="$DASH_FG" SCROLLER_MUTED="$DASH_MUTED" SCROLLER_GENERAL="$DASH_BLUE" SCROLLER_SPORTS="$DASH_GREEN" SCROLLER_POLITICS="$DASH_PINK" SCROLLER_WORLD="$DASH_RED" SCROLLER_BUSINESS="$DASH_YELLOW" SCROLLER_RESET="$DASH_RESET" python3 - <<'PY'
+import json
 import os
 
-text = os.environ.get("TICKER_TEXT", "")
-width = max(int(os.environ.get("TICKER_WIDTH", "80")), 20)
-offset = int(os.environ.get("TICKER_OFFSET", "0"))
+segments = json.loads(os.environ.get("SCROLLER_SEGMENTS", "[]") or "[]")
+width = max(int(os.environ.get("SCROLLER_WIDTH", "80")), 20)
+offset = int(os.environ.get("SCROLLER_OFFSET", "0"))
+colors = {
+    "fg": os.environ.get("SCROLLER_FG", ""),
+    "muted": os.environ.get("SCROLLER_MUTED", ""),
+    "general": os.environ.get("SCROLLER_GENERAL", ""),
+    "sports": os.environ.get("SCROLLER_SPORTS", ""),
+    "politics": os.environ.get("SCROLLER_POLITICS", ""),
+    "world": os.environ.get("SCROLLER_WORLD", ""),
+    "business": os.environ.get("SCROLLER_BUSINESS", ""),
+}
+reset = os.environ.get("SCROLLER_RESET", "")
 
-if not text:
-    text = "No headlines available right now."
+if not segments:
+    segments = [{"text": "No headlines available right now.", "color": "general"}]
 
-padding = "   ***   "
-scroll_text = text + padding + text + padding
-start = offset % (len(text) + len(padding))
-window = scroll_text[start:start + width]
-print(window)
+padding = [{"text": "   ***   ", "color": "muted"}]
+all_segments = segments + padding + segments + padding
+
+visible = []
+for segment in all_segments:
+    color = colors.get(segment.get("color", "fg"), colors["fg"])
+    for ch in segment.get("text", ""):
+        visible.append((ch, color))
+
+cycle = sum(len(seg.get("text", "")) for seg in segments + padding)
+if cycle <= 0:
+    cycle = len(visible)
+start = offset % cycle
+window = visible[start:start + width]
+if len(window) < width:
+    window += visible[:width - len(window)]
+
+out = []
+current = None
+for ch, color in window:
+    if color != current:
+        out.append(color)
+        current = color
+    out.append(ch)
+out.append(reset)
+print("".join(out))
 PY
 )
 
-        mapfile -t sports_lines < <(SPORTS_TEXT="$sports_text" SPORTS_WIDTH="$width" SPORTS_OFFSET="$sports_offset" python3 - <<'PY'
+        mapfile -t sports_lines < <(SCROLLER_SEGMENTS="$sports_text" SCROLLER_WIDTH="$width" SCROLLER_OFFSET="$sports_offset" SCROLLER_FG="$DASH_FG" SCROLLER_MUTED="$DASH_MUTED" SCROLLER_GENERAL="$DASH_BLUE" SCROLLER_SPORTS="$DASH_GREEN" SCROLLER_POLITICS="$DASH_PINK" SCROLLER_WORLD="$DASH_RED" SCROLLER_BUSINESS="$DASH_YELLOW" SCROLLER_RESET="$DASH_RESET" python3 - <<'PY'
+import json
 import os
 
-text = os.environ.get("SPORTS_TEXT", "")
-width = max(int(os.environ.get("SPORTS_WIDTH", "80")), 20)
-offset = int(os.environ.get("SPORTS_OFFSET", "0"))
+segments = json.loads(os.environ.get("SCROLLER_SEGMENTS", "[]") or "[]")
+width = max(int(os.environ.get("SCROLLER_WIDTH", "80")), 20)
+offset = int(os.environ.get("SCROLLER_OFFSET", "0"))
+colors = {
+    "fg": os.environ.get("SCROLLER_FG", ""),
+    "muted": os.environ.get("SCROLLER_MUTED", ""),
+    "general": os.environ.get("SCROLLER_GENERAL", ""),
+    "sports": os.environ.get("SCROLLER_SPORTS", ""),
+    "politics": os.environ.get("SCROLLER_POLITICS", ""),
+    "world": os.environ.get("SCROLLER_WORLD", ""),
+    "business": os.environ.get("SCROLLER_BUSINESS", ""),
+}
+reset = os.environ.get("SCROLLER_RESET", "")
 
-if not text:
-    text = "No scores available."
+if not segments:
+    segments = [{"text": "No scores available.", "color": "sports"}]
 
-padding = "   ***   "
-scroll_text = text + padding + text + padding
-start = offset % (len(text) + len(padding))
-window = scroll_text[start:start + width]
-print(window)
+padding = [{"text": "   ***   ", "color": "muted"}]
+all_segments = segments + padding + segments + padding
+
+visible = []
+for segment in all_segments:
+    color = colors.get(segment.get("color", "fg"), colors["fg"])
+    for ch in segment.get("text", ""):
+        visible.append((ch, color))
+
+cycle = sum(len(seg.get("text", "")) for seg in segments + padding)
+if cycle <= 0:
+    cycle = len(visible)
+start = offset % cycle
+window = visible[start:start + width]
+if len(window) < width:
+    window += visible[:width - len(window)]
+
+out = []
+current = None
+for ch, color in window:
+    if color != current:
+        out.append(color)
+        current = color
+    out.append(ch)
+out.append(reset)
+print("".join(out))
 PY
         )
 
         printf '\033[H'
         printf '%b%s%b\n\n' "$DASH_PINK" "$(header_line "$width")" "$DASH_RESET"
-        printf '%b%s%b\n' "$DASH_CYAN" "$(pad_line "${ticker_lines[0]:-No headlines available right now.}" "$width")" "$DASH_RESET"
-        printf '%b%s%b\n' "$DASH_ORANGE" "$(pad_line "${sports_lines[0]:-No scores available.}" "$width")" "$DASH_RESET"
-        printf '%s\n' "$(pad_line "$(render_clocks_line)" "$width")"
+        printf '%s\n' "${ticker_lines[0]:-$DASH_CYAN$(pad_line 'No headlines available right now.' "$width")$DASH_RESET}"
+        printf '%s\n' "${sports_lines[0]:-$DASH_ORANGE$(pad_line 'No scores available.' "$width")$DASH_RESET}"
+        printf '%s\n' "$(render_clocks_line)"
         printf '%b%s%b' "$DASH_MUTED" "$(pad_line "Super+B dashboard  Super+N stories  Super+Shift+R repos" "$width")" "$DASH_RESET"
 
         ticker_offset=$((ticker_offset + 1))
@@ -932,14 +1235,9 @@ PY
 }
 
 render_sports_compact() {
-    TITLE_COLOR="$DASH_ORANGE" META_COLOR="$DASH_MAGENTA" RESET_COLOR="$DASH_RESET" python3 - <<'PY'
+    python3 - <<'PY'
 import json
-import os
 import urllib.request
-
-TITLE = os.environ.get("TITLE_COLOR", "")
-META = os.environ.get("META_COLOR", "")
-RESET = os.environ.get("RESET_COLOR", "")
 
 feeds = [
     ("NFL", "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard"),
@@ -968,9 +1266,16 @@ for league, url in feeds:
         items.append(f"{league} {matchup} {status}")
 
 if not items:
-    print("No scores available.")
+    print(json.dumps([{"text": "No scores available.", "color": "sports"}]))
 else:
-    print(" | ".join(items))
+    segments = []
+    for idx, item in enumerate(items[:12], start=1):
+        segments.append({"text": f"{idx}. ", "color": "muted"})
+        segments.append({"text": item, "color": "sports"})
+        segments.append({"text": " | ", "color": "muted"})
+    if segments:
+        segments.pop()
+    print(json.dumps(segments))
 PY
 }
 
@@ -1165,6 +1470,12 @@ run_pane() {
         ticker)
             run_ticker_loop
             ;;
+        top-news-ticker)
+            run_ticker_loop
+            ;;
+        sports-news-ticker)
+            run_simple_scroller render_sports_news_ticker "$DASH_ORANGE" 300
+            ;;
         stories)
             pane_loop 300 render_stories
             ;;
@@ -1207,6 +1518,8 @@ render_once() {
         ticker)
             render_ticker
             ;;
+        top-news-ticker) render_ticker ;;
+        sports-news-ticker) render_sports_news_ticker ;;
         stories) render_stories ;;
         repo) render_repo ;;
         utility) render_utility ;;
@@ -1247,7 +1560,7 @@ create_home_window() {
         story_width=$((window_width - 40))
     fi
 
-    top_pane="$(tmux split-window -dPF '#{pane_id}' -t "$root_pane" -v -b -l 7)"
+    top_pane="$(tmux split-window -dPF '#{pane_id}' -t "$root_pane" -v -b -l 8)"
     stories_pane="$(tmux split-window -dPF '#{pane_id}' -t "$root_pane" -h -b -l "$story_width")"
     right_pane="$root_pane"
     monitor_pane="$(tmux split-window -dPF '#{pane_id}' -t "$right_pane" -v -b -l 12)"
@@ -1267,11 +1580,46 @@ create_home_window() {
 }
 
 create_extra_windows() {
-    tmux new-window -t "$SESSION_NAME" -n monitor "$(tmux_pane_command monitor)"
-    tmux new-window -t "$SESSION_NAME" -n feeds "$(tmux_pane_command feeds)"
-    tmux new-window -t "$SESSION_NAME" -n git "$(tmux_pane_command git)"
-    tmux new-window -t "$SESSION_NAME" -n sports "$(tmux_pane_command sports)"
-    tmux new-window -t "$SESSION_NAME" -n help "$(tmux_pane_command help)"
+    local window_ref main_pane top_pane bottom_pane
+    local top_height=8
+
+    tmux new-window -t "$SESSION_NAME" -n monitor
+    window_ref="$SESSION_NAME:monitor"
+    main_pane="$(tmux display-message -p -t "$window_ref.0" '#{pane_id}')"
+    top_pane="$(tmux split-window -dPF '#{pane_id}' -t "$main_pane" -v -b -l "$top_height")"
+    tmux respawn-pane -k -t "$top_pane" "$(tmux_pane_command ticker)"
+    tmux respawn-pane -k -t "$main_pane" "$(tmux_pane_command monitor)"
+
+    tmux new-window -t "$SESSION_NAME" -n feeds
+    window_ref="$SESSION_NAME:feeds"
+    main_pane="$(tmux display-message -p -t "$window_ref.0" '#{pane_id}')"
+    top_pane="$(tmux split-window -dPF '#{pane_id}' -t "$main_pane" -v -b -l "$top_height")"
+    tmux respawn-pane -k -t "$top_pane" "$(tmux_pane_command ticker)"
+    tmux respawn-pane -k -t "$main_pane" "$(tmux_pane_command feeds)"
+
+    tmux new-window -t "$SESSION_NAME" -n git
+    window_ref="$SESSION_NAME:git"
+    main_pane="$(tmux display-message -p -t "$window_ref.0" '#{pane_id}')"
+    top_pane="$(tmux split-window -dPF '#{pane_id}' -t "$main_pane" -v -b -l "$top_height")"
+    tmux respawn-pane -k -t "$top_pane" "$(tmux_pane_command ticker)"
+    tmux respawn-pane -k -t "$main_pane" "$(tmux_pane_command git)"
+
+    tmux new-window -t "$SESSION_NAME" -n sports
+    window_ref="$SESSION_NAME:sports"
+    main_pane="$(tmux display-message -p -t "$window_ref.0" '#{pane_id}')"
+    top_pane="$(tmux split-window -dPF '#{pane_id}' -t "$main_pane" -v -b -l "$top_height")"
+    bottom_pane="$(tmux split-window -dPF '#{pane_id}' -t "$main_pane" -v -l 1)"
+    tmux respawn-pane -k -t "$top_pane" "$(tmux_pane_command ticker)"
+    tmux respawn-pane -k -t "$main_pane" "$(tmux_pane_command sports)"
+    tmux respawn-pane -k -t "$bottom_pane" "$(tmux_pane_command sports-news-ticker)"
+
+    tmux new-window -t "$SESSION_NAME" -n help
+    window_ref="$SESSION_NAME:help"
+    main_pane="$(tmux display-message -p -t "$window_ref.0" '#{pane_id}')"
+    top_pane="$(tmux split-window -dPF '#{pane_id}' -t "$main_pane" -v -b -l "$top_height")"
+    tmux respawn-pane -k -t "$top_pane" "$(tmux_pane_command ticker)"
+    tmux respawn-pane -k -t "$main_pane" "$(tmux_pane_command help)"
+
     tmux select-window -t "$SESSION_NAME:home"
 }
 
