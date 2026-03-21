@@ -9,10 +9,10 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: repostatus-waybar.sh
-# Purpose: Waybar repo status indicator with caching
-# Dependencies: jq, repostatus, flock
+# Purpose: Waybar repo status indicator (reads from shared cache)
+# Dependencies: jq, status-cache-daemon.sh
 # Author: groot
-# Modified: 2026-02-14
+# Modified: 2026-03-20
 
 set -euo pipefail
 
@@ -23,24 +23,21 @@ STALE_THRESHOLD="${WAYBAR_STALE_THRESHOLD:-300}"
 
 DEFAULT_OUTPUT=$(waybar_output "⏳ Loading..." "Scanning repositories..." "loading")
 
-if ! command -v repostatus >/dev/null 2>&1; then
-    waybar_output "Err!" "$PATH" "$USER"
-    exit 0
-fi
-
 if ! command -v jq >/dev/null 2>&1; then
     waybar_output "repo" "jq not installed" "error"
     exit 0
 fi
 
-# Use the helper script to generate output (avoids shell quoting issues)
-GENERATE_CMD="/home/groot/projects/scripts/waybar/repostatus-generate.sh"
+# The daemon writes both repos-data.json (raw) and repostatus.json (waybar-formatted).
+# We read the waybar-formatted cache directly. If stale, kick off a daemon refresh.
+DAEMON_CMD="/home/groot/projects/scripts/system/status-cache-daemon.sh refresh-repos"
 
-if [[ ! -x "$GENERATE_CMD" ]]; then
-    waybar_output "Err!" "Helper script not found" "error"
-    exit 0
+# Fallback: if no daemon cache exists, use the old generate script directly
+GENERATE_CMD="/home/groot/projects/scripts/waybar/repostatus-generate.sh"
+FALLBACK_CMD="$GENERATE_CMD"
+if [[ -x "$DAEMON_CMD" ]] || command -v status-cache-daemon.sh >/dev/null 2>&1; then
+    FALLBACK_CMD="$DAEMON_CMD"
 fi
 
-# Try to serve from cache, show default on first boot
-output=$(cache_serve "$CACHE_NAME" "$GENERATE_CMD" "$STALE_THRESHOLD" "$DEFAULT_OUTPUT") || output="$DEFAULT_OUTPUT"
+output=$(cache_serve "$CACHE_NAME" "$FALLBACK_CMD" "$STALE_THRESHOLD" "$DEFAULT_OUTPUT") || output="$DEFAULT_OUTPUT"
 echo "$output"

@@ -9,10 +9,10 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
 #      ░    ░         ░ ░      ░ ░           
 # Script: yay-waybar.sh
-# Purpose: Waybar yay updates indicator with caching
+# Purpose: Waybar yay updates indicator (reads from shared cache)
 # Dependencies: yay, jq, flock, kitty, fuzzel (optional)
 # Author: groot
-# Modified: 2026-01-24
+# Modified: 2026-03-20
 
 set -euo pipefail
 
@@ -21,50 +21,18 @@ source "/home/groot/projects/scripts/lib/waybar-cache.sh"
 IGNORE_FILE="$HOME/.config/yay/ignored_packages"
 CACHE_NAME="yay-updates"
 STALE_THRESHOLD="${WAYBAR_STALE_THRESHOLD:-3600}"
+DAEMON_CMD="/home/groot/projects/scripts/system/status-cache-daemon.sh"
 
 DEFAULT_OUTPUT=$(waybar_output "⏳ Checking..." "Checking for updates..." "loading")
 
 touch "$IGNORE_FILE"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper functions for actions that still need direct yay access
+# ─────────────────────────────────────────────────────────────────────────────
+
 get_ignored_packages() {
     tr '\n' ',' < "$IGNORE_FILE" 2>/dev/null | sed 's/,$//'
-}
-
-get_update_count() {
-    local ignored="$1"
-    if [ -n "$ignored" ]; then
-        yay -Qu --ignore "$ignored" 2>/dev/null | wc -l
-    else
-        yay -Qu 2>/dev/null | wc -l
-    fi
-}
-
-get_update_list() {
-    local ignored="$1"
-    if [ -n "$ignored" ]; then
-        yay -Qu --ignore "$ignored" 2>/dev/null
-    else
-        yay -Qu 2>/dev/null
-    fi
-}
-
-generate_output() {
-    local ignored_packages update_count tooltip_text text
-    ignored_packages=$(get_ignored_packages)
-    update_count=$(get_update_count "$ignored_packages")
-
-    if [ "$update_count" -gt 0 ]; then
-        tooltip_text=$(get_update_list "$ignored_packages")
-    else
-        tooltip_text="No updates available"
-    fi
-
-    if [ -s "$IGNORE_FILE" ]; then
-        tooltip_text="${tooltip_text}"$'\n'"Ignoring: $(get_ignored_packages)"
-    fi
-
-    text="${update_count} updates"
-    waybar_output "$text" "$tooltip_text" ""
 }
 
 prompt_package() {
@@ -77,6 +45,19 @@ prompt_package() {
     printf '%s' "$package"
 }
 
+trigger_refresh() {
+    # Clear both the waybar-formatted and raw data caches, then refresh
+    cache_clear "$CACHE_NAME"
+    cache_clear "updates-data"
+    if [[ -x "$DAEMON_CMD" ]]; then
+        "$DAEMON_CMD" refresh-updates &
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Command dispatch
+# ─────────────────────────────────────────────────────────────────────────────
+
 case "${1:-}" in
     update)
         if ! command -v yay >/dev/null 2>&1; then
@@ -85,12 +66,10 @@ case "${1:-}" in
         fi
         ignored_packages=$(get_ignored_packages)
         kitty --title "yay-update" yay -Syyu --ignore "$ignored_packages"
-        cache_clear "$CACHE_NAME"
-        cache_update_with_lock "$CACHE_NAME" generate_output &
+        trigger_refresh
         ;;
     cache-clear)
-        cache_clear "$CACHE_NAME"
-        cache_update_with_lock "$CACHE_NAME" generate_output &
+        trigger_refresh
         ;;
     install)
         if ! command -v yay >/dev/null 2>&1; then
@@ -98,21 +77,18 @@ case "${1:-}" in
             exit 1
         fi
         package=$(prompt_package)
-        if [ -n "$package" ]; then
+        if [[ -n "$package" ]]; then
             kitty --title "yay-install" yay -S "$package"
-            cache_clear "$CACHE_NAME"
-            cache_update_with_lock "$CACHE_NAME" generate_output &
+            trigger_refresh
         fi
         ;;
     ignore)
-        [ -n "${2:-}" ] && echo "$2" >> "$IGNORE_FILE"
-        cache_clear "$CACHE_NAME"
-        cache_update_with_lock "$CACHE_NAME" generate_output &
+        [[ -n "${2:-}" ]] && echo "$2" >> "$IGNORE_FILE"
+        trigger_refresh
         ;;
     unignore)
-        [ -n "${2:-}" ] && sed -i "/^$2$/d" "$IGNORE_FILE"
-        cache_clear "$CACHE_NAME"
-        cache_update_with_lock "$CACHE_NAME" generate_output &
+        [[ -n "${2:-}" ]] && sed -i "/^$2$/d" "$IGNORE_FILE"
+        trigger_refresh
         ;;
     *)
         if ! command -v yay >/dev/null 2>&1; then
@@ -120,7 +96,10 @@ case "${1:-}" in
             exit 0
         fi
 
-        output=$(cache_serve "$CACHE_NAME" generate_output "$STALE_THRESHOLD") || output="$DEFAULT_OUTPUT"
+        # The daemon writes yay-updates.json (waybar-formatted).
+        # Use cache_serve to read it, falling back to daemon refresh if stale.
+        REFRESH_CMD="$DAEMON_CMD refresh-updates"
+        output=$(cache_serve "$CACHE_NAME" "$REFRESH_CMD" "$STALE_THRESHOLD") || output="$DEFAULT_OUTPUT"
         echo "$output"
         ;;
 esac

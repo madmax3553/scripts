@@ -242,7 +242,9 @@ update_flatpak() {
 refresh_waybar() {
     if [[ "$DISTRO" != "arch" ]]; then return 0; fi
     header "Phase: Refresh Status Bar"
-    if command -v yay-waybar.sh >/dev/null 2>&1; then
+    if command -v status-cache-daemon.sh >/dev/null 2>&1; then
+        run_with_spinner "Refreshing status cache..." status-cache-daemon.sh refresh-all
+    elif command -v yay-waybar.sh >/dev/null 2>&1; then
         run_with_spinner "Clearing Waybar cache..." yay-waybar.sh cache-clear
     fi
 }
