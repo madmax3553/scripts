@@ -74,9 +74,10 @@ sample(){
   # upower (may provide time to full and instantaneous rate)
   local up_dev=$(upower -e 2>/dev/null | grep -m1 BAT || true)
   if [[ -n $up_dev ]]; then
-    state=$(upower -i "$up_dev" | awk -F: '/state/ {gsub(/^[ \t]+/,"",$2);print $2}' )
-    upower_rateW=$(upower -i "$up_dev" | awk -F: '/energy-rate/ {gsub(/^[ \t]+/,"",$2);print $2}' | awk '{print $1}')
-    upower_time=$(upower -i "$up_dev" | awk -F: '/time to/ {gsub(/^[ \t]+/,"",$2);print $2}')
+    local up_info=$(upower -i "$up_dev" 2>/dev/null || true)
+    state=$(echo "$up_info" | awk -F: '/state/ {gsub(/^[ \t]+/,"",$2);print $2}' )
+    upower_rateW=$(echo "$up_info" | awk -F: '/energy-rate/ {gsub(/^[ \t]+/,"",$2);print $2}' | awk '{print $1}')
+    upower_time=$(echo "$up_info" | awk -F: '/time to/ {gsub(/^[ \t]+/,"",$2);print $2}')
   fi
 
   # Enumerate power sources (USB/AC)
@@ -133,3 +134,5 @@ while :; do
   fi
   sleep "$interval"
 done
+
+exit 0

@@ -14,7 +14,8 @@
 # Author: groot
 # Modified: 2026-01-24
 
-set -euo pipefail
+set -u
+set -o pipefail
 
 source "/home/groot/projects/scripts/lib/waybar-cache.sh"
 
@@ -30,15 +31,17 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 0
 fi
 
-data=$($charge_cmd -j | tail -n1)
+# We don't use set -e here so we can handle the failure manually
+data=$($charge_cmd -j 2>/dev/null | tail -n1 || true)
+
 if [ -z "$data" ]; then
-    waybar_output "battery" "no data" "error"
+    waybar_output "No Data" "Battery script failed or returned no data" "error"
     exit 0
 fi
 
-power=$(echo "$data" | jq -r '.power_W // empty')
-status=$(echo "$data" | jq -r '.status // empty')
-pct=$(echo "$data" | jq -r '.capacity_pct // empty')
+power=$(echo "$data" | jq -r '.power_W // 0')
+status=$(echo "$data" | jq -r '.status // "Unknown"')
+pct=$(echo "$data" | jq -r '.capacity_pct // 0')
 class=$(echo "$status" | tr '[:upper:]' '[:lower:]' | tr ' ' '_')
 text="${power}W"
 tooltip="${status} ${pct}%"
