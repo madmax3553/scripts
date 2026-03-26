@@ -3651,14 +3651,30 @@ start_overlay_screensaver() {
     # videos play to completion then advance
     # Use setsid to detach mpv into its own session so the cleanup trap
     # (pkill -P $$) does not kill it when wallctl exits.
+    # NOTE: $! captures the setsid wrapper PID which exits immediately,
+    # so we use pgrep to find the real mpv process by its unique title.
     env WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" DISPLAY="${DISPLAY:-:0}" \
     setsid mpv --fullscreen --loop-playlist --no-audio --really-quiet \
         --title=wallctl-screensaver \
         --image-display-duration="$SCREENSAVER_INTERVAL" \
         --x11-bypass-compositor=no \
         --playlist="$temp_playlist" >> "$LOG_FILE" 2>&1 &
-    local mpv_pid=$!
-    disown $mpv_pid 2>/dev/null
+    disown $! 2>/dev/null
+
+    # Wait briefly for mpv to start, then find its real PID via the unique title.
+    local mpv_pid="" attempts=0
+    while (( attempts < 20 )); do
+        mpv_pid=$(pgrep -f 'mpv.*--title=wallctl-screensaver' 2>/dev/null | head -1 || true)
+        [[ -n "$mpv_pid" ]] && break
+        sleep 0.1
+        (( attempts++ ))
+    done
+
+    if [[ -z "$mpv_pid" ]]; then
+        log "screensaver start failed: could not find mpv process after launch"
+        return 1
+    fi
+
     printf '%s:mpv\n' "$mpv_pid" > "$LOCK_FILE"
     
     return 0
@@ -3718,8 +3734,8 @@ cmd_screensaver() {
                 # Also clean up any spawned mpv/mpvpaper processes
                 case "$lock_type" in
                     mpv)
-                        # Kill the specific mpv overlay if it's still around
-                        pkill -P "$pid" 2>/dev/null || true
+                        # Fallback: also kill by title in case the lock PID is stale
+                        pkill -f 'mpv.*--title=wallctl-screensaver' 2>/dev/null || true
                         ;;
                     swww)
                         # Wallpaper loop may have spawned mpvpaper for live files
