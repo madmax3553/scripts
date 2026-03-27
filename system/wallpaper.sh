@@ -18,29 +18,29 @@ set -euo pipefail
 
 INTERVAL=300  # Time between changes (seconds, 300 = 5 minutes)
 LOG_FILE="$HOME/.cache/wallpaper.log"  # Log file for debugging
-SWWW_SOCKET="/run/user/$(id -u)/swww-wayland.sock"
-SWWW_WAIT_TIMEOUT=10  # Max seconds to wait for swww daemon
+AWWW_SOCKET="/run/user/$(id -u)/wayland-1-awww-daemon.sock"
+AWWW_WAIT_TIMEOUT=10  # Max seconds to wait for awww daemon
 
 # Function to log messages
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S'): $1" >> "$LOG_FILE"
 }
 
-# Function to check if swww daemon is running
-is_swww_running() {
-    if pgrep -x "swww-daemon" >/dev/null 2>&1; then
+# Function to check if awww daemon is running
+is_awww_running() {
+    if pgrep -x "awww-daemon" >/dev/null 2>&1; then
         return 0
     fi
     return 1
 }
 
-# Function to wait for swww daemon to be ready
-wait_for_swww() {
-    local timeout=$SWWW_WAIT_TIMEOUT
+# Function to wait for awww daemon to be ready
+wait_for_awww() {
+    local timeout=$AWWW_WAIT_TIMEOUT
     local start_time=$(date +%s)
 
     while [ $(($(date +%s) - start_time)) -lt $timeout ]; do
-        if swww query >/dev/null 2>&1; then
+        if awww query >/dev/null 2>&1; then
             return 0
         fi
         sleep 0.5
@@ -49,30 +49,30 @@ wait_for_swww() {
     return 1
 }
 
-# Function to ensure swww daemon is running
-ensure_swww_daemon() {
-    if is_swww_running; then
+# Function to ensure awww daemon is running
+ensure_awww_daemon() {
+    if is_awww_running; then
         # Daemon is running, wait for it to be ready
-        if wait_for_swww; then
+        if wait_for_awww; then
             return 0
         else
-            log_message "WARNING: swww daemon running but not responding, attempting restart..."
-            pkill -x swww-daemon 2>/dev/null || true
+            log_message "WARNING: awww daemon running but not responding, attempting restart..."
+            pkill -x awww-daemon 2>/dev/null || true
             sleep 1
         fi
     fi
 
-    # Start swww daemon
-    log_message "Starting swww daemon..."
-    swww-daemon >/dev/null 2>&1 &
-    SWWW_PID=$!
+    # Start awww daemon
+    log_message "Starting awww daemon..."
+    awww-daemon >/dev/null 2>&1 &
+    AWWW_PID=$!
 
     # Wait for daemon to be ready
-    if wait_for_swww; then
-        log_message "swww daemon started successfully (PID: $SWWW_PID)"
+    if wait_for_awww; then
+        log_message "awww daemon started successfully (PID: $AWWW_PID)"
         return 0
     else
-        log_message "ERROR: Failed to start or initialize swww daemon after ${SWWW_WAIT_TIMEOUT}s"
+        log_message "ERROR: Failed to start or initialize awww daemon after ${AWWW_WAIT_TIMEOUT}s"
         return 1
     fi
 }
@@ -88,19 +88,19 @@ fi
 
 log_message "Wallpaper rotation daemon started"
 
-# Ensure swww daemon is running before starting rotation loop
-ensure_swww_daemon || {
-    log_message "FATAL: Cannot start swww daemon, exiting"
+# Ensure awww daemon is running before starting rotation loop
+ensure_awww_daemon || {
+    log_message "FATAL: Cannot start awww daemon, exiting"
     exit 1
 }
 
 # Loop to rotate wallpapers
 while true; do
-    # Verify swww is still running before each rotation
-    if ! is_swww_running; then
-        log_message "WARNING: swww daemon died, attempting recovery..."
-        if ! ensure_swww_daemon; then
-            log_message "ERROR: Failed to recover swww daemon, skipping rotation"
+    # Verify awww is still running before each rotation
+    if ! is_awww_running; then
+        log_message "WARNING: awww daemon died, attempting recovery..."
+        if ! ensure_awww_daemon; then
+            log_message "ERROR: Failed to recover awww daemon, skipping rotation"
             sleep $INTERVAL
             continue
         fi
@@ -108,11 +108,11 @@ while true; do
 
     # Capture wallctl output for debugging
     if WALLCTL_OUTPUT=$(wallctl apply random 2>&1); then
-        # Verify wallpaper was actually applied by checking swww
-        if CURRENT_WALLPAPER=$(swww query 2>&1); then
+        # Verify wallpaper was actually applied by checking awww
+        if CURRENT_WALLPAPER=$(awww query 2>&1); then
             log_message "Wallpaper rotated: $WALLCTL_OUTPUT | Current: $CURRENT_WALLPAPER"
         else
-            log_message "WARNING: wallctl succeeded but swww query failed: $CURRENT_WALLPAPER"
+            log_message "WARNING: wallctl succeeded but awww query failed: $CURRENT_WALLPAPER"
         fi
     else
         log_message "Error: wallctl apply random failed - $WALLCTL_OUTPUT"

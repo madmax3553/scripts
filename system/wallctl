@@ -2479,26 +2479,26 @@ kill_live_wallpaper() {
     fi
 }
 
-# Helper to verify swww daemon is running and operational
-verify_swww_daemon() {
-    if ! pgrep -x "swww-daemon" >/dev/null 2>&1; then
+# Helper to verify awww daemon is running and operational
+verify_awww_daemon() {
+    if ! pgrep -x "awww-daemon" >/dev/null 2>&1; then
         return 1
     fi
     # Check if daemon is responsive
-    swww query >/dev/null 2>&1
+    awww query >/dev/null 2>&1
 }
 
-# Helper to ensure swww daemon is running before applying wallpapers
-ensure_swww_ready() {
-    if verify_swww_daemon; then
+# Helper to ensure awww daemon is running before applying wallpapers
+ensure_awww_ready() {
+    if verify_awww_daemon; then
         return 0
     fi
     # Daemon not running or not responsive, try to start it
-    swww-daemon >/dev/null 2>&1 &
+    awww-daemon >/dev/null 2>&1 &
     # Give it time to initialize
     sleep 1
     # Check again
-    verify_swww_daemon
+    verify_awww_daemon
 }
 
 set_wallpaper() {
@@ -2516,27 +2516,27 @@ set_wallpaper() {
         disown
         print_success "live wallpaper set: $(basename "$file") (mpvpaper on $monitor)"
     else
-        # Static wallpaper via swww
-        if ! command -v swww >/dev/null 2>&1; then
-            die "swww required for static wallpapers"
+        # Static wallpaper via awww
+        if ! command -v awww >/dev/null 2>&1; then
+            die "awww required for static wallpapers"
         fi
         kill_live_wallpaper
         
-        # Ensure swww daemon is ready before applying
-        if ! ensure_swww_ready; then
-            die "swww daemon failed to start or become operational"
+        # Ensure awww daemon is ready before applying
+        if ! ensure_awww_ready; then
+            die "awww daemon failed to start or become operational"
         fi
         
         # Apply wallpaper
-        if swww img "$file" --transition-type wipe --transition-duration 1 >/dev/null 2>&1; then
+        if awww img "$file" --transition-type wipe --transition-duration 1 >/dev/null 2>&1; then
             # Verify wallpaper was actually applied
             sleep 0.5
-            if CURRENT=$(swww query 2>/dev/null); then
-                # Success - wallpaper was applied and swww confirmed it
+            if CURRENT=$(awww query 2>/dev/null); then
+                # Success - wallpaper was applied and awww confirmed it
                 print_success "wallpaper set: $(basename "$file")"
             else
-                # swww command succeeded but query failed - daemon may have crashed
-                print_warning "wallpaper set but swww query failed - daemon may be unstable"
+                # awww command succeeded but query failed - daemon may have crashed
+                print_warn "wallpaper set but awww query failed - daemon may be unstable"
             fi
         else
             die "failed to apply wallpaper: $(basename "$file")"
@@ -2545,13 +2545,13 @@ set_wallpaper() {
 }
 
 get_current_wallpaper() {
-    # Try swww query first (most reliable when daemon is running)
-    if command -v swww >/dev/null 2>&1; then
-        local swww_out
-        swww_out=$(swww query 2>/dev/null || true)
-        if [[ -n "$swww_out" ]]; then
+    # Try awww query first (most reliable when daemon is running)
+    if command -v awww >/dev/null 2>&1; then
+        local awww_out
+        awww_out=$(awww query 2>/dev/null || true)
+        if [[ -n "$awww_out" ]]; then
             local path
-            path=$(printf '%s\n' "$swww_out" | head -n1 | sed 's/.*image: //')
+            path=$(printf '%s\n' "$awww_out" | head -n1 | sed 's/.*image: //')
             if [[ -n "$path" && -f "$path" ]]; then
                 printf '%s\n' "$path"
                 return 0
@@ -2559,11 +2559,11 @@ get_current_wallpaper() {
         fi
     fi
 
-    # Fallback: check swww cache files directly
-    local swww_cache="${XDG_CACHE_HOME:-$HOME/.cache}/swww"
-    if [[ -d "$swww_cache" ]]; then
+    # Fallback: check awww cache files directly
+    local awww_cache="${XDG_CACHE_HOME:-$HOME/.cache}/awww"
+    if [[ -d "$awww_cache" ]]; then
         local monitor_file path
-        for monitor_file in "$swww_cache"/*; do
+        for monitor_file in "$awww_cache"/*; do
             [[ -f "$monitor_file" ]] || continue
             path=$(awk '{print $2}' "$monitor_file" 2>/dev/null || true)
             if [[ -n "$path" && -f "$path" ]]; then
@@ -2615,7 +2615,7 @@ cmd_remove() {
 
     local current_wp
     if ! current_wp=$(get_current_wallpaper); then
-        die "could not detect current wallpaper (is swww or mpvpaper running?)"
+        die "could not detect current wallpaper (is awww or mpvpaper running?)"
     fi
 
     local bname
@@ -3606,23 +3606,18 @@ screensaver_loop_wallpaper() {
 }
 
 build_screensaver_filelist() {
-    local dir file
+    local dir
     : > "$SCREENSAVER_LIST_FILE"
-    spinner_active
+    # Skip costly per-file dimension checks (identify/ffprobe) for the
+    # screensaver playlist.  Files in current/old pools were already
+    # validated on import; scanning every file delays startup by 10-15s
+    # and causes hypridle to fire on-resume before mpv even appears.
     while IFS= read -r dir; do
         [[ -d "$dir" ]] || continue
-        while IFS= read -r -d '' file; do
-            spinner_cancelled && break
-            spinner_active
-            if is_selectable_wallpaper "$file"; then
-                printf '%s\n' "$file" >> "$SCREENSAVER_LIST_FILE"
-            fi
-        done < <(find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \
-                      -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
-                      -o -iname '*.mp4' -o -iname '*.webm' \) -print0)
+        find "$dir" -maxdepth 1 -type f \( -iname '*.jpg' -o -iname '*.jpeg' \
+             -o -iname '*.png' -o -iname '*.webp' -o -iname '*.gif' \
+             -o -iname '*.mp4' -o -iname '*.webm' \) >> "$SCREENSAVER_LIST_FILE" 2>/dev/null || true
     done < <(list_pool_dirs "$SCREENSAVER_POOL")
-    spinner_idle
-
 }
 
 start_overlay_screensaver() {
@@ -3636,47 +3631,37 @@ start_overlay_screensaver() {
         return 1
     fi
 
-    local shuffled temp_playlist
-    shuffled=$(shuf "$SCREENSAVER_LIST_FILE")
-    if [[ -z "$shuffled" ]]; then
+    # Write shuffled playlist to a file so mpv can read it after detaching.
+    local playlist_file="$STATE_DIR/screensaver-playlist.m3u"
+    shuf "$SCREENSAVER_LIST_FILE" > "$playlist_file"
+    if [[ ! -s "$playlist_file" ]]; then
         return 1
     fi
-
-    # Write shuffled playlist to a persistent file (not temp, so mpv can read it later)
-    temp_playlist="$CACHE_DIR/screensaver_playlist.m3u"
-    printf '%s\n' "$shuffled" > "$temp_playlist" || return 1
 
     # mpv handles both images and video natively
     # --image-display-duration controls how long each image shows
     # videos play to completion then advance
-    # Use setsid to detach mpv into its own session so the cleanup trap
-    # (pkill -P $$) does not kill it when wallctl exits.
-    # NOTE: $! captures the setsid wrapper PID which exits immediately,
-    # so we use pgrep to find the real mpv process by its unique title.
-    env WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-1}" DISPLAY="${DISPLAY:-:0}" \
-    setsid mpv --fullscreen --loop-playlist --no-audio --really-quiet \
-        --title=wallctl-screensaver \
+    #
+    # setsid --fork fully detaches mpv into its own session so the
+    # cleanup() trap (pkill -P $$) does not kill it on script exit.
+    # User exits the screensaver by pressing q in mpv.
+    setsid --fork mpv --fullscreen --loop-playlist --no-audio --really-quiet \
         --image-display-duration="$SCREENSAVER_INTERVAL" \
-        --x11-bypass-compositor=no \
-        --playlist="$temp_playlist" >> "$LOG_FILE" 2>&1 &
-    disown $! 2>/dev/null
+        --playlist="$playlist_file" >/dev/null 2>&1
 
-    # Wait briefly for mpv to start, then find its real PID via the unique title.
-    local mpv_pid="" attempts=0
-    while (( attempts < 20 )); do
-        mpv_pid=$(pgrep -f 'mpv.*--title=wallctl-screensaver' 2>/dev/null | head -1 || true)
-        [[ -n "$mpv_pid" ]] && break
+    # setsid --fork returns immediately; find the real mpv PID.
+    local mpv_pid="" i=0
+    while (( i < 20 )); do
+        mpv_pid=$(pgrep -f "mpv.*--playlist=$playlist_file" 2>/dev/null | head -1) && break
         sleep 0.1
-        (( attempts++ ))
+        (( i++ ))
     done
-
-    if [[ -z "$mpv_pid" ]]; then
-        log "screensaver start failed: could not find mpv process after launch"
-        return 1
+    if [[ -n "$mpv_pid" ]]; then
+        printf '%s:mpv\n' "$mpv_pid" > "$LOCK_FILE"
+    else
+        # mpv may have started but we can't find it; write 0 as fallback
+        printf '0:mpv\n' > "$LOCK_FILE"
     fi
-
-    printf '%s:mpv\n' "$mpv_pid" > "$LOCK_FILE"
-    
     return 0
 }
 
@@ -3705,23 +3690,23 @@ cmd_screensaver() {
                 else
                     log "screensaver start fallback: overlay unavailable, trying wallpaper mode"
                     print_warn "overlay mode unavailable; falling back to wallpaper mode"
-                    if ! command -v swww >/dev/null 2>&1; then
-                        log "screensaver start failed: swww missing for wallpaper fallback"
-                        die "swww required for wallpaper screensaver mode"
+                    if ! command -v awww >/dev/null 2>&1; then
+                        log "screensaver start failed: awww missing for wallpaper fallback"
+                        die "awww required for wallpaper screensaver mode"
                     fi
                     screensaver_loop_wallpaper &
-                    printf '%s:swww\n' "$!" > "$LOCK_FILE"
-                    log "screensaver start ok: mode=wallpaper engine=swww pid=$!"
+                    printf '%s:awww\n' "$!" > "$LOCK_FILE"
+                    log "screensaver start ok: mode=wallpaper engine=awww pid=$!"
                     print_success "screensaver wallpaper loop started"
                 fi
             else
-                if ! command -v swww >/dev/null 2>&1; then
-                    log "screensaver start failed: swww missing in wallpaper mode"
-                    die "swww required for wallpaper screensaver mode"
+                if ! command -v awww >/dev/null 2>&1; then
+                    log "screensaver start failed: awww missing in wallpaper mode"
+                    die "awww required for wallpaper screensaver mode"
                 fi
                 screensaver_loop_wallpaper &
-                printf '%s:swww\n' "$!" > "$LOCK_FILE"
-                log "screensaver start ok: mode=wallpaper engine=swww pid=$!"
+                printf '%s:awww\n' "$!" > "$LOCK_FILE"
+                log "screensaver start ok: mode=wallpaper engine=awww pid=$!"
                 print_success "screensaver wallpaper loop started"
             fi
             ;;
@@ -3734,10 +3719,10 @@ cmd_screensaver() {
                 # Also clean up any spawned mpv/mpvpaper processes
                 case "$lock_type" in
                     mpv)
-                        # Fallback: also kill by title in case the lock PID is stale
-                        pkill -f 'mpv.*--title=wallctl-screensaver' 2>/dev/null || true
+                        # Kill the specific mpv overlay if it's still around
+                        pkill -P "$pid" 2>/dev/null || true
                         ;;
-                    swww)
+                    awww)
                         # Wallpaper loop may have spawned mpvpaper for live files
                         kill_live_wallpaper
                         ;;
