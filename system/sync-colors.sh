@@ -37,6 +37,9 @@ YELLOW=$(get_color "yellow")
 BLUE=$(get_color "blue")
 MAGENTA=$(get_color "magenta")
 CYAN=$(get_color "cyan")
+BLACK=$(get_color "black")
+ORANGE=$(get_color "orange")
+PINK=$(get_color "pink")
 
 echo "Syncing colors from $COLORS_FILE..."
 
@@ -468,10 +471,244 @@ WTF_EOF
 
 # === WAYBAR ===
 echo "Updating waybar..."
-# Update color palette comments (non-breaking)
-sed -i "s/^.*bg:      #[0-9a-fA-F]*/# * bg:      $BG/" "$CONFIG_DIR/waybar/style.css"
-sed -i "s/^.*bg-alt:  #[0-9a-fA-F]*/# * bg-alt:  $BG_ALT/" "$CONFIG_DIR/waybar/style.css"
-sed -i "s/^.*fg:      #[0-9a-fA-F]*/# * fg:      $FG/" "$CONFIG_DIR/waybar/style.css"
+cat > "$CONFIG_DIR/waybar/style.css" << WAYBAR_EOF
+/*
+ * Waybar stylesheet — cyberdream palette
+ *
+ * bg:      $BG
+ * bg-alt:  $BG_ALT
+ * fg:      $FG
+ * red:     $RED
+ * green:   $GREEN
+ * yellow:  $YELLOW
+ * blue:    $BLUE
+ * magenta: $MAGENTA
+ * cyan:    $CYAN
+ */
+
+* {
+  border: none;
+  border-radius: 0;
+  min-height: 0;
+  font-family: "Hack Nerd Font", "Hack";
+  font-size: 13px;
+  font-weight: bold;
+  opacity: 1;
+}
+
+window#waybar {
+  background-color: $BG;
+  opacity: 0.9;
+  transition-property: background-color;
+  transition-duration: 0.5s;
+}
+
+window#waybar.hidden {
+  opacity: 0.5;
+}
+
+#workspaces {
+  background-color: transparent;
+}
+
+#workspaces button {
+  all: initial;
+  min-width: 0;
+  box-shadow: inset 0 -3px transparent;
+  padding: 2px 12px;
+  margin: 4px 3px;
+  border-radius: 4px;
+  background-color: $BG_ALT;
+  color: $FG;
+}
+
+#workspaces button.active {
+  color: $BG;
+  background-color: $BLUE;
+}
+
+#workspaces button:hover {
+  box-shadow: inherit;
+  text-shadow: inherit;
+  color: $BG;
+  background-color: $CYAN;
+}
+
+#workspaces button.urgent {
+  background-color: $RED;
+}
+
+#memory,
+#custom-yay,
+#custom-power,
+#battery,
+#wireplumber,
+#network,
+#clock {
+  border-radius: 4px;
+  margin: 4px 3px;
+  padding: 2px 12px;
+  background-color: $BG_ALT;
+  color: $BG;
+}
+
+#custom-logo {
+  padding-right: 7px;
+  padding-left: 7px;
+  margin-left: 5px;
+  font-size: 15px;
+  border-radius: 8px 0px 0px 8px;
+  color: $BLUE;
+}
+
+#clock {
+  background-color: $MAGENTA;
+}
+
+#memory {
+  background-color: $CYAN;
+}
+
+#network {
+  background-color: $GREEN;
+  padding-right: 17px;
+}
+
+#wireplumber {
+  background-color: $BLUE;
+}
+
+#battery {
+  background-color: $YELLOW;
+}
+
+#battery.warning,
+#battery.critical,
+#battery.urgent {
+  background-color: $RED;
+  color: $BG;
+}
+
+#battery.charging {
+  background-color: $GREEN;
+  color: $BG;
+}
+
+#custom-yay {
+  background-color: $BLUE;
+  color: $BG;
+}
+
+#custom-power {
+  margin-right: 6px;
+  background-color: $RED;
+  color: $BG;
+}
+
+tooltip {
+  border-radius: 8px;
+  padding: 15px;
+  background-color: $BG;
+}
+
+tooltip label {
+  padding: 5px;
+  background-color: $BG;
+  color: $FG;
+}
+
+#custom-charge {
+  background-color: $BG_ALT;
+  margin: 4px 3px;
+  padding: 2px 12px;
+  border-radius: 4px;
+  color: $BG;
+}
+#custom-charge.charging { background-color: $GREEN; color: $BG; }
+#custom-charge.not_charging { background-color: $RED; color: $BG; }
+#custom-charge.discharging { background-color: $RED; color: $BG; }
+
+#custom-repostatus {
+  border-radius: 4px;
+  margin: 4px 3px;
+  padding: 2px 12px;
+  background-color: $BG;
+  color: $FG;
+  font-size: 18px;
+  font-family: "Hack Nerd Font", "Hack";
+}
+
+#custom-repostatus.clean {
+  color: $GREEN;
+}
+
+#custom-repostatus.dirty {
+  color: $YELLOW;
+}
+
+#custom-repostatus.ahead {
+  color: $BLUE;
+}
+
+#custom-repostatus.behind {
+  color: $RED;
+}
+
+#custom-repostatus.diverged {
+  color: $RED;
+}
+
+#custom-repostatus.fetch_failed {
+  color: $RED;
+}
+
+#custom-repostatus.stale {
+  opacity: 0.7;
+}
+
+#custom-yay.stale {
+  opacity: 0.7;
+}
+
+#custom-notifications {
+  border-radius: 4px;
+  margin: 4px 3px;
+  padding: 2px 12px;
+  background-color: $CYAN;
+  color: $BG;
+}
+
+#custom-notifications.notification {
+  color: $BG;
+}
+
+#custom-notifications.dnd {
+  background-color: $RED;
+  color: $BG;
+}
+
+#custom-cliphist {
+  border-radius: 4px;
+  margin: 4px 3px;
+  padding: 2px 12px;
+  background-color: $GREEN;
+  color: $BG;
+}
+
+#custom-journal {
+  border-radius: 4px;
+  margin: 4px 3px;
+  padding: 2px 12px;
+  background-color: $YELLOW;
+  color: $BG;
+  font-weight: bold;
+}
+
+#custom-journal:hover {
+  background-color: $CYAN;
+  color: $BG;
+}
+WAYBAR_EOF
 
 # === QT6 ===
 echo "Updating Qt6ct..."
@@ -501,15 +738,6 @@ QT_EOF
 # Update qt6ct.conf to use the new colorscheme
 sed -i "s|color_scheme_path=.*|color_scheme_path=$CONFIG_DIR/qt6ct/colors/cyberdream.conf|" "$CONFIG_DIR/qt6ct/qt6ct.conf"
 
-echo "✓ Colors synced successfully!"
-echo ""
-echo "Colors used:"
-echo "  Background:  $BG"
-echo "  Background (alt): $BG_ALT"
-echo "  Foreground:  $FG"
-echo "  Blue (accent): $BLUE"
-echo "  Cyan: $CYAN"
-echo ""
 # === HYPRLAND ===
 echo "Updating Hyprland..."
 if [ -f ~/.config/hypr/hyprland.conf ]; then
@@ -554,9 +782,212 @@ if not pcall(function() vim.cmd("colorscheme cyberdream") end) then
 end
 NVIM_EOF
 
+# === SYSC-GREET ===
+echo "Updating sysc-greet..."
+mkdir -p "$CONFIG_DIR/sysc-greet/themes"
+cat > "$CONFIG_DIR/sysc-greet/themes/groot.toml" << GREET_EOF
+# groot.toml - Cyberdream theme for sysc-greet
+# Auto-synced by sync-colors.sh
+name = "Groot"
+
+[colors]
+bg_base = "$BG"
+bg_active = "$BG_ALT"
+primary = "$BLUE"
+secondary = "$MAGENTA"
+accent = "$CYAN"
+warning = "$YELLOW"
+danger = "$RED"
+fg_primary = "$FG"
+fg_secondary = "#cccccc"
+fg_muted = "$BG_ALT"
+border_focus = "$BLUE"
+GREET_EOF
+
+# === KITTY ===
+echo "Updating kitty..."
+cat > "$CONFIG_DIR/kitty/kitty.conf" << KITTY_EOF
+font_family Hack Nerd Font
+font_size 12.0
+bold_font Hack Nerd Font Bold
+italic_font Hack Nerd Font Italic
+bold_italic_font Hack Nerd Font Bold Italic
+cursor_shape block
+cursor_blink_interval 0.5
+cursor_underline_thickness 2
+cursor_beam_thickness 2
+cursor_color $BLUE
+cursor_text_color $BG
+background $BG
+foreground $FG
+background_opacity 0.9
+active_tab_background   $BLUE
+inactive_tab_background $BG_ALT
+active_tab_foreground   $BG
+inactive_tab_foreground $FG
+tab_bar_background      $BG
+tab_bar_foreground      $FG
+selection_background    $BG_ALT
+selection_foreground    $FG
+
+# Cyberdream 16-color palette
+color0  $BLACK
+color1  $RED
+color2  $GREEN
+color3  $YELLOW
+color4  $BLUE
+color5  $MAGENTA
+color6  $CYAN
+color7  $FG
+color8  $BG_ALT
+color9  $RED
+color10 $GREEN
+color11 $YELLOW
+color12 $BLUE
+color13 $MAGENTA
+color14 $CYAN
+color15 $FG
+scrollback_lines 10000
+enable_audio_bell no
+mouse_hide_wait 3.0
+window_padding_width 10
+window_padding_height 10
+map ctrl+shift+c copy_to_clipboard
+map ctrl+shift+v paste_from_clipboard
+map ctrl+shift+t new_tab
+map ctrl+shift+w close_tab
+map ctrl+shift+left previous_tab
+map ctrl+shift+right next_tab
+KITTY_EOF
+
+# === WLOGOUT ===
+echo "Updating wlogout..."
+# Convert hex BG to rgba decimal values
+BG_HEX="${BG#\#}"
+BG_R=$((16#${BG_HEX:0:2}))
+BG_G=$((16#${BG_HEX:2:2}))
+BG_B=$((16#${BG_HEX:4:2}))
+BLUE_HEX="${BLUE#\#}"
+BLUE_R=$((16#${BLUE_HEX:0:2}))
+BLUE_G=$((16#${BLUE_HEX:2:2}))
+BLUE_B=$((16#${BLUE_HEX:4:2}))
+cat > "$CONFIG_DIR/wlogout/style.css" << WLOGOUT_EOF
+* {
+    background-image: none;
+    font-size: 20px;
+    font-family: "Hack Nerd Font";
+}
+
+window {
+    background-color: rgba($BG_R, $BG_G, $BG_B, 0.9);
+}
+
+button {
+    margin: 20px;
+    color: transparent;
+    background-color: transparent;
+    border: none;
+    outline-style: none;
+    background-repeat: no-repeat;
+    background-position: center;
+    background-size: 20%;
+    box-shadow: none;
+    text-shadow: none;
+    animation: gradient_f 20s ease-in infinite;
+}
+
+button:hover {
+    background-color: transparent;
+    background-size: 30%;
+    animation: gradient_f 20s ease-in infinite;
+    transition: all 0.3s cubic-bezier(.55,0.0,.28,1.682);
+    outline-style: none;
+}
+
+button:active {
+    background-color: rgba($BLUE_R, $BLUE_G, $BLUE_B, 0.4);
+    box-shadow: 0 0 40px rgba($BLUE_R, $BLUE_G, $BLUE_B, 0.8);
+    outline-style: none;
+}
+
+#lock {
+    background-image: image(url("icons/lock.png"));
+}
+
+#logout {
+    background-image: image(url("icons/logout.png"));
+}
+
+#suspend {
+    background-image: image(url("icons/suspend.png"));
+}
+
+#shutdown {
+    background-image: image(url("icons/shutdown.png"));
+}
+
+#reboot {
+    background-image: image(url("icons/reboot.png"));
+}
+
+#hibernate {
+    background-image: image(url("icons/hibernate.png"));
+}
+WLOGOUT_EOF
+
+# === REMMINA ===
+echo "Updating remmina..."
+cat > "$CONFIG_DIR/remmina/remmina.colors" << REMMINA_EOF
+[ssh_colors]
+background = $BG
+cursor = $BLUE
+cursor_foreground = $BG
+foreground = $FG
+highlight = $BG_ALT
+highlight_foreground = $FG
+color0 = $BLACK
+color1 = $RED
+color2 = $GREEN
+color3 = $YELLOW
+color4 = $BLUE
+color5 = $MAGENTA
+color6 = $CYAN
+color7 = $FG
+color8 = $BG_ALT
+color9 = $RED
+color10 = $GREEN
+color11 = $YELLOW
+color12 = $BLUE
+color13 = $MAGENTA
+color14 = $CYAN
+color15 = $FG
+colorBD = $FG
+colorIT =
+colorUL =
+REMMINA_EOF
+
+# === STARSHIP ===
+echo "Updating starship..."
+# Starship uses $variable syntax in its format strings, so we can't use heredoc.
+# Instead, do targeted sed replacements on hex color values.
+if [ -f "$CONFIG_DIR/starship.toml" ]; then
+    # Update fg/white color references (used for distro, username)
+    sed -i "s|(\#[0-9a-fA-F]\{6\}) '|(${FG}) '|g" "$CONFIG_DIR/starship.toml"
+    # Update yellow color references (used for hostname, device)
+    sed -i "s|\[\$hostname\](#[0-9a-fA-F]\{6\})|\[\$hostname](${YELLOW})|" "$CONFIG_DIR/starship.toml"
+    sed -i "s|\[\$env_value\](#[0-9a-fA-F]\{6\})'$|\[\$env_value](${YELLOW})'|" "$CONFIG_DIR/starship.toml"
+    # Update green color references (git branch, git status, staged)
+    sed -i "s|bold #[0-9a-fA-F]\{6\}\"|bold ${GREEN}\"|g" "$CONFIG_DIR/starship.toml"
+    sed -i "s|\](#[0-9a-fA-F]\{6\})'$|](${GREEN})'|" "$CONFIG_DIR/starship.toml"
+fi
+
 echo ""
 echo "To apply changes:"
 echo "  - Swaync will update on next notification"
 echo "  - Hyprland: run 'hyprctl reload' to apply border colors"
 echo "  - Neovim: restart or run ':colorscheme cyberdream'"
-echo "  - Restart other applications (fuzzel, ghostty, etc.)"
+echo "  - sysc-greet: select 'Groot' theme via F1 menu"
+echo "  - Kitty: close and reopen terminal"
+echo "  - Waybar: run 'killall -SIGUSR2 waybar' to reload"
+echo "  - Starship: opens new shell to apply"
+echo "  - Restart other applications (fuzzel, ghostty, wlogout, remmina)"
