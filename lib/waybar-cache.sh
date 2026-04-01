@@ -12,13 +12,13 @@
 # Purpose: Shared caching utility for Waybar status scripts
 # Dependencies: jq (optional), flock
 # Author: groot
-# Modified: 2026-01-24
+# Modified: 2026-04-01
 
 # lib/waybar-cache.sh
 # Purpose: Shared caching utility for Waybar status scripts
 # Usage: source "$(dirname "$0")/lib/waybar-cache.sh"
 # Author: Custom
-# Modified: 2026-01-24
+# Modified: 2026-04-01
 
 set -euo pipefail
 
@@ -192,19 +192,38 @@ cache_add_stale_indicator() {
     local json="$1"
     local age_seconds="${2:-0}"
     
+    # Validate input is non-empty and valid JSON before transforming
+    if [[ -z "$json" ]]; then
+        return 1
+    fi
+    
     if ! command -v jq &> /dev/null; then
         echo "$json"
         return
+    fi
+    
+    # Validate JSON before piping to jq -- return original if invalid
+    if ! echo "$json" | jq -e . >/dev/null 2>&1; then
+        cache_debug_log "cache_add_stale_indicator: invalid JSON input, passing through"
+        echo "$json"
+        return 1
     fi
     
     local age_str
     age_str=$(cache_get_age_string "$age_seconds")
     
     # Add stale indicators
-    echo "$json" | jq -c \
+    local result
+    if result=$(echo "$json" | jq -c \
         --arg age_str "$age_str" \
         '.class |= (. // "") + " stale" | 
-         .tooltip |= (. // "") + "\n⚠ Cached data (\($age_str))"'
+         .tooltip |= (. // "") + "\n⚠ Cached data (\($age_str))"' 2>/dev/null); then
+        echo "$result"
+    else
+        # jq transform failed, return original
+        cache_debug_log "cache_add_stale_indicator: jq transform failed, returning original"
+        echo "$json"
+    fi
 }
 
 # ===== Waybar Output Helpers =====
@@ -215,8 +234,22 @@ waybar_output() {
     local class="${3:-}"
     
     if ! command -v jq &> /dev/null; then
-        # Fallback without jq
-        printf '{"text": "%s", "tooltip": "%s", "class": "%s"}\n' "$text" "$tooltip" "$class"
+        # Fallback without jq -- manually escape characters that break JSON:
+        # backslashes first, then double quotes, then newlines, then tabs
+        local escaped_text escaped_tooltip escaped_class
+        escaped_text="${text//\\/\\\\}"
+        escaped_text="${escaped_text//\"/\\\"}"
+        escaped_text="${escaped_text//$'\n'/\\n}"
+        escaped_text="${escaped_text//$'\t'/\\t}"
+        escaped_tooltip="${tooltip//\\/\\\\}"
+        escaped_tooltip="${escaped_tooltip//\"/\\\"}"
+        escaped_tooltip="${escaped_tooltip//$'\n'/\\n}"
+        escaped_tooltip="${escaped_tooltip//$'\t'/\\t}"
+        escaped_class="${class//\\/\\\\}"
+        escaped_class="${escaped_class//\"/\\\"}"
+        escaped_class="${escaped_class//$'\n'/\\n}"
+        escaped_class="${escaped_class//$'\t'/\\t}"
+        printf '{"text": "%s", "tooltip": "%s", "class": "%s"}\n' "$escaped_text" "$escaped_tooltip" "$escaped_class"
         return
     fi
     

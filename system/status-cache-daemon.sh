@@ -12,7 +12,7 @@
 # Purpose: Dedicated cache writer for repo status and system updates
 # Dependencies: jq, flock, repostatus, yay/checkupdates
 # Author: groot
-# Modified: 2026-03-20
+# Modified: 2026-04-01
 
 set -euo pipefail
 
@@ -108,7 +108,9 @@ generate_updates_data() {
             version=$(echo "$line" | cut -d' ' -f2-)
             jq -nc --arg name "$name" --arg version "$version" \
                 '{name: $name, version: $version}'
-        done | jq -sc '.')
+        done | jq -sc '.' 2>/dev/null) || packages="[]"
+        # Guard against empty string from subshell pipe failure
+        [[ -z "$packages" || "$packages" == "null" ]] && packages="[]"
     fi
 
     # Build the canonical raw data JSON

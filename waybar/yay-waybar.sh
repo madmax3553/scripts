@@ -12,7 +12,7 @@
 # Purpose: Waybar yay updates indicator (reads from shared cache)
 # Dependencies: yay, jq, flock, kitty, fuzzel (optional)
 # Author: groot
-# Modified: 2026-03-20
+# Modified: 2026-04-01
 
 set -euo pipefail
 
@@ -100,6 +100,13 @@ case "${1:-}" in
         # Use cache_serve to read it, falling back to daemon refresh if stale.
         REFRESH_CMD="$DAEMON_CMD refresh-updates"
         output=$(cache_serve "$CACHE_NAME" "$REFRESH_CMD" "$STALE_THRESHOLD") || output="$DEFAULT_OUTPUT"
+
+        # Validate JSON before sending to waybar -- malformed JSON causes waybar to crash
+        if command -v jq >/dev/null 2>&1; then
+            if ! echo "$output" | jq -e . >/dev/null 2>&1; then
+                output="$DEFAULT_OUTPUT"
+            fi
+        fi
         echo "$output"
         ;;
 esac
