@@ -10,12 +10,22 @@
 #      ░    ░         ░ ░      ░ ░
 # Script: remote
 # Purpose: Remote server connection manager
-# Dependencies: ssh, dialog or whiptail
+# Dependencies: ssh, sshfs (for mount), dialog or whiptail
 # Author: groot
-# Modified: 2026-01-24
+# Modified: 2026-04-04
 
 set -euo pipefail
 CONFIG_FILE="$HOME/.config/remotes"
+MOUNT_DIR="/mnt"
+TUI_ACTIVE=0
+
+# Clear screen on exit only when TUI was active (prevents dialog artifacts)
+cleanup_exit() {
+    if [[ $TUI_ACTIVE -eq 1 ]]; then
+        clear
+    fi
+}
+trap cleanup_exit EXIT
 
 mkdir -p "$(dirname "$CONFIG_FILE")"
 touch "$CONFIG_FILE"
@@ -33,36 +43,95 @@ trim() {
     echo "$1" | xargs
 }
 
+detect_terminal() {
+    if command -v ghostty &>/dev/null; then
+        echo "ghostty"
+    elif command -v kitty &>/dev/null; then
+        echo "kitty"
+    elif command -v alacritty &>/dev/null; then
+        echo "alacritty"
+    elif command -v foot &>/dev/null; then
+        echo "foot"
+    elif command -v wezterm &>/dev/null; then
+        echo "wezterm"
+    elif command -v xterm &>/dev/null; then
+        echo "xterm"
+    else
+        echo ""
+    fi
+}
+
+spawn_terminal() {
+    local title="$1"
+    shift
+    local term
+    term="$(detect_terminal)"
+
+    case "$term" in
+        ghostty)
+            ghostty --title="$title" -e "$@" &
+            ;;
+        kitty)
+            kitty --title "$title" "$@" &
+            ;;
+        alacritty)
+            alacritty --title "$title" -e "$@" &
+            ;;
+        foot)
+            foot --title "$title" "$@" &
+            ;;
+        wezterm)
+            wezterm start --cwd "$(pwd)" -- "$@" &
+            ;;
+        xterm)
+            xterm -title "$title" -e "$@" &
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    disown
+    return 0
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TUI Functions
 # ─────────────────────────────────────────────────────────────────────────────
 
 tui_main_menu() {
+    TUI_ACTIVE=1
     while :; do
         choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
             --title "Main Menu" \
-            --menu "Select an option:" 16 50 7 \
+            --menu "Select an option:" 20 50 10 \
             1 "Connect to remote" \
-            2 "Add new remote" \
-            3 "Edit remote" \
-            4 "Set default remote" \
-            5 "Delete remote" \
-            6 "Ad-hoc connection" \
-            7 "Exit" \
+            2 "Mount remote (SSHFS)" \
+            3 "Unmount remote" \
+            4 "Add new remote" \
+            5 "Edit remote" \
+            6 "Set default remote" \
+            7 "Delete remote" \
+            8 "Ad-hoc connection" \
+            9 "Exit" \
             3>&1 1>&2 2>&3)
 
         exit_status=$?
         [ $exit_status -ne 0 ] && break
 
+        # Temporarily disable errexit so failed actions don't kill the TUI
+        set +e
         case "$choice" in
             1) tui_connect ;;
-            2) tui_add ;;
-            3) tui_edit ;;
-            4) tui_set_default ;;
-            5) tui_delete ;;
-            6) tui_adhoc ;;
-            7) break ;;
+            2) tui_mount ;;
+            3) tui_unmount ;;
+            4) tui_add ;;
+            5) tui_edit ;;
+            6) tui_set_default ;;
+            7) tui_delete ;;
+            8) tui_adhoc ;;
+            9) break ;;
         esac
+        set -e
     done
     clear
 }
@@ -97,8 +166,26 @@ tui_connect() {
 
     entry="$(get_entry_by_name "$choice")"
     IFS=',' read -r name user host proto is_default <<<"$entry"
-    clear
-    connect_remote "$user" "$host" "$proto"
+
+    local target="${user}@${host}"
+
+    case "$proto" in
+        ssh)
+            if spawn_terminal "SSH: ${target}" ssh "$target"; then
+                "$DIALOG" --msgbox "SSH session launched in new terminal:\n${target}" 8 50
+            else
+                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
+            fi
+            ;;
+        vnc|garchyvnc)
+            # VNC runs its own GUI window, run in background
+            if connect_remote "$user" "$host" "$proto" 2>&1; then
+                "$DIALOG" --msgbox "VNC session launched for ${target}." 7 50
+            else
+                "$DIALOG" --msgbox "VNC connection failed for ${target}." 7 50
+            fi
+            ;;
+    esac
 }
 
 tui_add() {
@@ -316,8 +403,98 @@ tui_adhoc() {
         3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
-    clear
-    connect_remote "$user" "$host" "$proto"
+    local target="${user}@${host}"
+
+    case "$proto" in
+        ssh)
+            if spawn_terminal "SSH: ${target}" ssh "$target"; then
+                "$DIALOG" --msgbox "SSH session launched in new terminal:\n${target}" 8 50
+            else
+                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
+            fi
+            ;;
+        vnc|garchyvnc)
+            if connect_remote "$user" "$host" "$proto" 2>&1; then
+                "$DIALOG" --msgbox "VNC session launched for ${target}." 7 50
+            else
+                "$DIALOG" --msgbox "VNC connection failed for ${target}." 7 50
+            fi
+            ;;
+    esac
+}
+
+tui_mount() {
+    local items name user host proto is_default
+    mapfile -t items < <(tui_build_remote_list)
+
+    if [ ${#items[@]} -eq 0 ]; then
+        "$DIALOG" --msgbox "No remotes configured." 6 40
+        return
+    fi
+
+    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Mount Remote (SSHFS)" \
+        --menu "Select a remote to mount:" 20 60 10 \
+        "${items[@]}" \
+        3>&1 1>&2 2>&3)
+
+    [ $? -ne 0 ] && return
+
+    entry="$(get_entry_by_name "$choice")"
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+
+    local remote_path=""
+    remote_path=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Remote Path" \
+        --inputbox "Remote path (blank for home dir):" 8 50 \
+        3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+    remote_path="$(trim "$remote_path")"
+
+    local output
+    if output=$(mount_remote "$user" "$host" "$name" "$remote_path" 2>&1); then
+        "$DIALOG" --msgbox "Mount successful:\n\n${output}" 10 60
+    else
+        "$DIALOG" --msgbox "Mount failed:\n\n${output}" 10 60
+    fi
+}
+
+tui_unmount() {
+    local mount_items=()
+    if [[ -d "$MOUNT_DIR" ]]; then
+        for dir in "$MOUNT_DIR"/*/; do
+            [[ -d "$dir" ]] || continue
+            dir="${dir%/}"
+            local dname
+            dname="$(basename "$dir")"
+            if mountpoint -q "$dir" 2>/dev/null; then
+                mount_items+=("$dname" "$dir")
+            fi
+        done
+    fi
+
+    if [ ${#mount_items[@]} -eq 0 ]; then
+        "$DIALOG" --msgbox "No active SSHFS mounts." 6 40
+        return
+    fi
+
+    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Unmount Remote" \
+        --menu "Select a mount to remove:" 20 60 10 \
+        "${mount_items[@]}" \
+        3>&1 1>&2 2>&3)
+
+    [ $? -ne 0 ] && return
+
+    "$DIALOG" --yesno "Unmount '$choice'?" 6 30
+    [ $? -ne 0 ] && return
+
+    local output
+    if output=$(unmount_remote "$choice" 2>&1); then
+        "$DIALOG" --msgbox "Unmount successful:\n\n${output}" 10 60
+    else
+        "$DIALOG" --msgbox "Unmount failed:\n\n${output}" 10 60
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -442,24 +619,116 @@ connect_remote() {
             status=$?
             if [ $status -ne 0 ]; then
                 echo "SSH connection failed for $target (exit $status)." >&2
-                exit $status
+                return $status
             fi
-            exit 0
+            return 0
             ;;
         vnc)
-            run_vnc || exit 1
-            exit 0
+            run_vnc || return 1
+            return 0
             ;;
         garchyvnc)
-            run_remote_setup || exit 1
-            run_vnc || exit 1
-            exit 0
+            run_remote_setup || return 1
+            run_vnc || return 1
+            return 0
             ;;
         *)
             echo "Unknown protocol: $proto" >&2
-            exit 1
+            return 1
             ;;
     esac
+}
+
+mount_remote() {
+    local user="$1"
+    local host="$2"
+    local name="$3"
+    local remote_path="${4:-}"
+    local target="${user}@${host}"
+    local mount_point="${MOUNT_DIR}/${name}"
+
+    if ! command -v sshfs &>/dev/null; then
+        echo "sshfs not found. Install sshfs to use mount feature." >&2
+        return 1
+    fi
+
+    if mountpoint -q "$mount_point" 2>/dev/null; then
+        echo "Already mounted: $mount_point"
+        return 0
+    fi
+
+    if [[ ! -d "$mount_point" ]]; then
+        mkdir -p "$mount_point" 2>/dev/null || sudo mkdir -p "$mount_point"
+        sudo chown "$(id -un):$(id -gn)" "$mount_point" 2>/dev/null || true
+    fi
+
+    local remote_spec="${target}:"
+    if [[ -n "$remote_path" ]]; then
+        remote_spec="${target}:${remote_path}"
+    fi
+
+    echo "Mounting ${remote_spec} -> ${mount_point} ..."
+    if sshfs "$remote_spec" "$mount_point" \
+        -o ConnectTimeout=10 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=3 \
+        -o reconnect \
+        -o follow_symlinks \
+        -o cache_timeout=60 \
+        -o attr_timeout=60; then
+        echo "Mounted successfully: $mount_point"
+    else
+        echo "Mount failed for ${remote_spec}" >&2
+        rmdir "$mount_point" 2>/dev/null || sudo rmdir "$mount_point" 2>/dev/null || true
+        return 1
+    fi
+}
+
+unmount_remote() {
+    local name="$1"
+    local mount_point="${MOUNT_DIR}/${name}"
+
+    if ! mountpoint -q "$mount_point" 2>/dev/null; then
+        echo "Not mounted: $mount_point" >&2
+        return 1
+    fi
+
+    # FUSE3 uses fusermount3, fall back to fusermount
+    local fmount="fusermount3"
+    if ! command -v fusermount3 &>/dev/null; then
+        fmount="fusermount"
+    fi
+
+    echo "Unmounting ${mount_point} ..."
+    if "$fmount" -u "$mount_point" 2>/dev/null; then
+        echo "Unmounted successfully: $mount_point"
+        rmdir "$mount_point" 2>/dev/null || sudo rmdir "$mount_point" 2>/dev/null || true
+    elif "$fmount" -uz "$mount_point" 2>/dev/null; then
+        echo "Lazy unmounted (stale mount): $mount_point"
+        rmdir "$mount_point" 2>/dev/null || sudo rmdir "$mount_point" 2>/dev/null || true
+    else
+        echo "Unmount failed for ${mount_point}" >&2
+        return 1
+    fi
+}
+
+list_mounts() {
+    local found=0
+    if [[ -d "$MOUNT_DIR" ]]; then
+        for dir in "$MOUNT_DIR"/*/; do
+            [[ -d "$dir" ]] || continue
+            dir="${dir%/}"
+            local name
+            name="$(basename "$dir")"
+            if mountpoint -q "$dir" 2>/dev/null; then
+                echo "$name (mounted)"
+                found=1
+            fi
+        done
+    fi
+    if [[ $found -eq 0 ]]; then
+        echo "No active SSHFS mounts."
+    fi
 }
 
 get_entry_by_name() {
@@ -596,8 +865,12 @@ CLI Mode:
   remote -r, --random Ad-hoc connection (not saved)
   remote -D, --delete <name>   Delete a remote
   remote -c, --connect <name>  Connect to a saved remote
+  remote -m, --mount <name> [path]  Mount remote via SSHFS (home dir by default)
+  remote -u, --unmount <name>  Unmount a mounted remote
+  remote --mounts              List active SSHFS mounts
   remote -h, --help   Show this help
 
+SSHFS mounts are created under /mnt/<remote-name>.
 If dialog/whiptail is not available, falls back to CLI prompts.
 EOF
 }
@@ -714,6 +987,29 @@ case "${1:-}" in
             exit 1
         fi
         delete_entry "$2"
+        ;;
+    -m|--mount|mount)
+        if [ -z "${2:-}" ]; then
+            echo "Missing name to mount." >&2
+            exit 1
+        fi
+        entry="$(get_entry_by_name "$2")"
+        if [ -z "$entry" ]; then
+            echo "No such remote: $2" >&2
+            exit 1
+        fi
+        IFS=',' read -r name user host proto is_default <<<"$entry"
+        mount_remote "$user" "$host" "$name" "${3:-}"
+        ;;
+    -u|--unmount|unmount)
+        if [ -z "${2:-}" ]; then
+            echo "Missing name to unmount." >&2
+            exit 1
+        fi
+        unmount_remote "$2"
+        ;;
+    --mounts|mounts)
+        list_mounts
         ;;
     -r|--random|random)
         random_entry
