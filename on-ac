@@ -8,16 +8,27 @@
 #  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
 #      ░    ░         ░ ░      ░ ░
-# Script: toggle.sh
-# Purpose: Waybar visibility toggle
-# Dependencies: waybar
+# Script: on-ac
+# Purpose: Return success when the system is on AC power and failure when on battery
+# Dependencies: none
 # Author: groot
-# Modified: 2026-01-24
 
-set -euo pipefail
-if [ -f $HOME/.config/ml4w/settings/waybar-disabled ]; then
-    rm $HOME/.config/ml4w/settings/waybar-disabled
-else
-    touch $HOME/.config/ml4w/settings/waybar-disabled
-fi
-$HOME/.config/waybar/launch.sh &
+for ac_device in /sys/class/power_supply/AC*; do
+    if [[ -f "$ac_device/online" ]]; then
+        read -r status < "$ac_device/online"
+        if [[ "$status" == "1" ]]; then
+            exit 0
+        fi
+    fi
+done
+
+for bat_device in /sys/class/power_supply/BAT*; do
+    if [[ -f "$bat_device/status" ]]; then
+        read -r status < "$bat_device/status"
+        if [[ "$status" == "Charging" ]]; then
+            exit 0
+        fi
+    fi
+done
+
+exit 1

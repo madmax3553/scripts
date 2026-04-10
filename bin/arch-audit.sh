@@ -9,9 +9,9 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
 #      ░    ░         ░ ░      ░ ░
 # Script: arch-audit.sh
-# Purpose: Utility: arc  audit
-# Dependencies: <fill in as needed>
-# Author: Custom
+# Purpose: Review orphaned packages, pacman cache usage, and large installed packages on Arch
+# Dependencies: pacman, paccache, du, awk, column, sudo
+# Author: groot
 # Modified: 2026-01-24
 
 set -uo pipefail

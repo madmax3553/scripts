@@ -8,16 +8,18 @@
 #  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
 #      ░    ░         ░ ░      ░ ░
-# Script: toggle.sh
-# Purpose: Waybar visibility toggle
-# Dependencies: waybar
+# Script: waybar-journal.sh
+# Purpose: Output task count for waybar journal module
+# Dependencies: grep
 # Author: groot
-# Modified: 2026-01-24
+# Created: 2026-02-11
 
-set -euo pipefail
-if [ -f $HOME/.config/ml4w/settings/waybar-disabled ]; then
-    rm $HOME/.config/ml4w/settings/waybar-disabled
+TASK_REGISTRY="${HOME}/journal/tasks/active.md"
+
+if [[ -f "$TASK_REGISTRY" ]]; then
+    count=$(grep -c "^Status: \[ \]$" "$TASK_REGISTRY" 2>/dev/null || echo 0)
 else
-    touch $HOME/.config/ml4w/settings/waybar-disabled
+    count=0
 fi
-$HOME/.config/waybar/launch.sh &
+
+echo "󰈙 $count"

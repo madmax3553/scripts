@@ -2,40 +2,36 @@
 #  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
 # ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
 #▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
-#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
-#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
-# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
-#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
-#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
-#      ░    ░         ░ ░      ░ ░           
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
+#      ░    ░         ░ ░      ░ ░
 # Script: window-switcher.sh
-# Purpose: Hyprland window switcher with tofi
-# Dependencies: hyprctl, jq, tofi
+# Purpose: Hyprland window switcher using fuzzel
+# Dependencies: fuzzel, hyprctl, jq
 # Author: groot
 # Modified: 2026-01-24
 
 set -euo pipefail
 
-DEBUG=0
-if [[ "${1:-}" == "--debug" || "${WINDOW_SWITCHER_DEBUG:-}" == "1" ]]; then
-  DEBUG=1
-fi
-
 icon_for() {
   case "$1" in
-    *firefox*|*librewolf*) printf '' ;;
-    *chrome*|*chromium*|*brave*|*vivaldi*) printf '' ;;
+    *firefox*|*librewolf*) printf '' ;;
+    *chrome*|*chromium*|*brave*|*vivaldi*) printf '' ;;
     *code*|*vscode*|*code-oss*) printf '󰨞' ;;
-    *wezterm*|*alacritty*|*kitty*|*foot*|*terminal*|*xterm*) printf '' ;;
-    *thunar*|*nautilus*|*pcmanfm*|*dolphin*|*file*manager*) printf '' ;;
-    *discord*) printf '' ;;
-    *slack*) printf '' ;;
-    *spotify*) printf '' ;;
-    *steam*) printf '' ;;
-    *mpv*|*vlc*) printf '' ;;
-    *obsidian*|*notes*) printf '' ;;
-    *pavucontrol*|*volume*|*audio*) printf '' ;;
-    *settings*|*control*center*) printf '' ;;
+    *ghostty*|*wezterm*|*alacritty*|*kitty*|*foot*|*terminal*|*xterm*) printf '' ;;
+    *thunar*|*nautilus*|*pcmanfm*|*dolphin*|*file*manager*) printf '' ;;
+    *discord*) printf '' ;;
+    *slack*) printf '' ;;
+    *spotify*) printf '' ;;
+    *steam*) printf '' ;;
+    *mpv*|*vlc*) printf '' ;;
+    *obsidian*|*notes*) printf '' ;;
+    *pavucontrol*|*volume*|*audio*) printf '' ;;
+    *qutebrowser*) printf '' ;;
+    *settings*|*control*center*) printf '' ;;
     *) printf '󰖯' ;;
   esac
 }
@@ -50,6 +46,7 @@ pretty_name() {
     *vivaldi*) printf 'Vivaldi' ;;
     *code-oss*) printf 'VS Code' ;;
     *vscode*|*code*) printf 'VS Code' ;;
+    *ghostty*) printf 'Ghostty' ;;
     *wezterm*) printf 'WezTerm' ;;
     *alacritty*) printf 'Alacritty' ;;
     *kitty*) printf 'Kitty' ;;
@@ -66,6 +63,7 @@ pretty_name() {
     *vlc*) printf 'VLC' ;;
     *obsidian*) printf 'Obsidian' ;;
     *pavucontrol*) printf 'Audio' ;;
+    *qutebrowser*) printf 'Qutebrowser' ;;
     *settings*|*control*center*) printf 'Settings' ;;
     *)
       printf '%s' "$1" | tr '_-' '  ' | sed -E 's/(^| )([a-z])/\U\2/g'
@@ -105,25 +103,16 @@ formatted=$(
     else
       label="$app_name"
     fi
-    if (( DEBUG )); then
-      display="[$ws_label] $app_icon $label · class:$class · pid:$pid · addr:$address"
-    else
-      display="[$ws_label] $app_icon $label"
-    fi
+    display="[$ws_label] $app_icon $label"
     printf '%s\t%s\n' "$address" "$display"
   done
 )
 
 selection=$(printf '%s\n' "$formatted" | \
-  tofi --config ~/.config/tofi/config \
-       --anchor center \
-       --width 720 \
-       --height 480 \
-       --prompt-padding=32 \
-       --prompt-text "[win] " \
-       --placeholder-text "Select a window" \
-       --horizontal false \
-       --require-match=true) || exit 0
+  fuzzel --dmenu \
+       --prompt "[win] " \
+       --width 50 \
+       --lines 15) || exit 0
 
 [[ -z "$selection" ]] && exit 0
 

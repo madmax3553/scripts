@@ -2,17 +2,16 @@
 #  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
 # ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
 #▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
-#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
-#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
-# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
-#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
-#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
-#      ░    ░         ░ ░      ░ ░           
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
+#      ░    ░         ░ ░      ░ ░
 # Script: fuzzy_finder.sh
-# Purpose: Utility: fuzzy finder
-# Dependencies: <fill in as needed>
-# Author: Custom
-# Modified: 2026-01-24
+# Purpose: Search installed applications and indexed files from a single launcher surface
+# Dependencies: rg, tofi, gtk-launch, xdg-open, sed, stat
+# Author: groot
 
 set -euo pipefail
 

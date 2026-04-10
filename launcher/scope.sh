@@ -2,17 +2,16 @@
 #  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
 # ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
 #▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
-#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░ 
-#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░ 
-# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░   
-#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░    
-#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░      
-#      ░    ░         ░ ░      ░ ░           
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
+#      ░    ░         ░ ░      ░ ░
 # Script: scope.sh
-# Purpose: Utility:  cope
-# Dependencies: <fill in as needed>
-# Author: Custom
-# Modified: 2026-01-24
+# Purpose: Provide rich file previews for ranger across text, archives, media, and documents
+# Dependencies: ranger preview toolchain such as file, jq, atool, bsdtar, pdftotext, and imagemagick
+# Author: groot
 
 set -o noclobber -o noglob -o nounset -o pipefail
 IFS=$'\n'

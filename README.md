@@ -1,4 +1,13 @@
 # User Scripts Repository
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
+#      ░    ░         ░ ░      ░ ░
 
 Single source of truth for all custom shell scripts and utilities.
 
@@ -57,6 +66,29 @@ source ~/.local/bin/lib/colors.sh
    source /home/groot/projects/scripts/lib/colors.sh
    ```
 4. Commit to git
+
+## Header Standard
+
+Shell entrypoints should use the shared Groot header style:
+
+```bash
+#!/usr/bin/env bash
+#  ▄████  ██▀███   ▒█████   ▒█████  ▄▄▄█████▓
+# ██▒ ▀█▒▓██ ▒ ██▒▒██▒  ██▒▒██▒  ██▒▓  ██▒ ▓▒
+#▒██░▄▄▄░▓██ ░▄█ ▒▒██░  ██▒▒██░  ██▒▒ ▓██░ ▒░
+#░▓█  ██▓▒██▀▀█▄  ▒██   ██░▒██   ██░░ ▓██▓ ░
+#░▒▓███▀▒░██▓ ▒██▒░ ████▓▒░░ ████▓▒░  ▒██▒ ░
+# ░▒   ▒ ░ ▒▓ ░▒▓░░ ▒░▒░▒░ ░ ▒░▒░▒░   ▒ ░░
+#  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
+#░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
+#      ░    ░         ░ ░      ░ ░
+# Script: name.sh
+# Purpose: Short description
+# Dependencies: tool1, tool2
+# Author: groot
+```
+
+Optional metadata such as `# Modified:` or `# Created:` can follow when useful.
 
 ## Library Functions
 
