@@ -11,7 +11,7 @@
 # Script: update
 # Purpose: Comprehensive system updater with Braille spinner and Groot Logo
 # Author: groot
-# Modified: 2026-02-18
+# Modified: 2026-04-17
 
 set -euo pipefail
 
@@ -150,16 +150,12 @@ update_npm() {
     header "Phase: Global npm Packages"
     if ! command -v npm >/dev/null 2>&1; then return 0; fi
 
-    # We only update things that are NOT managed by pacman to avoid conflicts.
-    # npm itself should ALWAYS be managed by pacman on Arch.
     local packages
     info "Checking for outdated global packages... "
     local tmp_outdated=$(mktemp)
-    # Exclude npm and corepack to prevent system conflicts
     (npm outdated -g --json | jq -r 'keys[]' 2>/dev/null | grep -vE "^(npm|corepack)$" > "$tmp_outdated" || true) &
     local pid=$!
 
-    # Simple inline spinner for this capture
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     while kill -0 "$pid" 2>/dev/null; do
         for (( i=0; i<${#frames}; i++ )); do
@@ -177,7 +173,6 @@ update_npm() {
     ok
 
     for pkg in $packages; do
-        # If it's owned by a package, skip it
         if pacman -Qo "/usr/lib/node_modules/$pkg" >/dev/null 2>&1; then
             echo "Skipping pacman-managed npm package: $pkg" >> "$LOG_FILE"
             continue
@@ -190,16 +185,10 @@ update_npm() {
     done
 }
 
-# ------------------------------------------------------------------
-# Phase: System Package Updates
-# ------------------------------------------------------------------
-
 update_python() {
     header "Phase: Python (pip) Packages"
     if ! command -v pip >/dev/null 2>&1; then return 0; fi
 
-    # PEP 668: Arch Linux and most distros now prevent global pip installs.
-    # We only check for user-installed (--user) packages.
     local packages
     info "Checking for outdated user pip packages... "
     local tmp_pip=$(mktemp)
@@ -240,11 +229,8 @@ update_flatpak() {
 }
 
 refresh_waybar() {
-    if [[ "$DISTRO" != "arch" ]]; then return 0; fi
     header "Phase: Refresh Status Bar"
-    if command -v status-cache-daemon.sh >/dev/null 2>&1; then
-        run_with_spinner "Refreshing status cache..." status-cache-daemon.sh refresh-all
-    elif command -v yay-waybar.sh >/dev/null 2>&1; then
+    if command -v yay-waybar.sh >/dev/null 2>&1; then
         run_with_spinner "Clearing Waybar cache..." yay-waybar.sh cache-clear
     fi
 }
@@ -274,19 +260,25 @@ main() {
     header "Phase: System Package Updates"
     if [[ "$DISTRO" == "arch" ]]; then
         info "Updating system (yay)..."
-        # We DON'T use spinner here because yay is interactive
-        if yay -Syyu --noconfirm; then
+        if yay -Syu --noconfirm; then
             ok
         else
             fail "System update failed"; SYSTEM_ERRORS="${SYSTEM_ERRORS}yay -Syu failed\n"; ERRORS_OCCURRED=1
         fi
-
-        run_with_spinner "Cleaning up orphans..." yay -Yc --noconfirm
     fi
 
     update_python
     update_rust
     update_flatpak
+
+    header "Phase: Cleanup & Maintenance"
+    if [[ "$DISTRO" == "arch" ]]; then
+        run_with_spinner "Removing orphan packages..." yay -Yc --noconfirm || true
+        run_with_spinner "Cleaning stale download directories..." sudo rm -rf /var/cache/pacman/pkg/download-* || true
+        run_with_spinner "Cleaning pacman cache (keep latest 3)..." sudo paccache -r || true
+        run_with_spinner "Cleaning yay cache..." yay -Sc --noconfirm || true
+    fi
+
     refresh_waybar
 
     header "Summary"
