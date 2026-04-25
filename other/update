@@ -260,11 +260,40 @@ main() {
     header "Phase: System Package Updates"
     if [[ "$DISTRO" == "arch" ]]; then
         info "Updating system (yay)..."
-        if yay -Syu --noconfirm; then
+        local YAY_LOG=$(mktemp)
+        # Capture output to check for file conflicts while still showing it to the user
+        if yay -Syu --noconfirm 2>&1 | tee "$YAY_LOG"; then
             ok
+            cat "$YAY_LOG" >> "$LOG_FILE"
         else
-            fail "System update failed"; SYSTEM_ERRORS="${SYSTEM_ERRORS}yay -Syu failed\n"; ERRORS_OCCURRED=1
+            cat "$YAY_LOG" >> "$LOG_FILE"
+            if grep -q "exists in filesystem" "$YAY_LOG"; then
+                fail "System update failed due to file conflicts."
+                local packages=$(grep "exists in filesystem" "$YAY_LOG" | cut -d: -f1 | sort -u | xargs)
+                warn "Conflicting packages: $packages"
+                
+                printf "${YELLOW}Would you like to retry with --overwrite '*'? [y/N] ${RESET}"
+                read -r response
+                if [[ "$response" =~ ^[Yy]$ ]]; then
+                    info "Retrying with --overwrite '*'..."
+                    if yay -Syu --noconfirm --overwrite '*' 2>&1 | tee -a "$LOG_FILE"; then
+                        ok
+                    else
+                        fail "System update failed again."
+                        SYSTEM_ERRORS="${SYSTEM_ERRORS}yay -Syu --overwrite failed\n"
+                        ERRORS_OCCURRED=1
+                    fi
+                else
+                    SYSTEM_ERRORS="${SYSTEM_ERRORS}yay -Syu failed (file conflicts)\n"
+                    ERRORS_OCCURRED=1
+                fi
+            else
+                fail "System update failed"
+                SYSTEM_ERRORS="${SYSTEM_ERRORS}yay -Syu failed\n"
+                ERRORS_OCCURRED=1
+            fi
         fi
+        rm -f "$YAY_LOG"
     fi
 
     update_python
