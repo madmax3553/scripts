@@ -25,9 +25,12 @@ source "${HOME}/projects/scripts/lib/common.sh"
 JOURNAL_DIR="${JOURNAL_DIR:-${HOME}/projects/journal}"
 DIARY_DIR="${JOURNAL_DIR}/diary"
 TODO_FILE="${JOURNAL_DIR}/TODO.md"
+DASHBOARD_FILE="${JOURNAL_DIR}/index.md"
 NOTES_DIR="${JOURNAL_DIR}/notes"
 TERMINAL="${TERMINAL:-ghostty}"
 TITLE_PREFIX="${TITLE_PREFIX:-Journal}"
+DASHBOARD_TITLE="${TITLE_PREFIX} Dashboard"
+TODO_TITLE="${TITLE_PREFIX} TODO"
 JOURNAL_FLOAT_CENTER="${JOURNAL_FLOAT_CENTER:-0}"
 LOG_FILE="${JOURNAL_LOG_FILE:-${XDG_STATE_HOME:-${HOME}/.local/state}/journal.log}"
 
@@ -46,6 +49,8 @@ REMINDER_START_HOUR="${REMINDER_START_HOUR:-7}"
 REMINDER_END_HOUR="${REMINDER_END_HOUR:-21}"
 REMINDER_CHECK_INTERVAL="${REMINDER_CHECK_INTERVAL:-10}"
 REMOVED_DIR="${REMOVED_DIR:-${DIARY_DIR}/.removed}"
+TODO_PROMOTE_MEDIUM_AGE_DAYS="${TODO_PROMOTE_MEDIUM_AGE_DAYS:-14}"
+TODO_PROMOTE_LOW_AGE_DAYS="${TODO_PROMOTE_LOW_AGE_DAYS:-30}"
 
 if ! declare -p JOURNAL_GIT_REPOS >/dev/null 2>&1; then
     JOURNAL_GIT_REPOS=(
@@ -76,12 +81,14 @@ journal_log() {
 
 # ===== Window Management Functions =====
 
-focus_existing_window() {
+focus_window_by_title() {
+    local title="$1"
+
     command -v hyprctl >/dev/null 2>&1 || return 1
 
     local address
     address="$(
-        hyprctl -j clients 2>/dev/null | jq -r --arg title "${TITLE}" '
+        hyprctl -j clients 2>/dev/null | jq -r --arg title "${title}" '
             map(select(
                 (.title // "" ) == $title or
                 (.initialTitle // "" ) == $title
@@ -91,7 +98,7 @@ focus_existing_window() {
     )"
 
     if [[ -z "${address}" ]]; then
-        journal_log "focus: no matching window found (title=${TITLE})"
+        journal_log "focus: no matching window found (title=${title})"
         return 1
     fi
 
@@ -99,6 +106,10 @@ focus_existing_window() {
     journal_log "focus: focusing address ${address}"
     hyprctl dispatch focuswindow "address:${address}" >/dev/null 2>&1 || journal_log "focus: dispatch failed"
     return 0
+}
+
+focus_existing_window() {
+    focus_window_by_title "${TITLE}"
 }
 
 float_and_center() {
@@ -368,6 +379,32 @@ launch_journal() {
     fi
 }
 
+launch_markdown_file() {
+    local title="$1"
+    local file="$2"
+    local cmd=()
+    local nvim_full=(nvim "+set notitle" "${file}")
+
+    journal_log "launch: terminal=${TERMINAL} title=\"${title}\" file=${file}"
+
+    case "${TERMINAL}" in
+        ghostty)
+            cmd=(ghostty --title="${title}" -e "${nvim_full[@]}")
+            ;;
+        kitty)
+            cmd=(kitty --class Journal --title "${title}" "${nvim_full[@]}")
+            ;;
+        alacritty)
+            cmd=(alacritty --class Journal --title "${title}" -e "${nvim_full[@]}")
+            ;;
+        *)
+            cmd=("${TERMINAL}" -e "${nvim_full[@]}")
+            ;;
+    esac
+
+    setsid "${cmd[@]}" >/dev/null 2>&1 &
+}
+
 # ===== Daily Plan Command =====
 
 cmd_plan() {
@@ -552,9 +589,184 @@ cmd_surface() {
     fi
 }
 
+cmd_dashboard() {
+    ensure_today
+    launch_markdown_file "${DASHBOARD_TITLE}" "${DASHBOARD_FILE}"
+}
+
+cmd_surface_dashboard() {
+    ensure_today
+    if ! focus_window_by_title "${DASHBOARD_TITLE}"; then
+        launch_markdown_file "${DASHBOARD_TITLE}" "${DASHBOARD_FILE}"
+    fi
+}
+
+cmd_todo() {
+    launch_markdown_file "${TODO_TITLE}" "${TODO_FILE}"
+}
+
+cmd_surface_todo() {
+    if ! focus_window_by_title "${TODO_TITLE}"; then
+        launch_markdown_file "${TODO_TITLE}" "${TODO_FILE}"
+    fi
+}
+
 # ===== Weekly Summary Command =====
 
+todo_item_text() {
+    local line="$1"
+    line="${line#*- [ ] }"
+    line="${line#* [ ] }"
+    printf '%s\n' "$line" | sed 's/[[:space:]]*$//'
+}
+
+todo_age_days() {
+    local item_text="$1"
+    local todo_rel="TODO.md"
+
+    [[ -n "${item_text}" ]] || return 1
+    [[ -d "${JOURNAL_DIR}/.git" ]] || return 1
+
+    local first_seen
+    first_seen=$(git -C "${JOURNAL_DIR}" log --follow --reverse --format='%ad' --date=short -S"${item_text}" -- "${todo_rel}" 2>/dev/null | head -n 1 || true)
+    [[ -n "${first_seen}" ]] || return 1
+
+    local first_epoch today_epoch
+    first_epoch=$(date -d "${first_seen}" +%s 2>/dev/null || true)
+    today_epoch=$(date -d "${TODAY}" +%s 2>/dev/null || true)
+    [[ -n "${first_epoch}" && -n "${today_epoch}" ]] || return 1
+
+    echo $(((today_epoch - first_epoch) / 86400))
+}
+
+cleanup_completed_todos() {
+    [[ -f "${TODO_FILE}" ]] || return 0
+
+    mkdir -p "${TASK_HISTORY}"
+
+    local tmp_file completed_file archived_count
+    tmp_file=$(mktemp)
+    completed_file=$(mktemp)
+    archived_count=0
+
+    awk -v completed_file="${completed_file}" '
+        /^## Completed$/ { in_completed=1; print; next }
+        /^## / && in_completed && $0 != "## Completed" { in_completed=0 }
+
+        in_completed && /^[[:space:]]*[-*][[:space:]]*\[[✓xX]\]/ {
+            print > completed_file
+            next
+        }
+
+        { print }
+    ' "${TODO_FILE}" > "${tmp_file}"
+
+    archived_count=$(grep -c '^[[:space:]]*[-*][[:space:]]*\[[✓xX]\]' "${completed_file}" 2>/dev/null || true)
+    archived_count="${archived_count//[[:space:]]/}"
+
+    if (( archived_count > 0 )); then
+        local history_file="${TASK_HISTORY}/completed-${TODAY}.md"
+        {
+            echo "## Completed TODO cleanup: ${TODAY}"
+            echo ""
+            cat "${completed_file}"
+            echo ""
+        } >> "${history_file}"
+        mv "${tmp_file}" "${TODO_FILE}"
+        log_success "Archived ${archived_count} completed TODO item(s) to ${history_file}"
+    else
+        rm -f "${tmp_file}"
+    fi
+
+    rm -f "${completed_file}"
+}
+
+promote_aged_todos() {
+    [[ -f "${TODO_FILE}" ]] || return 0
+
+    local tmp_file promoted_file
+    tmp_file=$(mktemp)
+    promoted_file=$(mktemp)
+
+    local section="prefix"
+    local -a prefix high medium low suffix
+    local -a promoted_high promoted_medium
+    local line item_text age_days
+
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        case "${line}" in
+            "## High Priority") section="high"; continue ;;
+            "## Medium Priority") section="medium"; continue ;;
+            "## Low Priority") section="low"; continue ;;
+            "## Ongoing Git Changes"|"## Completed"|"## Tips") section="suffix" ;;
+        esac
+
+        case "${section}" in
+            prefix) prefix+=("${line}") ;;
+            high) high+=("${line}") ;;
+            medium)
+                if [[ "${line}" =~ ^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\] ]]; then
+                    item_text=$(todo_item_text "${line}")
+                    age_days=$(todo_age_days "${item_text}" || true)
+                    if [[ -n "${age_days}" ]] && (( age_days >= TODO_PROMOTE_MEDIUM_AGE_DAYS )); then
+                        promoted_high+=("${line}")
+                        printf '%s\n' "- Medium -> High after ${age_days} days: ${item_text}" >> "${promoted_file}"
+                        continue
+                    fi
+                fi
+                medium+=("${line}")
+                ;;
+            low)
+                if [[ "${line}" =~ ^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\] ]]; then
+                    item_text=$(todo_item_text "${line}")
+                    age_days=$(todo_age_days "${item_text}" || true)
+                    if [[ -n "${age_days}" ]] && (( age_days >= TODO_PROMOTE_LOW_AGE_DAYS )); then
+                        promoted_medium+=("${line}")
+                        printf '%s\n' "- Low -> Medium after ${age_days} days: ${item_text}" >> "${promoted_file}"
+                        continue
+                    fi
+                fi
+                low+=("${line}")
+                ;;
+            suffix) suffix+=("${line}") ;;
+        esac
+    done < "${TODO_FILE}"
+
+    if [[ ! -s "${promoted_file}" ]]; then
+        rm -f "${tmp_file}" "${promoted_file}"
+        return 0
+    fi
+
+    {
+        printf '%s\n' "${prefix[@]}"
+        echo "## High Priority"
+        printf '%s\n' "${high[@]}"
+        printf '%s\n' "${promoted_high[@]}"
+        echo "## Medium Priority"
+        printf '%s\n' "${medium[@]}"
+        printf '%s\n' "${promoted_medium[@]}"
+        echo "## Low Priority"
+        printf '%s\n' "${low[@]}"
+        printf '%s\n' "${suffix[@]}"
+    } > "${tmp_file}"
+
+    mv "${tmp_file}" "${TODO_FILE}"
+    log_success "Promoted aged TODO item(s):"
+    sed 's/^/  /' "${promoted_file}"
+    rm -f "${promoted_file}"
+}
+
+maintain_weekly_todos() {
+    cleanup_completed_todos
+    promote_aged_todos
+}
+
 cmd_weekly() {
+    local open_editor=1
+    if [[ "${1:-}" == "--no-open" ]] || [[ "${1:-}" == "--cron" ]]; then
+        open_editor=0
+    fi
+
     local week_start week_end
     # Get Monday of current week
     week_start=$(date -d "last monday" +%Y-%m-%d 2>/dev/null || date -d "monday" +%Y-%m-%d)
@@ -563,6 +775,7 @@ cmd_weekly() {
     local summary_file="${JOURNAL_DIR}/weekly-review-${week_start}.md"
     
     log_info "Generating weekly summary for $week_start to $week_end..."
+    maintain_weekly_todos
     
     {
         echo "# Weekly Review: $week_start to $week_end"
@@ -716,9 +929,11 @@ cmd_weekly() {
     } > "$summary_file"
     
     log_success "Weekly summary generated: $summary_file"
-    echo ""
-    echo "Opening weekly summary..."
-    nvim "$summary_file"
+    if [[ "${open_editor}" -eq 1 ]]; then
+        echo ""
+        echo "Opening weekly summary..."
+        nvim "$summary_file"
+    fi
 }
 
 # ===== Cleanup Command =====
@@ -1074,6 +1289,10 @@ ${BOLD}Usage:${RESET}
 ${BOLD}Commands:${RESET}
     ${CYAN}open${RESET}                   - Open today's journal entry (default)
     ${CYAN}surface${RESET}                - Focus existing journal or open if not found
+    ${CYAN}dashboard${RESET}              - Open journal dashboard
+    ${CYAN}surface-dashboard${RESET}      - Focus existing dashboard or open if not found
+    ${CYAN}todo${RESET}                   - Open master TODO list
+    ${CYAN}surface-todo${RESET}           - Focus existing TODO list or open if not found
     ${CYAN}plan${RESET}                   - Generate today's daily plan
     ${CYAN}commits${RESET}                - Update today's diary with git commits
     ${CYAN}review${RESET}                 - Review outstanding TODOs
@@ -1087,11 +1306,14 @@ ${BOLD}Commands:${RESET}
 ${BOLD}Examples:${RESET}
     journal.sh open          # Open today's journal
     journal.sh surface       # Focus existing or open
+    journal.sh surface-dashboard  # Focus dashboard or open
+    journal.sh surface-todo  # Focus TODO list or open
     journal.sh plan          # Generate daily plan
     journal.sh commits       # Update today's git commit summary
     journal.sh review        # Show outstanding TODOs
     journal.sh index         # Regenerate diary index
     journal.sh weekly        # Generate and open weekly summary
+    journal.sh weekly --no-open  # Generate weekly summary without opening Neovim
     journal.sh cleanup --dry-run  # Preview cleanup (no deletion)
     journal.sh cleanup       # Remove empty entries (with confirmation)
     journal.sh menu          # Interactive menu
@@ -1117,6 +1339,18 @@ main() {
         surface)
             cmd_surface
             ;;
+        dashboard)
+            cmd_dashboard
+            ;;
+        surface-dashboard)
+            cmd_surface_dashboard
+            ;;
+        todo)
+            cmd_todo
+            ;;
+        surface-todo)
+            cmd_surface_todo
+            ;;
         plan)
             cmd_plan
             ;;
@@ -1130,7 +1364,8 @@ main() {
             cmd_index
             ;;
         weekly)
-            cmd_weekly
+            shift
+            cmd_weekly "$@"
             ;;
         cleanup_non_journalled)
             cleanup_non_journalled
