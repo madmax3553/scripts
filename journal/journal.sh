@@ -47,6 +47,14 @@ REMINDER_END_HOUR="${REMINDER_END_HOUR:-21}"
 REMINDER_CHECK_INTERVAL="${REMINDER_CHECK_INTERVAL:-10}"
 REMOVED_DIR="${REMOVED_DIR:-${DIARY_DIR}/.removed}"
 
+if ! declare -p JOURNAL_GIT_REPOS >/dev/null 2>&1; then
+    JOURNAL_GIT_REPOS=(
+        "${JOURNAL_DIR}"
+        "${HOME}/projects/scripts"
+        "${HOME}/dotfiles"
+    )
+fi
+
 # Today's info
 TODAY="$(date +%Y-%m-%d)"
 YESTERDAY="$(date -d "yesterday" +%Y-%m-%d)"
@@ -214,6 +222,75 @@ carry_forward_tasks() {
     fi
 }
 
+git_repo_label() {
+    local repo="$1"
+
+    if [[ "${repo}" == "${JOURNAL_DIR}" ]]; then
+        echo "journal"
+        return 0
+    fi
+
+    basename "${repo}"
+}
+
+render_daily_git_commits() {
+    local since until repo label commits found=0
+    since="${TODAY} 00:00"
+    until="${TODAY} 23:59:59"
+
+    echo "## Git Commits Today"
+    echo ""
+    echo "*Auto-generated: $(date '+%Y-%m-%d %H:%M %Z')*"
+    echo ""
+
+    for repo in "${JOURNAL_GIT_REPOS[@]}"; do
+        [[ -d "${repo}/.git" ]] || continue
+
+        label="$(git_repo_label "${repo}")"
+        commits="$(git -C "${repo}" log --since="${since}" --until="${until}" --date=short --pretty=format:'- `%h` %s' 2>/dev/null || true)"
+        [[ -n "${commits}" ]] || continue
+
+        found=1
+        echo "### ${label}"
+        echo "${commits}"
+        echo ""
+    done
+
+    if [[ "${found}" -eq 0 ]]; then
+        echo "- No commits recorded yet."
+        echo ""
+    fi
+}
+
+update_daily_git_commits() {
+    [[ -f "${JOURNAL_FILE}" ]] || return 0
+
+    local tmp block
+    tmp="$(mktemp)"
+    block="$(mktemp)"
+
+    render_daily_git_commits > "${block}"
+
+    awk '
+        /^## Git Commits Today$/ { skip=1; next }
+        /^## / && skip { skip=0 }
+        !skip { print }
+    ' "${JOURNAL_FILE}" > "${tmp}"
+
+    while [[ -s "${tmp}" && -z "$(tail -n 1 "${tmp}")" ]]; do
+        sed -i '$d' "${tmp}"
+    done
+    printf '\n' >> "${tmp}"
+    cat "${block}" >> "${tmp}"
+    while [[ -s "${tmp}" && -z "$(tail -n 1 "${tmp}")" ]]; do
+        sed -i '$d' "${tmp}"
+    done
+    mv "${tmp}" "${JOURNAL_FILE}"
+    rm -f "${block}"
+
+    journal_log "updated daily git commits: ${JOURNAL_FILE}"
+}
+
 ensure_today() {
     if [[ ! -f "${JOURNAL_FILE}" ]]; then
         journal_log "creating template: weekend=${IS_WEEKEND} file=${JOURNAL_FILE}"
@@ -227,6 +304,8 @@ ensure_today() {
     else
         journal_log "journal exists: ${JOURNAL_FILE}"
     fi
+
+    update_daily_git_commits
 }
 
 pick_jump_section() {
@@ -295,6 +374,14 @@ cmd_plan() {
     log_info "Generating daily plan..."
     ensure_today
     log_success "Daily plan ready at $JOURNAL_FILE"
+}
+
+# ===== Daily Git Commits Command =====
+
+cmd_commits() {
+    log_info "Updating today's git commit summary..."
+    ensure_today
+    log_success "Git commit summary updated in ${JOURNAL_FILE}"
 }
 
 # ===== Diary Index Command =====
@@ -988,6 +1075,7 @@ ${BOLD}Commands:${RESET}
     ${CYAN}open${RESET}                   - Open today's journal entry (default)
     ${CYAN}surface${RESET}                - Focus existing journal or open if not found
     ${CYAN}plan${RESET}                   - Generate today's daily plan
+    ${CYAN}commits${RESET}                - Update today's diary with git commits
     ${CYAN}review${RESET}                 - Review outstanding TODOs
     ${CYAN}index${RESET}                  - Generate diary index
     ${CYAN}weekly${RESET}                 - Generate weekly summary (stats, completed tasks, etc.)
@@ -1000,6 +1088,7 @@ ${BOLD}Examples:${RESET}
     journal.sh open          # Open today's journal
     journal.sh surface       # Focus existing or open
     journal.sh plan          # Generate daily plan
+    journal.sh commits       # Update today's git commit summary
     journal.sh review        # Show outstanding TODOs
     journal.sh index         # Regenerate diary index
     journal.sh weekly        # Generate and open weekly summary
@@ -1030,6 +1119,9 @@ main() {
             ;;
         plan)
             cmd_plan
+            ;;
+        commits)
+            cmd_commits
             ;;
         review)
             cmd_review

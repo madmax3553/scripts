@@ -163,6 +163,13 @@ ensure_today() {
   fi
 }
 
+update_daily_git_commits() {
+  local journal_cmd="${HOME}/.local/bin/journal.sh"
+
+  [[ -x "${journal_cmd}" ]] || return 0
+  JOURNAL_DIR="${HOME}/projects/journal" "${journal_cmd}" commits >/dev/null 2>&1 || log "commits: update failed"
+}
+
 pick_jump_section() {
   local hour
   hour="$(date +%H | sed 's/^0//')"
@@ -223,6 +230,7 @@ launch_journal() {
 
 mode="${1:-open}"
 ensure_today
+update_daily_git_commits
 pick_jump_section
 
 case "${mode}" in
