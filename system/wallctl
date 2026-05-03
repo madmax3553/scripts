@@ -2509,9 +2509,13 @@ set_wallpaper() {
             die "mpvpaper required for live wallpapers (install: paru -S mpvpaper)"
         fi
         kill_live_wallpaper
-        # Get focused monitor
+        # Get focused monitor (compositor-aware)
         local monitor
-        monitor=$(hyprctl monitors -j 2>/dev/null | jq -r '.[0].name' 2>/dev/null || echo "eDP-1")
+        if [[ "${XDG_CURRENT_DESKTOP:-}" == "niri" ]]; then
+            monitor=$(niri msg outputs -j 2>/dev/null | jq -r '.[0].name' 2>/dev/null || echo "eDP-1")
+        else
+            monitor=$(hyprctl monitors -j 2>/dev/null | jq -r '.[0].name' 2>/dev/null || echo "eDP-1")
+        fi
         mpvpaper -o "no-audio loop" "$monitor" "$file" &
         disown
         print_success "live wallpaper set: $(basename "$file") (mpvpaper on $monitor)"
