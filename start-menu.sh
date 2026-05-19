@@ -75,7 +75,7 @@ case "$chosen" in
         ~/.local/bin/journal.sh surface &
         ;;
     *Dashboard)
-        ~/.local/bin/tmux-dashboard-control surface &
+        ~/.local/bin/hypr/dashboard.sh surface &
         ;;
     *Colorscheme)
         "$HOME/.local/bin/system/colorscheme-menu.sh" &

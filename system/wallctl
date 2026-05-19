@@ -92,6 +92,11 @@ WALLHAVEN_PURITY="100"
 # Wallctl-specific output helpers (not in common.sh)
 # ─────────────────────────────────────────────────────────────────────────────
 
+_has_tty() {
+    [[ -t 0 || -t 1 ]] || return 1
+    { : >/dev/tty; } 2>/dev/null
+}
+
 cleanup() {
     local code=$?
     local _pid
@@ -113,7 +118,7 @@ cleanup() {
     done < <(jobs -pr 2>/dev/null || true)
 
     unpin_header 2>/dev/null
-    if [[ -e /dev/tty ]]; then
+    if _has_tty; then
         stty sane </dev/tty 2>/dev/null || true
         # Reset common terminal modes (cursor, wrapping, scroll region, mouse, bracketed paste).
         printf '\033[0m\033[?25h\033[?7h\033[r\033[?1l\033[?1000l\033[?1002l\033[?1003l\033[?1004l\033[?1005l\033[?1006l\033[?1015l\033[?2004l\033[?1049l' >/dev/tty 2>/dev/null || true
@@ -194,7 +199,7 @@ DUP_COUNT_CACHE_TTL_MS=900000
 # piped stdout, and command substitution).
 _term_cols() {
     local _l _c
-    if read -r _l _c < <(stty size </dev/tty 2>/dev/null); then
+    if _has_tty && read -r _l _c < <(stty size </dev/tty 2>/dev/null); then
         printf '%s' "$_c"
     else
         printf '80'
@@ -203,7 +208,7 @@ _term_cols() {
 
 _term_lines() {
     local _l _c
-    if read -r _l _c < <(stty size </dev/tty 2>/dev/null); then
+    if _has_tty && read -r _l _c < <(stty size </dev/tty 2>/dev/null); then
         printf '%s' "$_l"
     else
         printf '24'
@@ -277,7 +282,7 @@ _spinner_loop() {
 
 # Start the background spinner
 spinner_start() {
-    [[ -e /dev/tty ]] || return 0
+    _has_tty || return 0
     
     # Kill any existing spinner first
     spinner_stop 2>/dev/null || true
@@ -299,7 +304,9 @@ spinner_stop() {
     fi
     SPINNER_PID=""
     # Show cursor again
-    printf '\033[?25h' >/dev/tty 2>/dev/null || true
+    if _has_tty; then
+        printf '\033[?25h' >/dev/tty 2>/dev/null || true
+    fi
 }
 
 # Set spinner to active mode (fast spin)
@@ -332,7 +339,7 @@ spinner_cancelled() {
 HEADER_PINNED=0
 
 pin_header() {
-    [[ -t 1 ]] || return 0
+    _has_tty || return 0
     local rows
     rows=$(_term_lines)
     local pin_rows=${1:-$((SPINNER_ROW))}    # freeze rows 1..pin_rows
@@ -344,7 +351,7 @@ pin_header() {
 }
 
 unpin_header() {
-    [[ -t 1 ]] || return 0
+    _has_tty || return 0
     (( HEADER_PINNED )) || return 0
     local rows
     rows=$(_term_lines)
@@ -361,13 +368,17 @@ unpin_header() {
 draw_screen() {
     local title="${1:-}"
     unpin_header
-    # Clear kitty graphics protocol images before clearing screen
-    kitten icat --clear >/dev/tty 2>/dev/null || true
-    clear
-    print_groot_logo
-    [[ -n "$title" ]] && print_header "$title" || true
-    pin_header
-    spinner_idle
+    if _has_tty; then
+        # Clear kitty graphics protocol images before clearing screen
+        kitten icat --clear >/dev/tty 2>/dev/null || true
+        clear
+        print_groot_logo
+        [[ -n "$title" ]] && print_header "$title" || true
+        pin_header
+        spinner_idle
+    else
+        [[ -n "$title" ]] && print_header "$title" || true
+    fi
 }
 
 print_groot_logo() {
@@ -391,6 +402,16 @@ maybe_pause() {
     fi
     if [[ -t 0 && -t 1 ]]; then
         printf "\n${BOLD}${CYAN}Press Enter to continue...${RESET}"
+        read -r _ || true
+    fi
+}
+
+menu_pause() {
+    if [[ "$NO_PAUSE" -eq 1 ]]; then
+        return 0
+    fi
+    if [[ -t 0 && -t 1 ]]; then
+        printf "\n${BOLD}${CYAN}Press Enter to return to menu...${RESET}"
         read -r _ || true
     fi
 }
@@ -2184,11 +2205,40 @@ cmd_list() {
 cmd_dedupe() {
     load_config
     local apply=0
+    local mode="new"
+    local details=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --apply)
                 apply=1
                 shift
+                ;;
+            --new|--new-only|--inbox)
+                mode="new"
+                shift
+                ;;
+            --all)
+                mode="all"
+                shift
+                ;;
+            --details|--verbose|-v)
+                details=1
+                shift
+                ;;
+            --help|-h)
+                cat <<EOF
+Usage: $SCRIPT_NAME dedupe [--apply] [--new-only|--all] [--details]
+
+Default mode removes only duplicates from the inbox (new pool). It keeps
+current/old files intact and moves applied drops into wallctl trash.
+
+Options:
+  --apply      Move duplicate drops to wallctl trash
+  --new-only   Only drop duplicates from new (default)
+  --all        Dedupe across current, old, and new
+  --details    Show every duplicate group
+EOF
+                return 0
                 ;;
             *)
                 die "Unknown dedupe flag: $1"
@@ -2196,40 +2246,85 @@ cmd_dedupe() {
         esac
     done
 
+    mkdir -p "$TRASH_DIR"
     spinner_active
     local report
-    report=$(python3 - "$WALLPAPER_DIR_NEW" "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_OLD" <<'PY'
+    report=$(python3 - "$mode" "$WALLPAPER_DIR_CURRENT" "$WALLPAPER_DIR_OLD" "$WALLPAPER_DIR_NEW" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
 
+mode = sys.argv[1]
+pools = [
+    ("current", Path(sys.argv[2])),
+    ("old", Path(sys.argv[3])),
+    ("new", Path(sys.argv[4])),
+]
+media_exts = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4", ".webm"}
 pool_order = {"current": 0, "old": 1, "new": 2, "other": 9}
-paths = [Path(p) for p in sys.argv[1:]]
+
+def human_size(n):
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    size = float(n)
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def sort_key(row):
+    _digest, pool, path, _size = row
+    return (pool_order.get(pool, 9), path.name.lower(), str(path).lower())
+
 rows = []
-for p in paths:
-    pool = p.name
-    if not p.exists():
+for pool, root in pools:
+    if not root.exists():
         continue
-    for f in p.iterdir():
-        if f.is_file():
-            h = hashlib.sha256(f.read_bytes()).hexdigest()
-            rows.append((h, pool, str(f)))
+    for f in root.rglob("*"):
+        if not f.is_file() or f.suffix.lower() not in media_exts:
+            continue
+        try:
+            rows.append((file_hash(f), pool, f, f.stat().st_size))
+        except OSError:
+            continue
 
 groups = {}
-for h, pool, full in rows:
-    groups.setdefault(h, []).append((pool, full))
+for row in rows:
+    groups.setdefault(row[0], []).append(row)
 
-dup_groups = [g for g in groups.values() if len(g) > 1]
-dup_groups.sort(key=lambda g: (pool_order.get(g[0][0], 9), g[0][1]))
+drops_by_group = []
+for group in groups.values():
+    if len(group) < 2:
+        continue
+    group.sort(key=sort_key)
+    if mode == "new":
+        new_rows = [row for row in group if row[1] == "new"]
+        if not new_rows:
+            continue
+        non_new = [row for row in group if row[1] != "new"]
+        keep = non_new[0] if non_new else new_rows[0]
+        drops = [row for row in new_rows if row[2] != keep[2]]
+    else:
+        keep = group[0]
+        drops = [row for row in group[1:]]
+    if drops:
+        drops_by_group.append((keep, group, drops))
 
-print(f"GROUPS\t{len(dup_groups)}")
-for i, g in enumerate(dup_groups, 1):
-    g.sort(key=lambda t: (pool_order.get(t[0], 9), len(t[1]), t[1]))
-    keep = g[0]
-    print(f"GROUP\t{i}\t{len(g)}")
-    print(f"KEEP\t{keep[0]}\t{keep[1]}")
-    for item in g[1:]:
-        print(f"DROP\t{item[0]}\t{item[1]}")
+drop_count = sum(len(drops) for _keep, _group, drops in drops_by_group)
+drop_bytes = sum(row[3] for _keep, _group, drops in drops_by_group for row in drops)
+
+print(f"SUMMARY\t{mode}\t{len(rows)}\t{len(drops_by_group)}\t{drop_count}\t{drop_bytes}\t{human_size(drop_bytes)}")
+for i, (keep, group, drops) in enumerate(drops_by_group, 1):
+    print(f"GROUP\t{i}\t{len(group)}\t{len(drops)}")
+    print(f"KEEP\t{keep[1]}\t{keep[2]}")
+    for row in drops:
+        print(f"DROP\t{row[1]}\t{human_size(row[3])}\t{row[2]}")
 PY
 )
     spinner_idle
@@ -2237,32 +2332,65 @@ PY
 
     draw_screen "dedupe"
 
-    local groups=0 dropped=0
-    local line kind a b
+    local scanned=0 groups=0 planned=0 planned_bytes=0 planned_human="0 B"
+    local applied=0 failed=0 skipped=0 current_group=0
+    local line kind a b c d e f
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        IFS=$'\t' read -r kind a b <<< "$line"
+        IFS=$'\t' read -r kind a b c d e f <<< "$line"
         case "$kind" in
-            GROUPS)
-                groups="$a"
-                print_info "duplicate groups: $groups"
+            SUMMARY)
+                mode="$a"
+                scanned="$b"
+                groups="$c"
+                planned="$d"
+                planned_bytes="$e"
+                planned_human="$f"
+                print_info "mode: $([[ "$mode" == "new" ]] && printf 'new-only inbox cleanup' || printf 'all pools')"
+                print_info "scanned media files: $scanned"
+                print_info "duplicate groups with drops: $groups"
+                print_info "$([[ "$apply" == "1" ]] && printf 'will trash' || printf 'would trash'): $planned file(s), $planned_human"
                 ;;
             GROUP)
-                print_info "group $a (files: $b)"
+                current_group="$a"
+                if (( details == 1 )); then
+                    print_info "group $a (files: $b, drops: $c)"
+                fi
                 ;;
             KEEP)
-                printf "  keep: [%s] %s\n" "$a" "$b"
+                if (( details == 1 )); then
+                    printf "  keep: [%s] %s\n" "$a" "$b"
+                fi
                 ;;
             DROP)
                 if (( apply == 1 )); then
-                    if rm -f "$b"; then
-                        printf "  drop: [%s] %s\n" "$a" "$b"
-                        dropped=$((dropped + 1))
-                    else
-                        print_warn "failed to remove: $b"
+                    local drop_pool="$a"
+                    local drop_size="$b"
+                    local drop_path="$c"
+                    if [[ ! -f "$drop_path" ]]; then
+                        print_warn "missing before trash: $drop_path"
+                        skipped=$((skipped + 1))
+                        continue
                     fi
-                else
-                    printf "  drop: [%s] %s\n" "$a" "$b"
+                    local base trash_path n
+                    base=$(basename "$drop_path")
+                    trash_path="$TRASH_DIR/dedupe__${drop_pool}__${base}"
+                    n=1
+                    while [[ -e "$trash_path" ]]; do
+                        trash_path="$TRASH_DIR/dedupe__${drop_pool}__${n}__${base}"
+                        n=$((n + 1))
+                    done
+                    if mv "$drop_path" "$trash_path"; then
+                        if (( details == 1 )); then
+                            printf "  trash: [%s] %s (%s)\n" "$drop_pool" "$drop_path" "$drop_size"
+                        fi
+                        applied=$((applied + 1))
+                    else
+                        print_warn "failed to trash: $drop_path"
+                        failed=$((failed + 1))
+                    fi
+                elif (( details == 1 )); then
+                    printf "  drop: [%s] %s (%s)\n" "$a" "$c" "$b"
                 fi
                 ;;
         esac
@@ -2271,9 +2399,17 @@ PY
     if (( groups == 0 )); then
         print_success "no duplicates found"
     elif (( apply == 1 )); then
-        print_success "removed duplicate files: $dropped"
+        print_success "trashed duplicate files: $applied"
+        (( skipped > 0 )) && print_warn "skipped missing files: $skipped"
+        (( failed > 0 )) && print_warn "failed to trash: $failed"
+        print_info "review trash with: $SCRIPT_NAME trash --list"
+        print_info "empty trash with: $SCRIPT_NAME trash --purge"
     else
         print_info "dry-run only; use: $SCRIPT_NAME dedupe --apply"
+        print_info "show exact files with: $SCRIPT_NAME dedupe --details"
+        if [[ "$mode" == "new" ]]; then
+            print_info "include current/old cleanup with: $SCRIPT_NAME dedupe --all"
+        fi
     fi
 }
 
@@ -3994,7 +4130,23 @@ cmd_menu() {
                 cmd_archive
                 ;;
             5)
-                cmd_dedupe
+                local dedupe_choice=0
+                printf "\n"
+                if menu_select dedupe_choice \
+                    "preview inbox duplicates" \
+                    "apply inbox dedupe" \
+                    "preview all pools" \
+                    "apply all pools" \
+                    "details for inbox"; then
+                    case "$dedupe_choice" in
+                        1) cmd_dedupe ;;
+                        2) cmd_dedupe --apply ;;
+                        3) cmd_dedupe --all ;;
+                        4) cmd_dedupe --all --apply ;;
+                        5) cmd_dedupe --details ;;
+                    esac
+                    menu_pause
+                fi
                 ;;
             6)
                 local ss_choice=0
@@ -4063,7 +4215,8 @@ Commands:
                                 Move aging wallpapers to old pool
   status                        Show pool counts and runtime state
   list [new|current|old|all]    List files by pool
-  dedupe [--apply]              Find or remove exact duplicate files
+  dedupe [--apply] [--new-only|--all] [--details]
+                                Find duplicate media and soft-trash drops
   migrate [--dry-run] [--to-new|--to-current]
                                 Move loose wallpapers into a pool
   trash [--list|--purge]        View or empty the soft-delete trash

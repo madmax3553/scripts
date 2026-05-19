@@ -10,14 +10,15 @@
 #      ░    ░         ░ ░      ░ ░
 # Script: remote
 # Purpose: Remote server connection manager
-# Dependencies: ssh, sshfs (for mount), dialog or whiptail
+# Dependencies: ssh, sshfs (for mount), tmux (on remote for tmux mode), dialog or whiptail
 # Author: groot
-# Modified: 2026-04-04
+# Modified: 2026-05-19
 
 set -euo pipefail
 CONFIG_FILE="$HOME/.config/remotes"
 MOUNT_DIR="/mnt"
 TUI_ACTIVE=0
+REMOTE_TMUX_SESSION="${REMOTE_TMUX_SESSION:-remote}"
 
 # Clear screen on exit only when TUI was active (prevents dialog artifacts)
 cleanup_exit() {
@@ -94,6 +95,41 @@ spawn_terminal() {
     return 0
 }
 
+validate_tmux_session_name() {
+    local session="$1"
+
+    if [[ ! "$session" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+        echo "Invalid tmux session name: ${session:-<empty>}" >&2
+        echo "Use letters, numbers, dots, underscores, or hyphens." >&2
+        return 1
+    fi
+}
+
+tmux_remote_command() {
+    local session="$1"
+    local shell_cmd
+
+    validate_tmux_session_name "$session" || return 1
+
+    shell_cmd='command -v tmux >/dev/null 2>&1 || '
+    shell_cmd+='{ echo "tmux not found on remote host. Install tmux first." >&2; exit 127; }; '
+    shell_cmd+='case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *UTF-8*|*utf8*|*utf-8*) ;; *) export LANG=C.UTF-8; export LC_ALL=C.UTF-8; export LC_CTYPE=C.UTF-8 ;; esac; '
+    shell_cmd+='tmux -u set-environment -g LANG "$LANG" 2>/dev/null || true; '
+    shell_cmd+='tmux -u set-environment -g LC_CTYPE "${LC_CTYPE:-$LANG}" 2>/dev/null || true; '
+    shell_cmd+='[ -z "${LC_ALL:-}" ] || tmux -u set-environment -g LC_ALL "$LC_ALL" 2>/dev/null || true; '
+    shell_cmd+="exec tmux -u new-session -A -s \"$session\""
+
+    printf "exec \"\${SHELL:-/bin/sh}\" -lic '%s'" "$shell_cmd"
+}
+
+connect_tmux_session() {
+    local target="$1"
+    local remote_cmd
+
+    remote_cmd="$(tmux_remote_command "$REMOTE_TMUX_SESSION")" || return 1
+    ssh -tt "$target" "$remote_cmd"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TUI Functions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,16 +139,17 @@ tui_main_menu() {
     while :; do
         choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
             --title "Main Menu" \
-            --menu "Select an option:" 20 50 10 \
+            --menu "Select an option:" 21 56 10 \
             1 "Connect to remote" \
-            2 "Mount remote (SSHFS)" \
-            3 "Unmount remote" \
-            4 "Add new remote" \
-            5 "Edit remote" \
-            6 "Set default remote" \
-            7 "Delete remote" \
-            8 "Ad-hoc connection" \
-            9 "Exit" \
+            2 "Connect with tmux" \
+            3 "Mount remote (SSHFS)" \
+            4 "Unmount remote" \
+            5 "Add new remote" \
+            6 "Edit remote" \
+            7 "Set default remote" \
+            8 "Delete remote" \
+            9 "Ad-hoc connection" \
+            10 "Exit" \
             3>&1 1>&2 2>&3)
 
         exit_status=$?
@@ -122,14 +159,15 @@ tui_main_menu() {
         set +e
         case "$choice" in
             1) tui_connect ;;
-            2) tui_mount ;;
-            3) tui_unmount ;;
-            4) tui_add ;;
-            5) tui_edit ;;
-            6) tui_set_default ;;
-            7) tui_delete ;;
-            8) tui_adhoc ;;
-            9) break ;;
+            2) tui_connect_tmux ;;
+            3) tui_mount ;;
+            4) tui_unmount ;;
+            5) tui_add ;;
+            6) tui_edit ;;
+            7) tui_set_default ;;
+            8) tui_delete ;;
+            9) tui_adhoc ;;
+            10) break ;;
         esac
         set -e
     done
@@ -145,6 +183,37 @@ tui_build_remote_list() {
             printf "%s\n%s@%s (%s)%s\n", $1, $2, $3, $4, def
         }
     ' "$CONFIG_FILE"
+}
+
+tui_launch_ssh() {
+    local target="$1"
+    local proto="$2"
+    local remote_cmd
+
+    case "$proto" in
+        ssh)
+            if spawn_terminal "SSH: ${target}" ssh "$target"; then
+                "$DIALOG" --msgbox "SSH session launched in new terminal:\n${target}" 8 50
+            else
+                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
+            fi
+            ;;
+        tmux)
+            if ! validate_tmux_session_name "$REMOTE_TMUX_SESSION"; then
+                "$DIALOG" --msgbox "Invalid REMOTE_TMUX_SESSION:\n${REMOTE_TMUX_SESSION}" 8 56
+                return
+            fi
+
+            remote_cmd="$(tmux_remote_command "$REMOTE_TMUX_SESSION")"
+            if spawn_terminal "SSH tmux: ${target}" ssh -tt "$target" "$remote_cmd"; then
+                "$DIALOG" --msgbox \
+                    "Reconnectable tmux session launched:\n${target}\n\nSession: ${REMOTE_TMUX_SESSION}" \
+                    10 60
+            else
+                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
+            fi
+            ;;
+    esac
 }
 
 tui_connect() {
@@ -170,12 +239,8 @@ tui_connect() {
     local target="${user}@${host}"
 
     case "$proto" in
-        ssh)
-            if spawn_terminal "SSH: ${target}" ssh "$target"; then
-                "$DIALOG" --msgbox "SSH session launched in new terminal:\n${target}" 8 50
-            else
-                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
-            fi
+        ssh|tmux)
+            tui_launch_ssh "$target" "$proto"
             ;;
         vnc|garchyvnc)
             # VNC runs its own GUI window, run in background
@@ -186,6 +251,29 @@ tui_connect() {
             fi
             ;;
     esac
+}
+
+tui_connect_tmux() {
+    local items name user host proto is_default
+    mapfile -t items < <(tui_build_remote_list)
+
+    if [ ${#items[@]} -eq 0 ]; then
+        "$DIALOG" --msgbox "No remotes configured." 6 40
+        return
+    fi
+
+    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Connect with tmux" \
+        --menu "Select a remote:" 20 60 10 \
+        "${items[@]}" \
+        3>&1 1>&2 2>&3)
+
+    [ $? -ne 0 ] && return
+
+    entry="$(get_entry_by_name "$choice")"
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+
+    tui_launch_ssh "${user}@${host}" "tmux"
 }
 
 tui_add() {
@@ -220,8 +308,9 @@ tui_add() {
 
     proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
         --title "Protocol" \
-        --menu "Select protocol:" 12 40 3 \
+        --menu "Select protocol:" 13 48 4 \
         ssh "SSH terminal" \
+        tmux "SSH tmux session" \
         vnc "VNC (tunnel)" \
         garchyvnc "VNC with remote setup" \
         3>&1 1>&2 2>&3)
@@ -351,8 +440,9 @@ tui_edit() {
     new_proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
         --title "Protocol" \
         --default-item "$proto" \
-        --menu "Select protocol:" 12 40 3 \
+        --menu "Select protocol:" 13 48 4 \
         ssh "SSH terminal" \
+        tmux "SSH tmux session" \
         vnc "VNC (tunnel)" \
         garchyvnc "VNC with remote setup" \
         3>&1 1>&2 2>&3)
@@ -396,8 +486,9 @@ tui_adhoc() {
 
     proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
         --title "Protocol" \
-        --menu "Select protocol:" 12 40 3 \
+        --menu "Select protocol:" 13 48 4 \
         ssh "SSH terminal" \
+        tmux "SSH tmux session" \
         vnc "VNC (tunnel)" \
         garchyvnc "VNC with remote setup" \
         3>&1 1>&2 2>&3)
@@ -406,12 +497,8 @@ tui_adhoc() {
     local target="${user}@${host}"
 
     case "$proto" in
-        ssh)
-            if spawn_terminal "SSH: ${target}" ssh "$target"; then
-                "$DIALOG" --msgbox "SSH session launched in new terminal:\n${target}" 8 50
-            else
-                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
-            fi
+        ssh|tmux)
+            tui_launch_ssh "$target" "$proto"
             ;;
         vnc|garchyvnc)
             if connect_remote "$user" "$host" "$proto" 2>&1; then
@@ -508,6 +595,7 @@ connect_remote() {
     local target="${user}@${host}"
     local max_retries=3
     local retry_delay=2
+    local status=0
 
     printf "\033c"
     echo "Remote: $target (proto: $proto)"
@@ -615,10 +703,17 @@ connect_remote() {
 
     case "$proto" in
         ssh)
-            ssh "$target"
-            status=$?
+            ssh "$target" || status=$?
             if [ $status -ne 0 ]; then
                 echo "SSH connection failed for $target (exit $status)." >&2
+                return $status
+            fi
+            return 0
+            ;;
+        tmux)
+            connect_tmux_session "$target" || status=$?
+            if [ $status -ne 0 ]; then
+                echo "SSH tmux connection failed for $target (exit $status)." >&2
                 return $status
             fi
             return 0
@@ -812,11 +907,11 @@ add_entry() {
     host="$(trim "$host")"
 
     while :; do
-        read -rp "Protocol (ssh/vnc/garchyvnc): " proto
+        read -rp "Protocol (ssh/tmux/vnc/garchyvnc): " proto
         proto="$(trim "$proto")"
         case "$proto" in
-            ssh|vnc|garchyvnc) break ;;
-            *) echo "Please enter 'ssh', 'vnc', or 'garchyvnc'." >&2 ;;
+            ssh|tmux|vnc|garchyvnc) break ;;
+            *) echo "Please enter 'ssh', 'tmux', 'vnc', or 'garchyvnc'." >&2 ;;
         esac
     done
 
@@ -838,11 +933,11 @@ random_entry() {
     host="$(trim "$host")"
 
     while :; do
-        read -rp "Protocol (ssh/vnc/garchyvnc): " proto
+        read -rp "Protocol (ssh/tmux/vnc/garchyvnc): " proto
         proto="$(trim "$proto")"
         case "$proto" in
-            ssh|vnc|garchyvnc) break ;;
-            *) echo "Please enter 'ssh', 'vnc', or 'garchyvnc'." >&2 ;;
+            ssh|tmux|vnc|garchyvnc) break ;;
+            *) echo "Please enter 'ssh', 'tmux', 'vnc', or 'garchyvnc'." >&2 ;;
         esac
     done
 
@@ -865,11 +960,13 @@ CLI Mode:
   remote -r, --random Ad-hoc connection (not saved)
   remote -D, --delete <name>   Delete a remote
   remote -c, --connect <name>  Connect to a saved remote
+  remote -t, --tmux <name>     Connect through remote tmux session
   remote -m, --mount <name> [path]  Mount remote via SSHFS (home dir by default)
   remote -u, --unmount <name>  Unmount a mounted remote
   remote --mounts              List active SSHFS mounts
   remote -h, --help   Show this help
 
+Set REMOTE_TMUX_SESSION to choose the remote tmux session name (default: remote).
 SSHFS mounts are created under /mnt/<remote-name>.
 If dialog/whiptail is not available, falls back to CLI prompts.
 EOF
@@ -930,12 +1027,12 @@ edit_entry() {
     [ -z "$new_host" ] && new_host="$old_host"
 
     while :; do
-        read -rp "Protocol (ssh/vnc/garchyvnc) [$old_proto]: " new_proto
+        read -rp "Protocol (ssh/tmux/vnc/garchyvnc) [$old_proto]: " new_proto
         new_proto="$(trim "$new_proto")"
         [ -z "$new_proto" ] && new_proto="$old_proto"
         case "$new_proto" in
-            ssh|vnc|garchyvnc) break ;;
-            *) echo "Please enter 'ssh', 'vnc', or 'garchyvnc'." >&2 ;;
+            ssh|tmux|vnc|garchyvnc) break ;;
+            *) echo "Please enter 'ssh', 'tmux', 'vnc', or 'garchyvnc'." >&2 ;;
         esac
     done
 
@@ -968,21 +1065,21 @@ case "${1:-}" in
         add_entry
         ;;
     -e|--edit|edit)
-        if [ -z "$2" ]; then
+        if [ -z "${2:-}" ]; then
             echo "Missing name to edit." >&2
             exit 1
         fi
         edit_entry "$2"
         ;;
     -d|--default|default)
-        if [ -z "$2" ]; then
+        if [ -z "${2:-}" ]; then
             echo "Missing name for default." >&2
             exit 1
         fi
         set_default "$2"
         ;;
     -D|--delete|delete)
-        if [ -z "$2" ]; then
+        if [ -z "${2:-}" ]; then
             echo "Missing name to delete." >&2
             exit 1
         fi
@@ -1015,7 +1112,7 @@ case "${1:-}" in
         random_entry
         ;;
     -c|--connect)
-        if [ -z "$2" ]; then
+        if [ -z "${2:-}" ]; then
             echo "Missing name for connect." >&2
             exit 1
         fi
@@ -1026,6 +1123,19 @@ case "${1:-}" in
         fi
         IFS=',' read -r name user host proto is_default <<<"$entry"
         connect_remote "$user" "$host" "$proto"
+        ;;
+    -t|--tmux|tmux)
+        if [ -z "${2:-}" ]; then
+            echo "Missing name for tmux connect." >&2
+            exit 1
+        fi
+        entry="$(get_entry_by_name "$2")"
+        if [ -z "$entry" ]; then
+            echo "No such remote: $2" >&2
+            exit 1
+        fi
+        IFS=',' read -r name user host proto is_default <<<"$entry"
+        connect_remote "$user" "$host" "tmux"
         ;;
     "" )
         # No arguments: launch TUI if available, else show help
