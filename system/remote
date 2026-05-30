@@ -19,6 +19,13 @@ CONFIG_FILE="$HOME/.config/remotes"
 MOUNT_DIR="/mnt"
 TUI_ACTIVE=0
 REMOTE_TMUX_SESSION="${REMOTE_TMUX_SESSION:-remote}"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+
+if [[ "$SCRIPT_PATH" != */* ]]; then
+    SCRIPT_PATH="$(command -v -- "$SCRIPT_PATH" 2>/dev/null || printf "%s" "$SCRIPT_PATH")"
+elif command -v realpath &>/dev/null; then
+    SCRIPT_PATH="$(realpath "$SCRIPT_PATH" 2>/dev/null || printf "%s" "$SCRIPT_PATH")"
+fi
 
 # Clear screen on exit only when TUI was active (prevents dialog artifacts)
 cleanup_exit() {
@@ -66,32 +73,40 @@ spawn_terminal() {
     local title="$1"
     shift
     local term
+    local cmd=()
     term="$(detect_terminal)"
 
     case "$term" in
         ghostty)
-            ghostty --title="$title" -e "$@" &
+            cmd=(ghostty --title="$title" -e "$@")
             ;;
         kitty)
-            kitty --title "$title" "$@" &
+            cmd=(kitty --title "$title" "$@")
             ;;
         alacritty)
-            alacritty --title "$title" -e "$@" &
+            cmd=(alacritty --title "$title" -e "$@")
             ;;
         foot)
-            foot --title "$title" "$@" &
+            cmd=(foot --title "$title" "$@")
             ;;
         wezterm)
-            wezterm start --cwd "$(pwd)" -- "$@" &
+            cmd=(wezterm start --cwd "$(pwd)" -- "$@")
             ;;
         xterm)
-            xterm -title "$title" -e "$@" &
+            cmd=(xterm -title "$title" -e "$@")
             ;;
         *)
             return 1
             ;;
     esac
-    disown
+
+    if command -v setsid &>/dev/null; then
+        setsid -f "${cmd[@]}" >/dev/null 2>&1 </dev/null || return 1
+    else
+        nohup "${cmd[@]}" >/dev/null 2>&1 </dev/null &
+        disown 2>/dev/null || true
+    fi
+
     return 0
 }
 
@@ -139,7 +154,7 @@ tui_main_menu() {
     while :; do
         choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
             --title "Main Menu" \
-            --menu "Select an option:" 21 56 10 \
+            --menu "Select an option:" 22 60 11 \
             1 "Connect to remote" \
             2 "Connect with tmux" \
             3 "Mount remote (SSHFS)" \
@@ -149,7 +164,8 @@ tui_main_menu() {
             7 "Set default remote" \
             8 "Delete remote" \
             9 "Ad-hoc connection" \
-            10 "Exit" \
+            10 "Open remotes / close" \
+            11 "Exit" \
             3>&1 1>&2 2>&3)
 
         exit_status=$?
@@ -167,7 +183,8 @@ tui_main_menu() {
             7) tui_set_default ;;
             8) tui_delete ;;
             9) tui_adhoc ;;
-            10) break ;;
+            10) tui_active_remotes ;;
+            11) break ;;
         esac
         set -e
     done
@@ -193,49 +210,34 @@ tui_launch_ssh() {
     case "$proto" in
         ssh)
             if spawn_terminal "SSH: ${target}" ssh "$target"; then
-                "$DIALOG" --msgbox "SSH session launched in new terminal:\n${target}" 8 50
+                return 0
             else
                 "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
+                return 1
             fi
             ;;
         tmux)
             if ! validate_tmux_session_name "$REMOTE_TMUX_SESSION"; then
                 "$DIALOG" --msgbox "Invalid REMOTE_TMUX_SESSION:\n${REMOTE_TMUX_SESSION}" 8 56
-                return
+                return 1
             fi
 
             remote_cmd="$(tmux_remote_command "$REMOTE_TMUX_SESSION")"
             if spawn_terminal "SSH tmux: ${target}" ssh -tt "$target" "$remote_cmd"; then
-                "$DIALOG" --msgbox \
-                    "Reconnectable tmux session launched:\n${target}\n\nSession: ${REMOTE_TMUX_SESSION}" \
-                    10 60
+                return 0
             else
                 "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
+                return 1
             fi
             ;;
     esac
 }
 
-tui_connect() {
-    local items name user host proto is_default
-    mapfile -t items < <(tui_build_remote_list)
-
-    if [ ${#items[@]} -eq 0 ]; then
-        "$DIALOG" --msgbox "No remotes configured." 6 40
-        return
-    fi
-
-    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
-        --title "Connect to Remote" \
-        --menu "Select a remote:" 20 60 10 \
-        "${items[@]}" \
-        3>&1 1>&2 2>&3)
-
-    [ $? -ne 0 ] && return
-
-    entry="$(get_entry_by_name "$choice")"
-    IFS=',' read -r name user host proto is_default <<<"$entry"
-
+tui_launch_saved_remote() {
+    local name="$1"
+    local user="$2"
+    local host="$3"
+    local proto="$4"
     local target="${user}@${host}"
 
     case "$proto" in
@@ -243,37 +245,66 @@ tui_connect() {
             tui_launch_ssh "$target" "$proto"
             ;;
         vnc|garchyvnc)
-            # VNC runs its own GUI window, run in background
-            if connect_remote "$user" "$host" "$proto" 2>&1; then
-                "$DIALOG" --msgbox "VNC session launched for ${target}." 7 50
+            if spawn_terminal "Remote ${proto}: ${target}" "$SCRIPT_PATH" --connect "$name"; then
+                return 0
             else
-                "$DIALOG" --msgbox "VNC connection failed for ${target}." 7 50
+                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn ${proto} in new window." 8 56
+                return 1
             fi
             ;;
     esac
 }
 
+tui_connect() {
+    local items name user host proto is_default
+
+    while :; do
+        mapfile -t items < <(tui_build_remote_list)
+
+        if [ ${#items[@]} -eq 0 ]; then
+            "$DIALOG" --msgbox "No remotes configured." 6 40
+            return
+        fi
+
+        choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+            --title "Connect to Remote" \
+            --menu "Select a remote to launch (Cancel returns):" 20 68 10 \
+            "${items[@]}" \
+            3>&1 1>&2 2>&3)
+
+        [ $? -ne 0 ] && return
+
+        entry="$(get_entry_by_name "$choice")"
+        IFS=',' read -r name user host proto is_default <<<"$entry"
+
+        tui_launch_saved_remote "$name" "$user" "$host" "$proto"
+    done
+}
+
 tui_connect_tmux() {
     local items name user host proto is_default
-    mapfile -t items < <(tui_build_remote_list)
 
-    if [ ${#items[@]} -eq 0 ]; then
-        "$DIALOG" --msgbox "No remotes configured." 6 40
-        return
-    fi
+    while :; do
+        mapfile -t items < <(tui_build_remote_list)
 
-    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
-        --title "Connect with tmux" \
-        --menu "Select a remote:" 20 60 10 \
-        "${items[@]}" \
-        3>&1 1>&2 2>&3)
+        if [ ${#items[@]} -eq 0 ]; then
+            "$DIALOG" --msgbox "No remotes configured." 6 40
+            return
+        fi
 
-    [ $? -ne 0 ] && return
+        choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+            --title "Connect with tmux" \
+            --menu "Select a remote to launch (Cancel returns):" 20 68 10 \
+            "${items[@]}" \
+            3>&1 1>&2 2>&3)
 
-    entry="$(get_entry_by_name "$choice")"
-    IFS=',' read -r name user host proto is_default <<<"$entry"
+        [ $? -ne 0 ] && return
 
-    tui_launch_ssh "${user}@${host}" "tmux"
+        entry="$(get_entry_by_name "$choice")"
+        IFS=',' read -r name user host proto is_default <<<"$entry"
+
+        tui_launch_ssh "${user}@${host}" "tmux"
+    done
 }
 
 tui_add() {
@@ -501,10 +532,11 @@ tui_adhoc() {
             tui_launch_ssh "$target" "$proto"
             ;;
         vnc|garchyvnc)
-            if connect_remote "$user" "$host" "$proto" 2>&1; then
-                "$DIALOG" --msgbox "VNC session launched for ${target}." 7 50
+            if spawn_terminal "Remote ${proto}: ${target}" "$SCRIPT_PATH" --adhoc-connect "$user" "$host" "$proto"; then
+                return 0
             else
-                "$DIALOG" --msgbox "VNC connection failed for ${target}." 7 50
+                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn ${proto} in new window." 8 56
+                return 1
             fi
             ;;
     esac
@@ -581,6 +613,63 @@ tui_unmount() {
         "$DIALOG" --msgbox "Unmount successful:\n\n${output}" 10 60
     else
         "$DIALOG" --msgbox "Unmount failed:\n\n${output}" 10 60
+    fi
+}
+
+tui_active_remotes() {
+    local records=()
+    local menu_items=()
+    local record kind name target pid detail choice output summary
+    local index=1
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] && records+=("$record")
+    done < <(list_active_records)
+
+    if [ ${#records[@]} -eq 0 ]; then
+        "$DIALOG" --msgbox "No active remote connections or SSHFS mounts." 6 56
+        return
+    fi
+
+    menu_items+=(all "Close all listed remotes")
+    for record in "${records[@]}"; do
+        IFS=$'\t' read -r kind name target pid detail <<<"$record"
+        summary="$(active_record_summary "$kind" "$name" "$target" "$pid" "$detail")"
+        menu_items+=("$index" "$(shorten "$summary" 72)")
+        index=$((index + 1))
+    done
+
+    choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+        --title "Open Remotes" \
+        --menu "Select a remote to close:" 22 82 12 \
+        "${menu_items[@]}" \
+        3>&1 1>&2 2>&3)
+
+    [ $? -ne 0 ] && return
+
+    if [[ "$choice" == "all" ]]; then
+        "$DIALOG" --yesno "Close all listed remote connections and mounts?" 7 58
+        [ $? -ne 0 ] && return
+
+        if output=$(close_active_remotes all 2>&1); then
+            "$DIALOG" --msgbox "Close complete:\n\n${output}" 14 76
+        else
+            "$DIALOG" --msgbox "Close finished with errors:\n\n${output}" 14 76
+        fi
+        return
+    fi
+
+    record="${records[$((choice - 1))]}"
+    IFS=$'\t' read -r kind name target pid detail <<<"$record"
+    summary="$(active_record_summary "$kind" "$name" "$target" "$pid" "$detail")"
+
+    "$DIALOG" --yesno "Close this remote?\n\n${summary}" 9 76
+    [ $? -ne 0 ] && return
+
+    if output=$(close_active_record "$record" 2>&1); then
+        "$DIALOG" --msgbox "Closed:\n\n${output}" 12 76
+    else
+        "$DIALOG" --msgbox "Close failed:\n\n${output}" 12 76
     fi
 }
 
@@ -826,6 +915,235 @@ list_mounts() {
     fi
 }
 
+configured_remote_records() {
+    awk -F',' '
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+            if ($1 != "" && $2 != "" && $3 != "") {
+                printf "%s\t%s@%s\t%s\n", $1, $2, $3, $4
+            }
+        }
+    ' "$CONFIG_FILE"
+}
+
+shorten() {
+    local value="$1"
+    local max="${2:-80}"
+
+    if ((${#value} > max)); then
+        printf "%s..." "${value:0:max-3}"
+    else
+        printf "%s" "$value"
+    fi
+}
+
+active_record_summary() {
+    local kind="$1"
+    local name="$2"
+    local target="$3"
+    local pid="$4"
+    local detail="$5"
+    local label
+
+    case "$kind" in
+        mount) label="SSHFS mount" ;;
+        tmux) label="tmux SSH" ;;
+        vnc-tunnel) label="VNC tunnel" ;;
+        ssh) label="SSH" ;;
+        *) label="$kind" ;;
+    esac
+
+    if [[ "$pid" == "-" ]]; then
+        printf "%s: %s -> %s (%s)" "$label" "$name" "$target" "$detail"
+    else
+        printf "%s: %s -> %s (PID %s)" "$label" "$name" "$target" "$pid"
+    fi
+}
+
+classify_ssh_process() {
+    local args="$1"
+
+    if [[ "$args" == *"-L 5900:localhost:5900"* || "$args" == *"-L5900:localhost:5900"* ]]; then
+        echo "vnc-tunnel"
+    elif [[ "$args" == *"tmux -u new-session -A -s"* ]]; then
+        echo "tmux"
+    else
+        echo "ssh"
+    fi
+}
+
+list_active_records() {
+    local dir name entry entry_name entry_user entry_host entry_proto entry_default
+    local mount_point target proto ps_output proc pid args cmd kind seen_pids=" "
+
+    if [[ -d "$MOUNT_DIR" ]]; then
+        for dir in "$MOUNT_DIR"/*/; do
+            [[ -d "$dir" ]] || continue
+            dir="${dir%/}"
+            name="$(basename "$dir")"
+            mount_point="${MOUNT_DIR}/${name}"
+
+            if mountpoint -q "$mount_point" 2>/dev/null; then
+                target="-"
+                entry="$(get_entry_by_name "$name")"
+                if [[ -n "$entry" ]]; then
+                    IFS=',' read -r entry_name entry_user entry_host entry_proto entry_default <<<"$entry"
+                    target="${entry_user}@${entry_host}"
+                fi
+                printf "mount\t%s\t%s\t-\t%s\n" "$name" "$target" "$mount_point"
+            fi
+        done
+    fi
+
+    ps_output="$(ps -eo pid=,args= 2>/dev/null || true)"
+    [[ -n "$ps_output" ]] || return 0
+
+    while IFS=$'\t' read -r name target proto; do
+        [[ -n "$name" && -n "$target" ]] || continue
+
+        while IFS= read -r proc; do
+            pid=""
+            args=""
+            read -r pid args <<<"$proc"
+            [[ -n "$pid" && -n "$args" ]] || continue
+            [[ "$pid" == "$$" ]] && continue
+            [[ "$seen_pids" == *" $pid "* ]] && continue
+
+            cmd="${args%% *}"
+            cmd="${cmd##*/}"
+            [[ "$cmd" == "ssh" ]] || continue
+
+            if [[ " $args " != *" $target "* && " $args " != *" $target:"* ]]; then
+                continue
+            fi
+
+            # sshfs owns its mount lifecycle; show and close it through mount records.
+            [[ "$args" == *" -s sftp"* ]] && continue
+
+            kind="$(classify_ssh_process "$args")"
+            printf "%s\t%s\t%s\t%s\t%s\n" "$kind" "$name" "$target" "$pid" "$args"
+            seen_pids="${seen_pids}${pid} "
+        done <<<"$ps_output"
+    done < <(configured_remote_records)
+}
+
+list_active_remotes() {
+    local found=0
+    local record kind name target pid detail
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        if [[ $found -eq 0 ]]; then
+            printf "%-12s %-18s %-28s %-8s %s\n" "TYPE" "NAME" "TARGET" "PID" "DETAIL"
+        fi
+        found=1
+        IFS=$'\t' read -r kind name target pid detail <<<"$record"
+        printf "%-12s %-18s %-28s %-8s %s\n" \
+            "$kind" "$name" "$target" "$pid" "$(shorten "$detail" 90)"
+    done < <(list_active_records)
+
+    if [[ $found -eq 0 ]]; then
+        echo "No active remote connections or SSHFS mounts."
+    fi
+}
+
+active_record_matches() {
+    local selector="$1"
+    local kind="$2"
+    local name="$3"
+    local target="$4"
+    local pid="$5"
+
+    [[ "$selector" == "all" || "$selector" == "$name" || "$selector" == "$target" || "$selector" == "$pid" || "$selector" == "$kind:$pid" ]]
+}
+
+close_pid() {
+    local pid="$1"
+    local label="$2"
+    local display="$label"
+
+    if [[ ! "$pid" =~ ^[0-9]+$ ]]; then
+        echo "Invalid PID: $pid" >&2
+        return 1
+    fi
+
+    [[ "$display" == *"(PID $pid)"* ]] || display="${display} (PID $pid)"
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "Already closed: $display"
+        return 0
+    fi
+
+    echo "Closing $display ..."
+    if ! kill "$pid" 2>/dev/null; then
+        echo "Failed to close $display" >&2
+        return 1
+    fi
+
+    sleep 0.2
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Sent close signal to $display."
+    else
+        echo "Closed $display."
+    fi
+}
+
+close_active_record() {
+    local record="$1"
+    local kind name target pid detail label
+
+    IFS=$'\t' read -r kind name target pid detail <<<"$record"
+
+    case "$kind" in
+        mount)
+            unmount_remote "$name"
+            ;;
+        ssh|tmux|vnc-tunnel)
+            label="$(active_record_summary "$kind" "$name" "$target" "$pid" "$detail")"
+            close_pid "$pid" "$label"
+            ;;
+        *)
+            echo "Unknown active remote type: $kind" >&2
+            return 1
+            ;;
+    esac
+}
+
+close_active_remotes() {
+    local selector="$1"
+    local records=()
+    local record kind name target pid detail
+    local closed=0
+    local failures=0
+
+    while IFS= read -r record; do
+        [[ -n "$record" ]] && records+=("$record")
+    done < <(list_active_records)
+
+    for record in "${records[@]}"; do
+        IFS=$'\t' read -r kind name target pid detail <<<"$record"
+        if active_record_matches "$selector" "$kind" "$name" "$target" "$pid"; then
+            if close_active_record "$record"; then
+                closed=$((closed + 1))
+            else
+                failures=$((failures + 1))
+            fi
+        fi
+    done
+
+    if [[ $closed -eq 0 && $failures -eq 0 ]]; then
+        if [[ "$selector" == "all" ]]; then
+            echo "No active remote connections or SSHFS mounts."
+            return 0
+        fi
+        echo "No active remotes matched: $selector" >&2
+        return 1
+    fi
+
+    [[ $failures -eq 0 ]]
+}
+
 get_entry_by_name() {
     local name="$1"
     awk -F',' -v name="$name" '
@@ -964,6 +1282,8 @@ CLI Mode:
   remote -m, --mount <name> [path]  Mount remote via SSHFS (home dir by default)
   remote -u, --unmount <name>  Unmount a mounted remote
   remote --mounts              List active SSHFS mounts
+  remote -o, --open, --active  List open remote connections and SSHFS mounts
+  remote --close <name|pid|all>  Close open remote connections/mounts
   remote -h, --help   Show this help
 
 Set REMOTE_TMUX_SESSION to choose the remote tmux session name (default: remote).
@@ -1108,8 +1428,32 @@ case "${1:-}" in
     --mounts|mounts)
         list_mounts
         ;;
+    -o|--open|open|--active|active)
+        list_active_remotes
+        ;;
+    --close|close)
+        if [ -z "${2:-}" ]; then
+            echo "Missing selector to close (use name, PID, target, or all)." >&2
+            exit 1
+        fi
+        close_active_remotes "$2"
+        ;;
     -r|--random|random)
         random_entry
+        ;;
+    --adhoc-connect)
+        if [[ -z "${2:-}" || -z "${3:-}" || -z "${4:-}" ]]; then
+            echo "Missing user, host, or protocol for ad-hoc connect." >&2
+            exit 1
+        fi
+        case "$4" in
+            ssh|tmux|vnc|garchyvnc) ;;
+            *)
+                echo "Unknown protocol: $4" >&2
+                exit 1
+                ;;
+        esac
+        connect_remote "$2" "$3" "$4"
         ;;
     -c|--connect)
         if [ -z "${2:-}" ]; then
