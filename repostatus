@@ -10,101 +10,19 @@
 #      ░    ░         ░ ░      ░ ░
 # Script: repostatus
 # Purpose: Git repository status checker with TUI
-# Dependencies: git, dialog
+# Dependencies: git, fzf
 # Author: groot
-# Modified: 2026-01-24
+# Modified: 2026-05-30
 
 set -e
 
-# Dark theme for dialog
-export DIALOGRC=""
-export DIALOG_COLOR="on"
-
-# Create dark theme config
-DIALOG_THEME=$(mktemp)
-cat > "$DIALOG_THEME" << 'EOF'
-# Dark theme for dialog - minimal bright elements
-aspect = 0
-separate_widget = ""
-tab_len = 0
-visit_items = OFF
-use_shadow = ON
-use_colors = ON
-
-# Main screen - cyan text, terminal default background, NOT bold
-screen_color = (CYAN,DEFAULT,OFF)
-shadow_color = (DEFAULT,DEFAULT,OFF)
-
-# Dialog box - cyan text, default bg, NOT bold to avoid white
-dialog_color = (CYAN,DEFAULT,OFF)
-title_color = (CYAN,DEFAULT,ON)
-border_color = (CYAN,DEFAULT,OFF)
-border2_color = (CYAN,DEFAULT,OFF)
-
-# Buttons - inverted cyan when active
-button_active_color = (BLACK,CYAN,OFF)
-button_inactive_color = (CYAN,DEFAULT,OFF)
-button_key_active_color = (BLACK,CYAN,OFF)
-button_key_inactive_color = (CYAN,DEFAULT,OFF)
-button_label_active_color = (BLACK,CYAN,OFF)
-button_label_inactive_color = (CYAN,DEFAULT,OFF)
-
-# Input/search boxes
-inputbox_color = (CYAN,DEFAULT,OFF)
-inputbox_border_color = (CYAN,DEFAULT,OFF)
-inputbox_border2_color = (CYAN,DEFAULT,OFF)
-searchbox_color = (CYAN,DEFAULT,OFF)
-searchbox_title_color = (CYAN,DEFAULT,ON)
-searchbox_border_color = (CYAN,DEFAULT,OFF)
-searchbox_border2_color = (CYAN,DEFAULT,OFF)
-
-# Menu
-menubox_color = (CYAN,DEFAULT,OFF)
-menubox_border_color = (CYAN,DEFAULT,OFF)
-menubox_border2_color = (CYAN,DEFAULT,OFF)
-item_color = (CYAN,DEFAULT,OFF)
-item_selected_color = (BLACK,CYAN,OFF)
-
-# Tags (the numbers/letters in menu)
-tag_color = (CYAN,DEFAULT,OFF)
-tag_selected_color = (BLACK,CYAN,OFF)
-tag_key_color = (CYAN,DEFAULT,OFF)
-tag_key_selected_color = (BLACK,CYAN,OFF)
-
-# Checkboxes
-check_color = (CYAN,DEFAULT,OFF)
-check_selected_color = (BLACK,CYAN,OFF)
-
-# Scroll arrows
-uarrow_color = (CYAN,DEFAULT,OFF)
-darrow_color = (CYAN,DEFAULT,OFF)
-
-# Position indicator
-position_indicator_color = (CYAN,DEFAULT,OFF)
-
-# Help text
-itemhelp_color = (CYAN,DEFAULT,OFF)
-
-# Forms
-form_active_text_color = (BLACK,CYAN,OFF)
-form_text_color = (CYAN,DEFAULT,OFF)
-form_item_readonly_color = (CYAN,DEFAULT,OFF)
-
-# Gauge
-gauge_color = (CYAN,DEFAULT,OFF)
-EOF
-export DIALOGRC="$DIALOG_THEME"
-trap 'rm -f "$DIALOG_THEME"' EXIT
-
-# Colors for non-dialog output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+FIRST_ARG="${1:-}"
+SECOND_ARG="${2:-}"
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/repostatus"
 FETCH_LOG="$CACHE_DIR/fetch.log"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/repostatus"
+EXCLUDES_FILE="$CONFIG_DIR/excludes"
 mkdir -p "$CACHE_DIR"
 : > "$FETCH_LOG"
 
@@ -119,7 +37,7 @@ FETCH_FAILED="⛔"
 
 # When called from waybar with --json-summary, use shorter fetch interval
 # to avoid double-wait (waybar interval + script interval)
-if [ "$1" = "--json-summary" ]; then
+if [ "$FIRST_ARG" = "--json-summary" ]; then
     FETCH_INTERVAL=${REPOSTATUS_FETCH_INTERVAL:-60}
 else
     FETCH_INTERVAL=${REPOSTATUS_FETCH_INTERVAL:-300}
@@ -185,20 +103,7 @@ get_repo_status() {
     fi
 }
 
-get_status_icon() {
-    case "$1" in
-        clean)   echo -e "${GREEN}${CLEAN}${NC}" ;;
-        dirty)   echo -e "${YELLOW}${DIRTY}${NC}" ;;
-        ahead)   echo -e "${BLUE}${AHEAD}${NC}" ;;
-        behind)  echo -e "${YELLOW}${BEHIND}${NC}" ;;
-        diverged) echo -e "${RED}${DIVERGED}${NC}" ;;
-        uninitialized) echo -e "${NC}${UNINITIALIZED}${NC}" ;;
-        fetch_failed) echo -e "${RED}${FETCH_FAILED}${NC}" ;;
-        *)       echo -e "${NC}❓${NC}" ;;
-    esac
-}
-
-# Plain text icons for dialog (no ANSI colors)
+# Plain text icons for fzf display
 get_status_icon_plain() {
     case "$1" in
         clean)   echo "$CLEAN" ;;
@@ -229,11 +134,11 @@ get_worst_status() {
 get_parent_dir() {
     local path="$1"
     local parent=$(dirname "$path")
-    local parent_name=$(basename "$parent")
 
-    # Check if it's directly in home
-    if [ "$parent" = "$HOME" ]; then
-        echo "~/$parent_name"
+    if [ "$path" = "$HOME" ]; then
+        echo "~"
+    elif [ "$parent" = "$HOME" ]; then
+        echo "~"
     else
         # Get the first level directory under home
         local rel_path="${path#$HOME/}"
@@ -252,15 +157,18 @@ sync_repos() {
     local total=${#repos_to_sync[@]}
     local current=0
 
+    if [ "$total" -eq 0 ]; then
+        echo "No repositories selected."
+        return
+    fi
+
     for repo_path in "${repos_to_sync[@]}"; do
         cd "$repo_path"
         local repo_name=$(basename "$repo_path")
         local status=$(get_repo_status "$repo_path")
 
         current=$((current + 1))
-        percent=$((current * 100 / total))
-        echo "$percent" | dialog --title "Syncing Repositories" \
-            --gauge "Syncing: $repo_name" 8 60 "$percent"
+        printf '[%d/%d] Syncing %s\n' "$current" "$total" "$repo_name"
 
         case "$status" in
             behind)
@@ -283,37 +191,35 @@ sync_repos() {
     done
 
     # Build summary
-    local summary="━━━ Summary ━━━\n"
-    summary+="✓ Synced: $synced\n"
-    summary+="✓ Already up to date: $up_to_date\n"
+    printf '\nSummary\n'
+    printf '  Synced: %d\n' "$synced"
+    printf '  Already up to date: %d\n' "$up_to_date"
 
     # Only show problem details if there are any
     if [ ${#failed[@]} -gt 0 ] || [ ${#skipped_dirty[@]} -gt 0 ] || [ ${#skipped_diverged[@]} -gt 0 ]; then
-        summary+="\n━━━ Issues ━━━\n"
+        printf '\nIssues\n'
 
         if [ ${#failed[@]} -gt 0 ]; then
-            summary+="✗ Failed (${#failed[@]}):\n"
+            printf '  Failed (%d):\n' "${#failed[@]}"
             for repo in "${failed[@]}"; do
-                summary+="  • $repo\n"
+                printf '    - %s\n' "$repo"
             done
         fi
 
         if [ ${#skipped_dirty[@]} -gt 0 ]; then
-            summary+="⊘ Skipped - local changes (${#skipped_dirty[@]}):\n"
+            printf '  Skipped - local changes (%d):\n' "${#skipped_dirty[@]}"
             for repo in "${skipped_dirty[@]}"; do
-                summary+="  • $repo\n"
+                printf '    - %s\n' "$repo"
             done
         fi
 
         if [ ${#skipped_diverged[@]} -gt 0 ]; then
-            summary+="⊘ Skipped - diverged (${#skipped_diverged[@]}):\n"
+            printf '  Skipped - diverged (%d):\n' "${#skipped_diverged[@]}"
             for repo in "${skipped_diverged[@]}"; do
-                summary+="  • $repo\n"
+                printf '    - %s\n' "$repo"
             done
         fi
     fi
-
-    dialog --title "Sync Complete" --msgbox "$summary" 20 50
 }
 
 commit_repos() {
@@ -323,15 +229,18 @@ commit_repos() {
     local total=${#repos_to_commit[@]}
     local current=0
 
+    if [ "$total" -eq 0 ]; then
+        echo "No repositories selected."
+        return
+    fi
+
     for repo_path in "${repos_to_commit[@]}"; do
         cd "$repo_path"
         local repo_name=$(basename "$repo_path")
         local status=$(get_repo_status "$repo_path")
 
         current=$((current + 1))
-        percent=$((current * 100 / total))
-        echo "$percent" | dialog --title "Committing Repositories" \
-            --gauge "Committing: $repo_name" 8 60 "$percent"
+        printf '[%d/%d] Committing %s\n' "$current" "$total" "$repo_name"
 
         # Only commit dirty repos
         if [ "$status" = "dirty" ]; then
@@ -357,17 +266,15 @@ commit_repos() {
     done
 
     # Build summary
-    local summary="━━━ Commit Summary ━━━\n"
-    summary+="✓ Committed: $committed\n"
+    printf '\nCommit Summary\n'
+    printf '  Committed: %d\n' "$committed"
 
     if [ ${#failed[@]} -gt 0 ]; then
-        summary+="✗ Failed (${#failed[@]}):\n"
+        printf '  Failed (%d):\n' "${#failed[@]}"
         for repo in "${failed[@]}"; do
-            summary+="  • $repo\n"
+            printf '    - %s\n' "$repo"
         done
     fi
-
-    dialog --title "Commit Complete" --msgbox "$summary" 12 50
 }
 
 fetch_all_repos() {
@@ -378,11 +285,9 @@ fetch_all_repos() {
         repo_path="${paths[$i]}"
         repo_name=$(basename "$repo_path")
         current=$((current + 1))
-        percent=$((current * 100 / total))
 
         if [ "$JSON_MODE" -eq 0 ]; then
-            echo "$percent" | dialog --title "Fetching Remote Updates" \
-                --gauge "Fetching: $repo_name" 8 60 "$percent"
+            printf '[%d/%d] Fetching %s\n' "$current" "$total" "$repo_name" >&2
         fi
 
         set +e
@@ -401,17 +306,142 @@ fetch_all_repos() {
     done
 }
 
+normalize_exclude() {
+    local exclude="$1"
+
+    if [ "$exclude" = "~" ]; then
+        echo "$HOME"
+    elif [[ "$exclude" == "~/"* ]]; then
+        echo "$HOME/${exclude#~/}"
+    else
+        echo "$exclude"
+    fi
+}
+
+load_user_excludes() {
+    USER_EXCLUDE_DIRS=()
+
+    if [ ! -f "$EXCLUDES_FILE" ]; then
+        return
+    fi
+
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+
+        if [ -z "$line" ] || [[ "$line" == \#* ]]; then
+            continue
+        fi
+
+        USER_EXCLUDE_DIRS+=("$(normalize_exclude "$line")")
+    done < "$EXCLUDES_FILE"
+}
+
+exclude_exists() {
+    local exclude="$1"
+    local existing
+
+    for existing in "${EXCLUDE_DIRS[@]}" "${USER_EXCLUDE_DIRS[@]}"; do
+        if [ "$existing" = "$exclude" ]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+add_user_exclude() {
+    local exclude
+    exclude="$(normalize_exclude "$1")"
+    exclude="${exclude#"${exclude%%[![:space:]]*}"}"
+    exclude="${exclude%"${exclude##*[![:space:]]}"}"
+
+    if [ -z "$exclude" ]; then
+        return 1
+    fi
+
+    if exclude_exists "$exclude"; then
+        return 2
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' "$exclude" >> "$EXCLUDES_FILE"
+    USER_EXCLUDE_DIRS+=("$exclude")
+}
+
+remove_user_exclude() {
+    local remove_index="$1"
+    local new_excludes=()
+    local i
+
+    mkdir -p "$CONFIG_DIR"
+    : > "$EXCLUDES_FILE"
+
+    for i in "${!USER_EXCLUDE_DIRS[@]}"; do
+        if [ "$i" -ne "$remove_index" ]; then
+            printf '%s\n' "${USER_EXCLUDE_DIRS[$i]}" >> "$EXCLUDES_FILE"
+            new_excludes+=("${USER_EXCLUDE_DIRS[$i]}")
+        fi
+    done
+
+    USER_EXCLUDE_DIRS=("${new_excludes[@]}")
+}
+
+build_find_args() {
+    FIND_ARGS=("$HOME")
+
+    local exclude
+    for exclude in "${EXCLUDE_DIRS[@]}" "${USER_EXCLUDE_DIRS[@]}"; do
+        if [ -z "$exclude" ]; then
+            continue
+        fi
+
+        if [[ "$exclude" = /* ]]; then
+            FIND_ARGS+=(-path "$exclude" -prune -o)
+        else
+            FIND_ARGS+=(-path "*/$exclude" -prune -o)
+        fi
+    done
+
+    FIND_ARGS+=(-name ".git" -type d -prune -print0)
+}
+
+is_valid_git_repo() {
+    local repo_dir="$1"
+    local repo_real
+    local top_level
+    local top_real
+
+    top_level=$(git -C "$repo_dir" rev-parse --show-toplevel 2>/dev/null) || return 1
+    repo_real=$(cd "$repo_dir" && pwd -P)
+    top_real=$(cd "$top_level" && pwd -P)
+
+    [ "$repo_real" = "$top_real" ]
+}
+
+emit_empty_json_summary() {
+    echo '{"overall_status": "clean", "status_counts": {"clean": 0, "dirty": 0, "ahead": 0, "behind": 0, "diverged": 0, "uninitialized": 0, "fetch_failed": 0}, "repos": []}'
+}
+
 # Find all git repositories in home directory
 
 declare -a repos
 declare -a statuses
 declare -a paths
 declare -a fetch_error_msgs
+declare -a invalid_git_dirs
+declare -a invalid_repo_paths
+declare -a invalid_reasons
+declare -a USER_EXCLUDE_DIRS
+declare -a FIND_ARGS
 
 # Directories to exclude
 EXCLUDE_DIRS=(
     ".local"
     ".cache"
+    ".codex"
+    ".xmake"
     ".cargo"
     ".npm"
     ".nvm"
@@ -422,20 +452,17 @@ EXCLUDE_DIRS=(
     ".virtualenv"
 )
 
-# Build find exclusion string
-EXCLUDE_FIND=""
-for dir in "${EXCLUDE_DIRS[@]}"; do
-    EXCLUDE_FIND="$EXCLUDE_FIND -path '*/$dir' -prune -o"
-done
+load_user_excludes
+build_find_args
 
 # Check if we should run in JSON mode (will be handled after repo scan)
 JSON_MODE=0
-if [ "$1" = "--json-summary" ]; then
+if [ "$FIRST_ARG" = "--json-summary" ]; then
     JSON_MODE=1
 fi
 
 # Check for sync mode (handle separately from JSON)
-if [ "$1" = "--sync" ] || [ "$1" = "-s" ]; then
+if [ "$FIRST_ARG" = "--sync" ] || [ "$FIRST_ARG" = "-s" ]; then
     # Need to scan repos first
     :
 fi
@@ -443,47 +470,67 @@ fi
 # Check for commit mode
 COMMIT_MODE=0
 COMMIT_TARGET=""
-if [ "$1" = "--commit" ]; then
+if [ "$FIRST_ARG" = "--commit" ]; then
     COMMIT_MODE=1
-    COMMIT_TARGET="${2:-}"
+    COMMIT_TARGET="$SECOND_ARG"
 fi
 
-# Show initial scanning message (only if not in JSON mode)
+INTERACTIVE_MODE=1
+if [ "$JSON_MODE" -eq 1 ] || [ "$FIRST_ARG" = "--sync" ] || [ "$FIRST_ARG" = "-s" ] || [ "$COMMIT_MODE" -eq 1 ]; then
+    INTERACTIVE_MODE=0
+fi
+
+if [ "$INTERACTIVE_MODE" -eq 1 ] && ! command -v fzf >/dev/null 2>&1; then
+    echo "fzf is required for interactive mode." >&2
+    exit 1
+fi
+
 if [ "$JSON_MODE" -eq 0 ]; then
-    dialog --title "Repository Status" --infobox "Scanning for git repositories..." 5 45
+    printf 'Scanning for git repositories...\n' >&2
 fi
 
 # First pass: find all repos (fast)
 declare -a git_dirs
 while IFS= read -r -d '' git_dir; do
     git_dirs+=("$git_dir")
-done < <(eval "find ~ $EXCLUDE_FIND -name '.git' -type d -prune -print0 2>/dev/null" | head -z -n 50)
+done < <(find "${FIND_ARGS[@]}" 2>/dev/null | head -z -n 50)
 
+NO_VALID_REPOS=0
 total_repos=${#git_dirs[@]}
 
 if [ "$total_repos" -eq 0 ]; then
-    dialog --title "Repository Status" --msgbox "No git repositories found in home directory" 6 50
-    clear
-    exit 0
+    if [ "$JSON_MODE" -eq 1 ]; then
+        emit_empty_json_summary
+        exit 0
+    elif [ "$INTERACTIVE_MODE" -eq 0 ]; then
+        echo "No git repositories found in home directory."
+        exit 0
+    else
+        NO_VALID_REPOS=1
+    fi
 fi
 
 # Second pass: get status for each repo with progress
 current=0
 for git_dir in "${git_dirs[@]}"; do
     repo_dir=$(dirname "$git_dir")
+    repo_name=$(basename "$repo_dir")
+    current=$((current + 1))
+
+    if [ "$JSON_MODE" -eq 0 ]; then
+        printf '[%d/%d] Checking %s\n' "$current" "$total_repos" "$repo_name" >&2
+    fi
 
     # Skip if inside another git repo
     if [[ "$repo_dir" == *"/.git/"* ]]; then
         continue
     fi
 
-    repo_name=$(basename "$repo_dir")
-    current=$((current + 1))
-    percent=$((current * 100 / total_repos))
-
-    if [ "$JSON_MODE" -eq 0 ]; then
-        echo "$percent" | dialog --title "Scanning Repositories" \
-            --gauge "Checking: $repo_name" 8 60 "$percent"
+    if ! is_valid_git_repo "$repo_dir"; then
+        invalid_git_dirs+=("$git_dir")
+        invalid_repo_paths+=("$repo_dir")
+        invalid_reasons+=("git rev-parse --show-toplevel failed or did not match this directory")
+        continue
     fi
 
     status=$(get_repo_status "$repo_dir")
@@ -494,9 +541,15 @@ for git_dir in "${git_dirs[@]}"; do
 done
 
 if [ ${#repos[@]} -eq 0 ]; then
-    dialog --title "Repository Status" --msgbox "No git repositories found in home directory" 6 50
-    clear
-    exit 0
+    if [ "$JSON_MODE" -eq 1 ]; then
+        emit_empty_json_summary
+        exit 0
+    elif [ "$INTERACTIVE_MODE" -eq 0 ]; then
+        echo "No valid git repositories found in home directory."
+        exit 0
+    else
+        NO_VALID_REPOS=1
+    fi
 fi
 
 should_fetch=1
@@ -510,7 +563,7 @@ elif [ "$FORCE_FETCH" -eq 0 ] && [ "$FETCH_INTERVAL" -gt 0 ] && [ -f "$LAST_FETC
     fi
 fi
 
-if [ "$should_fetch" -eq 1 ]; then
+if [ "$NO_VALID_REPOS" -eq 0 ] && [ "$should_fetch" -eq 1 ]; then
     fetch_all_repos
     date +%s > "$LAST_FETCH_FILE"
 fi
@@ -559,7 +612,7 @@ if [ "$JSON_MODE" -eq 1 ]; then
 fi
 
 # Handle sync mode
-if [ "$1" = "--sync" ] || [ "$1" = "-s" ]; then
+if [ "$FIRST_ARG" = "--sync" ] || [ "$FIRST_ARG" = "-s" ]; then
     sync_repos "${paths[@]}"
     exit 0
 fi
@@ -595,178 +648,679 @@ if [ "$COMMIT_MODE" -eq 1 ]; then
     exit 0
 fi
 
-# Group repositories by parent directory
 declare -A dir_repos
 declare -A dir_statuses
 
 for i in "${!repos[@]}"; do
     parent=$(get_parent_dir "${paths[$i]}")
 
-    if [ -z "${dir_repos[$parent]}" ]; then
+    if [ -z "${dir_repos[$parent]:-}" ]; then
         dir_repos[$parent]="$i"
         dir_statuses[$parent]="${statuses[$i]}"
     else
         dir_repos[$parent]="${dir_repos[$parent]},$i"
-        # Update worst status
         current_worst="${dir_statuses[$parent]}"
         new_worst=$(get_worst_status "$current_worst" "${statuses[$i]}")
         dir_statuses[$parent]="$new_worst"
     fi
 done
 
-# Main loop with dialog
-show_main_menu() {
-    while true; do
-        # Build menu items for directories
-        local menu_items=()
-        local dir_list=()
-        for dir in "${!dir_repos[@]}"; do
-            dir_list+=("$dir")
-        done
+pause_for_user() {
+    printf '\nPress Enter to continue...'
+    read -r _ || true
+}
 
-        # Sort directories
-        IFS=$'\n' dir_list=($(sort <<<"${dir_list[*]}"))
-        unset IFS
+confirm_yes_no() {
+    local prompt="$1"
+    local answer
 
-        for i in "${!dir_list[@]}"; do
-            dir="${dir_list[$i]}"
-            icon=$(get_status_icon_plain "${dir_statuses[$dir]}")
-            repo_count=$(echo "${dir_repos[$dir]}" | tr ',' '\n' | wc -l)
-            menu_items+=("$((i+1))" "$icon $dir ($repo_count repos)")
-        done
-         menu_items+=("S" "🔄 Sync All Repos")
-         menu_items+=("C" "💾 Commit Dirty Repos")
-         menu_items+=("L" "📖 Legend")
+    printf '%s [y/N] ' "$prompt"
+    read -r answer || return 1
+    [[ "$answer" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
+}
 
-        local choice
-        choice=$(dialog --title "Git Repository Status" \
-            --menu "Select a directory to view repositories:" \
-            20 70 14 \
-            "${menu_items[@]}" \
-            2>&1 >/dev/tty) || {
-            clear
-            exit 0
-        }
+rescan() {
+    exec "$0"
+}
 
-         if [ "$choice" = "S" ]; then
-             sync_repos "${paths[@]}"
-             exec "$0"
-         fi
+run_and_rescan() {
+    clear
+    "$@"
+    pause_for_user
+    rescan
+}
 
-         if [ "$choice" = "C" ]; then
-             # Collect dirty repos for committing
-             declare -a dirty_repos
-             for i in "${!statuses[@]}"; do
-                 if [ "${statuses[$i]}" = "dirty" ]; then
-                     dirty_repos+=("${paths[$i]}")
-                 fi
-             done
-             
-             if [ ${#dirty_repos[@]} -eq 0 ]; then
-                 dialog --title "Info" --msgbox "No dirty repositories found." 6 40
-             else
-                 commit_repos "${dirty_repos[@]}"
-                 exec "$0"
-             fi
-             continue
-         fi
+open_repo() {
+    local repo_path="$1"
 
-         if [ "$choice" = "L" ]; then
-             show_legend
-             continue
-         fi
+    clear
+    cd "$repo_path" || exit 1
 
-        local selected_dir_idx=$((choice - 1))
-        local selected_dir="${dir_list[$selected_dir_idx]}"
+    if command -v lazygit >/dev/null 2>&1; then
+        lazygit
+    else
+        printf 'lazygit not found. Showing git status instead.\n\n'
+        git status --short --branch
+        pause_for_user
+    fi
 
-        show_repo_menu "$selected_dir"
-    done
+    rescan
 }
 
 show_legend() {
-    local legend_text="$CLEAN  Clean - No uncommitted changes, up to date with remote\n"
-    legend_text+="$DIRTY  Dirty - Has uncommitted changes or untracked files\n"
-    legend_text+="$AHEAD  Ahead - Local commits not pushed to remote\n"
-    legend_text+="$BEHIND  Behind - Remote has commits not pulled locally\n"
-    legend_text+="$DIVERGED  Diverged - Both local and remote have new commits\n"
-    legend_text+="$UNINITIALIZED  Uninitialized - No remote branches configured\n"
-    legend_text+="$FETCH_FAILED  Fetch Failed - Could not reach remote"
+    clear
+    cat <<EOF
+Status Legend
 
-    dialog --title "Status Legend" --msgbox "$legend_text" 13 60
+$CLEAN  Clean - No uncommitted changes, up to date with remote
+$DIRTY  Dirty - Has uncommitted changes or untracked files
+$AHEAD  Ahead - Local commits not pushed to remote
+$BEHIND  Behind - Remote has commits not pulled locally
+$DIVERGED  Diverged - Both local and remote have new commits
+$UNINITIALIZED  Uninitialized - No remote branches configured
+$FETCH_FAILED  Fetch Failed - Could not reach remote
+EOF
+    pause_for_user
 }
 
-show_repo_menu() {
-    local selected_dir="$1"
+build_main_items() {
+    local group
+    local group_indices
+    local group_list=()
+    local icon
+    local repo_count
+    local display
+
+    if [ "${#paths[@]}" -gt 0 ]; then
+        printf 'action\tsync_all\t🔄  Sync all repos\t-\t-\n'
+        printf 'action\tcommit_dirty\t💾  Commit all dirty repos\t-\t-\n'
+    fi
+
+    if [ "${#invalid_git_dirs[@]}" -gt 0 ]; then
+        printf 'action\tinvalid\t⚠  Invalid Git dirs (%d)\t-\t-\n' "${#invalid_git_dirs[@]}"
+    fi
+
+    printf 'action\texcludes\t🚫  Manage excludes\t-\t-\n'
+    printf 'action\tlegend\t📖  Legend\t-\t-\n'
+    printf 'action\trescan\t⟳  Rescan\t-\t-\n'
+
+    for group in "${!dir_repos[@]}"; do
+        group_list+=("$group")
+    done
+
+    if [ "${#group_list[@]}" -gt 0 ]; then
+        IFS=$'\n' group_list=($(sort <<<"${group_list[*]}"))
+        unset IFS
+    fi
+
+    for group in "${group_list[@]}"; do
+        IFS=',' read -ra group_indices <<< "${dir_repos[$group]}"
+        repo_count=${#group_indices[@]}
+        icon=$(get_status_icon_plain "${dir_statuses[$group]}")
+        display=$(printf '%s  %-24s %-14s %3d repos' \
+            "$icon" "$group" "[${dir_statuses[$group]}]" "$repo_count")
+        printf 'group\t%s\t%s\t%s\t%s\n' "$group" "$display" "$group" "${dir_statuses[$group]}"
+    done
+}
+
+fzf_main_preview() {
+    cat <<'EOF'
+bash -c '
+kind="$1"
+id="$2"
+path="$3"
+status="$4"
+
+if [ "$kind" = "repo" ]; then
+    printf "Path: %s\nStatus: %s\n\n" "$path" "$status"
+    git -C "$path" status --short --branch 2>/dev/null || true
+    printf "\nRecent commits:\n"
+    git -C "$path" log --oneline -5 2>/dev/null || true
+    exit 0
+fi
+
+if [ "$kind" = "group" ]; then
+    printf "Group: %s\nStatus: %s\n\n" "$id" "$status"
+    printf "Enter opens this group.\n"
+    printf "alt-s syncs this group.\n"
+    printf "alt-d commits dirty repos in this group.\n"
+    exit 0
+fi
+
+case "$id" in
+    sync_all) echo "Pull repositories that are behind. Dirty and diverged repos are skipped." ;;
+    commit_dirty) echo "Commit and push all repositories currently marked dirty." ;;
+    sync_group) echo "Pull repositories in this group that are behind. Dirty and diverged repos are skipped." ;;
+    commit_group) echo "Commit and push dirty repositories in this group." ;;
+    back) echo "Return to the group list." ;;
+    invalid) echo "Review .git directories that failed validation and were not counted as repos." ;;
+    excludes) echo "Add or remove user exclude rules stored in ~/.config/repostatus/excludes." ;;
+    legend) echo "Show status icon meanings." ;;
+    rescan) echo "Rerun repository discovery and status checks." ;;
+esac
+' _ {1} {2} {4} {5}
+EOF
+}
+
+show_main_menu() {
+    local header
+    local preview_cmd
+
+    header="enter: open group/select | alt-s: sync group | alt-a: sync all | alt-d: commit dirty group | alt-p: commit all dirty | alt-x: invalid | alt-e: excludes | ctrl-r: rescan"
+    preview_cmd=$(fzf_main_preview)
 
     while true; do
-        IFS=',' read -ra repo_indices <<< "${dir_repos[$selected_dir]}"
+        local result
+        if ! result=$(build_main_items | fzf \
+            --ansi \
+            --height=100% \
+            --layout=reverse \
+            --border \
+            --delimiter=$'\t' \
+            --with-nth=3 \
+            --expect=enter,alt-s,alt-a,alt-d,alt-p,alt-x,alt-e,ctrl-r \
+            --header="$header" \
+            --prompt="repos> " \
+            --preview="$preview_cmd" \
+            --preview-window="right,55%,border-left"); then
+            clear
+            exit 0
+        fi
 
-        local menu_items=()
-        for i in "${!repo_indices[@]}"; do
-            idx="${repo_indices[$i]}"
-            icon=$(get_status_icon_plain "${statuses[$idx]}")
-            local extra_info=""
-            if [ "${statuses[$idx]}" = "fetch_failed" ]; then
-                extra_info=" [fetch failed]"
-            fi
-            menu_items+=("$((i+1))" "$icon ${repos[$idx]}$extra_info")
-        done
-         menu_items+=("S" "🔄 Sync all in this directory")
-         menu_items+=("C" "💾 Commit all dirty in this directory")
-         menu_items+=("B" "⬅ Back to directory list")
+        local key
+        local line
+        key=$(printf '%s\n' "$result" | sed -n '1p')
+        line=$(printf '%s\n' "$result" | sed -n '2p')
 
-        local choice
-        choice=$(dialog --title "Repos in $selected_dir" \
-            --menu "Select a repository to open in lazygit:" \
-            20 70 12 \
-            "${menu_items[@]}" \
-            2>&1 >/dev/tty) || return
+        if [ -z "$line" ]; then
+            line="$key"
+            key="enter"
+        fi
 
-         if [ "$choice" = "B" ]; then
-             return
-         fi
+        local kind
+        local item_id
+        local display
+        local selected_path
+        local selected_status
+        IFS=$'\t' read -r kind item_id display selected_path selected_status <<< "$line"
 
-         if [ "$choice" = "S" ]; then
-             declare -a repos_to_sync_in_dir
-             for i in "${!repo_indices[@]}"; do
-                 repos_to_sync_in_dir+=("${paths[${repo_indices[$i]}]}")
-             done
-             sync_repos "${repos_to_sync_in_dir[@]}"
-             exec "$0"
-         fi
+        case "$key" in
+            ctrl-r)
+                rescan
+                ;;
+            alt-a)
+                run_and_rescan sync_repos "${paths[@]}"
+                ;;
+            alt-p)
+                run_commit_dirty_repos
+                ;;
+            alt-x)
+                show_invalid_git_dirs
+                ;;
+            alt-e)
+                show_excludes_menu
+                ;;
+            alt-s)
+                if [ "$kind" = "group" ]; then
+                    run_sync_group "$item_id"
+                fi
+                ;;
+            alt-d)
+                if [ "$kind" = "group" ]; then
+                    run_commit_group_dirty_repos "$item_id"
+                fi
+                ;;
+            enter|"")
+                handle_main_selection "$kind" "$item_id" "$selected_path" "$selected_status"
+                ;;
+        esac
+    done
+}
 
-         if [ "$choice" = "C" ]; then
-             declare -a repos_to_commit_in_dir
-             for i in "${!repo_indices[@]}"; do
-                 idx="${repo_indices[$i]}"
-                 if [ "${statuses[$idx]}" = "dirty" ]; then
-                     repos_to_commit_in_dir+=("${paths[$idx]}")
-                 fi
-             done
-             
-             if [ ${#repos_to_commit_in_dir[@]} -eq 0 ]; then
-                 dialog --title "Info" --msgbox "No dirty repositories in this directory." 6 50
-             else
-                 commit_repos "${repos_to_commit_in_dir[@]}"
-                 exec "$0"
-             fi
-             return
-         fi
+handle_main_selection() {
+    local kind="$1"
+    local item_id="$2"
+    local selected_path="$3"
+    local selected_status="$4"
 
-        local selected_repo_idx="${repo_indices[$((choice - 1))]}"
-        local selected_path="${paths[$selected_repo_idx]}"
+    if [ "$kind" = "group" ]; then
+        show_group_repos "$item_id"
+    fi
 
-        clear
-        cd "$selected_path"
+    case "$item_id" in
+        sync_all)
+            run_and_rescan sync_repos "${paths[@]}"
+            ;;
+        commit_dirty)
+            run_commit_dirty_repos
+            ;;
+        invalid)
+            show_invalid_git_dirs
+            ;;
+        excludes)
+            show_excludes_menu
+            ;;
+        legend)
+            show_legend
+            ;;
+        rescan)
+            rescan
+            ;;
+    esac
+}
 
-        if command -v lazygit &> /dev/null; then
-            lazygit
-            dialog --title "Repository Status" --infobox "Rescanning repositories..." 5 40
-            exec "$0"
-        else
-            dialog --title "Error" --msgbox "lazygit not found.\n\nInstall with: sudo pacman -S lazygit" 8 50
+build_group_paths() {
+    local group="$1"
+    local -a group_indices
+    local idx
+
+    group_paths=()
+    IFS=',' read -ra group_indices <<< "${dir_repos[$group]}"
+    for idx in "${group_indices[@]}"; do
+        group_paths+=("${paths[$idx]}")
+    done
+}
+
+build_group_dirty_paths() {
+    local group="$1"
+    local -a group_indices
+    local idx
+
+    group_dirty_paths=()
+    IFS=',' read -ra group_indices <<< "${dir_repos[$group]}"
+    for idx in "${group_indices[@]}"; do
+        if [ "${statuses[$idx]}" = "dirty" ]; then
+            group_dirty_paths+=("${paths[$idx]}")
         fi
     done
+}
+
+run_sync_group() {
+    local group="$1"
+    local group_paths=()
+
+    build_group_paths "$group"
+    run_and_rescan sync_repos "${group_paths[@]}"
+}
+
+run_commit_group_dirty_repos() {
+    local group="$1"
+    local group_dirty_paths=()
+
+    build_group_dirty_paths "$group"
+    clear
+
+    if [ "${#group_dirty_paths[@]}" -eq 0 ]; then
+        printf 'No dirty repositories found in %s.\n' "$group"
+        pause_for_user
+        return
+    fi
+
+    if confirm_yes_no "Commit and push ${#group_dirty_paths[@]} dirty repos in $group?"; then
+        commit_repos "${group_dirty_paths[@]}"
+        pause_for_user
+        rescan
+    fi
+}
+
+build_group_repo_items() {
+    local group="$1"
+    local -a group_indices
+    local idx
+    local icon
+    local display
+
+    printf 'action\tsync_group\t🔄  Sync repos in %s\t-\t-\n' "$group"
+    printf 'action\tcommit_group\t💾  Commit dirty repos in %s\t-\t-\n' "$group"
+    printf 'action\tback\t←  Back to groups\t-\t-\n'
+
+    IFS=',' read -ra group_indices <<< "${dir_repos[$group]}"
+    for idx in "${group_indices[@]}"; do
+        icon=$(get_status_icon_plain "${statuses[$idx]}")
+        display=$(printf '%s  %-30s %-14s %s' \
+            "$icon" "${repos[$idx]}" "[${statuses[$idx]}]" "${paths[$idx]}")
+        printf 'repo\t%s\t%s\t%s\t%s\n' "$idx" "$display" "${paths[$idx]}" "${statuses[$idx]}"
+    done
+}
+
+show_group_repos() {
+    local group="$1"
+    local header
+    local preview_cmd
+
+    header="enter: open/select | alt-s: sync selected | alt-a: sync group | alt-d: commit selected | alt-p: commit dirty group | ctrl-r: rescan | esc: groups"
+    preview_cmd=$(fzf_main_preview)
+
+    while true; do
+        local result
+        if ! result=$(build_group_repo_items "$group" | fzf \
+            --ansi \
+            --height=100% \
+            --layout=reverse \
+            --border \
+            --delimiter=$'\t' \
+            --with-nth=3 \
+            --expect=enter,alt-s,alt-a,alt-d,alt-p,ctrl-r \
+            --header="$header" \
+            --prompt="${group}> " \
+            --preview="$preview_cmd" \
+            --preview-window="right,55%,border-left"); then
+            return
+        fi
+
+        local key
+        local line
+        key=$(printf '%s\n' "$result" | sed -n '1p')
+        line=$(printf '%s\n' "$result" | sed -n '2p')
+
+        if [ -z "$line" ]; then
+            line="$key"
+            key="enter"
+        fi
+
+        local kind
+        local item_id
+        local display
+        local selected_path
+        local selected_status
+        IFS=$'\t' read -r kind item_id display selected_path selected_status <<< "$line"
+
+        case "$key" in
+            ctrl-r)
+                rescan
+                ;;
+            alt-a)
+                run_sync_group "$group"
+                ;;
+            alt-p)
+                run_commit_group_dirty_repos "$group"
+                ;;
+            alt-s)
+                if [ "$kind" = "repo" ]; then
+                    run_and_rescan sync_repos "$selected_path"
+                fi
+                ;;
+            alt-d)
+                if [ "$kind" = "repo" ]; then
+                    run_commit_selected_repo "$selected_path" "$selected_status"
+                fi
+                ;;
+            enter|"")
+                if [ "$kind" = "action" ] && [ "$item_id" = "back" ]; then
+                    return
+                fi
+                handle_group_selection "$group" "$kind" "$item_id" "$selected_path" "$selected_status"
+                ;;
+        esac
+    done
+}
+
+handle_group_selection() {
+    local group="$1"
+    local kind="$2"
+    local item_id="$3"
+    local selected_path="$4"
+    local selected_status="$5"
+
+    if [ "$kind" = "repo" ]; then
+        open_repo "$selected_path"
+    fi
+
+    case "$item_id" in
+        sync_group)
+            run_sync_group "$group"
+            ;;
+        commit_group)
+            run_commit_group_dirty_repos "$group"
+            ;;
+        back)
+            return
+            ;;
+    esac
+}
+
+run_commit_selected_repo() {
+    local repo_path="$1"
+    local status="$2"
+    local repo_name
+    repo_name=$(basename "$repo_path")
+
+    clear
+    if [ "$status" != "dirty" ]; then
+        printf '%s is not dirty.\n' "$repo_name"
+        pause_for_user
+        return
+    fi
+
+    if confirm_yes_no "Commit and push $repo_name?"; then
+        commit_repos "$repo_path"
+        pause_for_user
+        rescan
+    fi
+}
+
+run_commit_dirty_repos() {
+    local dirty_repos=()
+    local i
+
+    for i in "${!statuses[@]}"; do
+        if [ "${statuses[$i]}" = "dirty" ]; then
+            dirty_repos+=("${paths[$i]}")
+        fi
+    done
+
+    clear
+
+    if [ "${#dirty_repos[@]}" -eq 0 ]; then
+        echo "No dirty repositories found."
+        pause_for_user
+        return
+    fi
+
+    if confirm_yes_no "Commit and push ${#dirty_repos[@]} dirty repos?"; then
+        commit_repos "${dirty_repos[@]}"
+        pause_for_user
+        rescan
+    fi
+}
+
+build_exclude_items() {
+    local i
+
+    printf 'action\tadd\tAdd user exclude\n'
+    printf 'action\tbuiltin\tView built-in excludes\n'
+
+    for i in "${!USER_EXCLUDE_DIRS[@]}"; do
+        printf 'exclude\t%s\tRemove: %s\n' "$i" "${USER_EXCLUDE_DIRS[$i]}"
+    done
+}
+
+show_excludes_menu() {
+    while true; do
+        local result
+        if ! result=$(build_exclude_items | fzf \
+            --height=80% \
+            --layout=reverse \
+            --border \
+            --delimiter=$'\t' \
+            --with-nth=3 \
+            --prompt="excludes> " \
+            --header="enter: select | esc: back | file: $EXCLUDES_FILE"); then
+            return
+        fi
+
+        local kind
+        local item_id
+        local display
+        IFS=$'\t' read -r kind item_id display <<< "$result"
+
+        case "$kind:$item_id" in
+            action:add)
+                add_exclude_prompt
+                ;;
+            action:builtin)
+                show_builtin_excludes
+                ;;
+            exclude:*)
+                remove_exclude_prompt "$item_id"
+                ;;
+        esac
+    done
+}
+
+add_exclude_prompt() {
+    local new_exclude
+    local code
+
+    clear
+    printf 'Enter a directory name, absolute path, or ~/path to exclude.\n'
+    printf 'Exclude: '
+    read -r new_exclude || return
+
+    if add_user_exclude "$new_exclude"; then
+        printf 'Added exclude: %s\n' "$(normalize_exclude "$new_exclude")"
+        pause_for_user
+        rescan
+    else
+        code=$?
+        if [ "$code" -eq 2 ]; then
+            echo "That rule already exists or is covered as a built-in exclude."
+        else
+            echo "Exclude cannot be empty."
+        fi
+        pause_for_user
+    fi
+}
+
+show_builtin_excludes() {
+    local i
+
+    clear
+    printf 'Built-in excludes\n\n'
+    for i in "${!EXCLUDE_DIRS[@]}"; do
+        printf '  - %s\n' "${EXCLUDE_DIRS[$i]}"
+    done
+    printf '\nUser excludes file:\n%s\n' "$EXCLUDES_FILE"
+    pause_for_user
+}
+
+remove_exclude_prompt() {
+    local remove_index="$1"
+    local remove_value="${USER_EXCLUDE_DIRS[$remove_index]}"
+
+    clear
+    if confirm_yes_no "Remove user exclude '$remove_value'?"; then
+        remove_user_exclude "$remove_index"
+        echo "Removed exclude."
+        pause_for_user
+        rescan
+    fi
+}
+
+build_invalid_items() {
+    local i
+    local display
+
+    for i in "${!invalid_git_dirs[@]}"; do
+        display=$(printf '%-50s %s' "${invalid_repo_paths[$i]}" "${invalid_reasons[$i]}")
+        printf '%s\t%s\t%s\t%s\t%s\n' \
+            "$i" "$display" "${invalid_git_dirs[$i]}" "${invalid_repo_paths[$i]}" "${invalid_reasons[$i]}"
+    done
+}
+
+fzf_invalid_preview() {
+    cat <<'EOF'
+bash -c '
+git_dir="$1"
+repo_dir="$2"
+reason="$3"
+printf "Git dir: %s\nRepo dir: %s\nReason: %s\n\n" "$git_dir" "$repo_dir" "$reason"
+printf "Actions\n"
+printf "  enter  open shell here\n"
+printf "  alt-p  add exact path exclude\n"
+printf "  alt-n  add directory-name exclude\n"
+' _ {3} {4} {5}
+EOF
+}
+
+show_invalid_git_dirs() {
+    if [ "${#invalid_git_dirs[@]}" -eq 0 ]; then
+        clear
+        echo "No invalid .git directories were found during this scan."
+        pause_for_user
+        return
+    fi
+
+    local preview_cmd
+    preview_cmd=$(fzf_invalid_preview)
+
+    while true; do
+        local result
+        if ! result=$(build_invalid_items | fzf \
+            --height=90% \
+            --layout=reverse \
+            --border \
+            --delimiter=$'\t' \
+            --with-nth=2 \
+            --expect=enter,alt-p,alt-n \
+            --prompt="invalid> " \
+            --header="enter: shell | alt-p: exclude exact path | alt-n: exclude name | esc: back" \
+            --preview="$preview_cmd" \
+            --preview-window="right,55%,border-left"); then
+            return
+        fi
+
+        local key
+        local line
+        key=$(printf '%s\n' "$result" | sed -n '1p')
+        line=$(printf '%s\n' "$result" | sed -n '2p')
+
+        if [ -z "$line" ]; then
+            line="$key"
+            key="enter"
+        fi
+
+        local index
+        local display
+        local git_dir
+        local repo_dir
+        local reason
+        IFS=$'\t' read -r index display git_dir repo_dir reason <<< "$line"
+
+        case "$key" in
+            alt-p)
+                add_invalid_exclude_and_rescan "$repo_dir"
+                ;;
+            alt-n)
+                add_invalid_exclude_and_rescan "$(basename "$repo_dir")"
+                ;;
+            enter|"")
+                clear
+                cd "$repo_dir" || exit 1
+                exec "${SHELL:-/bin/bash}"
+                ;;
+        esac
+    done
+}
+
+add_invalid_exclude_and_rescan() {
+    local exclude="$1"
+    local code
+
+    clear
+    if add_user_exclude "$exclude"; then
+        printf 'Added exclude: %s\n' "$exclude"
+        pause_for_user
+        rescan
+    else
+        code=$?
+        if [ "$code" -eq 2 ]; then
+            echo "That path or name is already excluded."
+        else
+            echo "Exclude cannot be empty."
+        fi
+        pause_for_user
+    fi
 }
 
 show_main_menu

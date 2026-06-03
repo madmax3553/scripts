@@ -40,6 +40,7 @@ ERRORS_OCCURRED=0
 NPM_ERRORS=""
 PIP_ERRORS=""
 SYSTEM_ERRORS=""
+XMAKE_ERRORS=""
 NPM_REINSTALL_REQUIRED=0
 
 # Status helpers
@@ -226,6 +227,16 @@ update_rust() {
     fi
 }
 
+update_xmake() {
+    header "Phase: Xmake Package Repositories"
+    if command -v xmake >/dev/null 2>&1; then
+        run_with_spinner "Updating xmake package repositories..." xmake repo -u || {
+            XMAKE_ERRORS="${XMAKE_ERRORS}xmake repo -u failed\n"
+            ERRORS_OCCURRED=1
+        }
+    fi
+}
+
 update_flatpak() {
     header "Phase: Flatpak"
     if command -v flatpak >/dev/null 2>&1; then
@@ -307,6 +318,7 @@ main() {
 
     update_python
     update_rust
+    update_xmake
     update_flatpak
 
     header "Phase: Cleanup & Maintenance"
@@ -326,6 +338,7 @@ main() {
         printf '\n%b✗ Updates completed with issues:%b\n' "${BOLD}${RED}" "${RESET}"
         [[ -n "$NPM_ERRORS" ]] && printf '%bNPM:%b\n%b' "${BOLD}${YELLOW}" "${RESET}" "$NPM_ERRORS"
         [[ -n "$PIP_ERRORS" ]] && printf '%bPython/Pip:%b\n%b' "${BOLD}${YELLOW}" "${RESET}" "$PIP_ERRORS"
+        [[ -n "$XMAKE_ERRORS" ]] && printf '%bXmake:%b\n%b' "${BOLD}${YELLOW}" "${RESET}" "$XMAKE_ERRORS"
         [[ -n "$SYSTEM_ERRORS" ]] && printf '%bSystem:%b\n%b' "${BOLD}${YELLOW}" "${RESET}" "$SYSTEM_ERRORS"
         printf '\nCheck log: %s\n\n' "$LOG_FILE"
         [[ $ERRORS_OCCURRED -eq 1 ]] && exit 1

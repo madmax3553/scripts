@@ -222,15 +222,256 @@ carry_forward_tasks() {
 
     [[ ! -f "${yesterday_file}" ]] && return 0
 
-    # Grab unchecked tasks and append under the carry-over section
-    local tasks
-    tasks="$(grep '^- \[ \]' "${yesterday_file}" || true)"
-    [[ -z "${tasks}" ]] && return 0
+    local tasks_file new_tasks tmp
+    tasks_file="$(mktemp)"
+    new_tasks="$(mktemp)"
+    tmp="$(mktemp)"
 
-    # Insert after the carry-over heading if not already present
-    if ! grep -q "${tasks}" "${JOURNAL_FILE}"; then
-        sed -i "/^## Tasks Carried Over from Yesterday/a ${tasks}" "${JOURNAL_FILE}"
+    grep '^- \[ \]' "${yesterday_file}" > "${tasks_file}" || true
+    if [[ ! -s "${tasks_file}" ]]; then
+        rm -f "${tasks_file}" "${new_tasks}" "${tmp}"
+        return 0
     fi
+
+    local task
+    while IFS= read -r task; do
+        [[ -n "${task}" ]] || continue
+        if ! grep -Fqx -- "${task}" "${JOURNAL_FILE}"; then
+            printf '%s\n' "${task}" >> "${new_tasks}"
+        fi
+    done < "${tasks_file}"
+
+    if [[ ! -s "${new_tasks}" ]]; then
+        rm -f "${tasks_file}" "${new_tasks}" "${tmp}"
+        return 0
+    fi
+
+    awk -v tasks_file="${new_tasks}" '
+        { print }
+
+        /^## Tasks Carried Over from Yesterday$/ {
+            while ((getline task < tasks_file) > 0) {
+                print task
+            }
+            close(tasks_file)
+            inserted = 1
+        }
+
+        END {
+            if (!inserted) {
+                print ""
+                print "## Tasks Carried Over from Yesterday"
+                while ((getline task < tasks_file) > 0) {
+                    print task
+                }
+                close(tasks_file)
+            }
+        }
+    ' "${JOURNAL_FILE}" > "${tmp}"
+
+    mv "${tmp}" "${JOURNAL_FILE}"
+    rm -f "${tasks_file}" "${new_tasks}"
+}
+
+collect_priority_todos() {
+    [[ -f "${TODO_FILE}" ]] || return 0
+
+    awk '
+        /^## / {
+            section = substr($0, 4)
+            next
+        }
+
+        section == "High Priority" { priority = "High" }
+        section == "Medium Priority" { priority = "Medium" }
+        section == "Low Priority" { priority = "Low" }
+        section != "High Priority" && section != "Medium Priority" && section != "Low Priority" { priority = "" }
+
+        priority != "" && /^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\]/ {
+            item = $0
+            sub(/^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\][[:space:]]*/, "", item)
+            gsub(/\t/, " ", item)
+            print priority "\t" section "\t" NR "\t" item
+        }
+    ' "${TODO_FILE}"
+}
+
+todo_is_weekend_tagged() {
+    local item="${1,,}"
+
+    [[ "${item}" =~ (^|[[:space:]])#weekends?($|[[:space:][:punct:]]) ]] ||
+        [[ "${item}" =~ (^|[[:space:]])@weekends?($|[[:space:][:punct:]]) ]] ||
+        [[ "${item}" =~ \[weekends?\] ]] ||
+        [[ "${item}" =~ \(weekends?\) ]]
+}
+
+render_todo_rows() {
+    local rows_file="$1"
+    local mode="$2"
+    local limit="$3"
+    local count=0
+    local priority section line item
+
+    while IFS=$'\t' read -r priority section line item; do
+        [[ -n "${item}" ]] || continue
+
+        case "${mode}" in
+            high)
+                [[ "${priority}" == "High" ]] || continue
+                ;;
+            weekend)
+                todo_is_weekend_tagged "${item}" || continue
+                ;;
+        esac
+
+        printf -- '- [[../TODO|TODO.md]] `%s` %s\n' "${priority}" "${item}"
+        count=$((count + 1))
+        (( count >= limit )) && break
+    done < "${rows_file}"
+
+    if (( count == 0 )); then
+        case "${mode}" in
+            weekend)
+                echo "- No priority TODOs tagged yet. Add \`#weekend\` to pin one here."
+                ;;
+            *)
+                echo "- No matching priority TODOs."
+                ;;
+        esac
+    fi
+}
+
+render_longest_todo_rows() {
+    local rows_file="$1"
+    local limit="$2"
+    local scored
+    scored="$(mktemp)"
+
+    local priority section line item age sort_age age_label
+    while IFS=$'\t' read -r priority section line item; do
+        [[ -n "${item}" ]] || continue
+
+        age="$(todo_age_days "${item}" || true)"
+        if [[ "${age}" =~ ^[0-9]+$ ]]; then
+            sort_age="${age}"
+            age_label="${age}d"
+        else
+            sort_age=0
+            age_label="age unknown"
+        fi
+
+        printf '%08d\t%08d\t%s\t%s\t%s\n' "${sort_age}" "${line}" "${priority}" "${age_label}" "${item}" >> "${scored}"
+    done < "${rows_file}"
+
+    if [[ ! -s "${scored}" ]]; then
+        echo "- No priority TODOs."
+        rm -f "${scored}"
+        return 0
+    fi
+
+    sort -t $'\t' -k1,1nr -k2,2n "${scored}" | head -n "${limit}" | while IFS=$'\t' read -r sort_age line priority age_label item; do
+        printf -- '- [[../TODO|TODO.md]] `%s` %s *(%s)*\n' "${priority}" "${item}" "${age_label}"
+    done
+
+    rm -f "${scored}"
+}
+
+render_daily_todo_focus() {
+    echo "## TODO Focus"
+    echo ""
+    echo "*Auto-generated: $(date '+%Y-%m-%d %H:%M %Z'). Source: [[../TODO|TODO.md]]*"
+    echo ""
+
+    if [[ ! -f "${TODO_FILE}" ]]; then
+        echo "- TODO.md not found: ${TODO_FILE}"
+        echo ""
+        return 0
+    fi
+
+    local rows_file total
+    rows_file="$(mktemp)"
+    collect_priority_todos > "${rows_file}"
+    total="$(wc -l < "${rows_file}" | tr -d ' ')"
+
+    echo "- Open priority TODOs: ${total}"
+    echo "- Master list: [[../TODO|TODO.md]]"
+    echo ""
+    echo "### Most Important"
+    render_todo_rows "${rows_file}" high 3
+    echo ""
+    echo "### Weekend Tagged"
+    render_todo_rows "${rows_file}" weekend 3
+    echo ""
+    echo "### Longest Open"
+    render_longest_todo_rows "${rows_file}" 3
+    echo ""
+
+    rm -f "${rows_file}"
+}
+
+strip_daily_todo_focus() {
+    awk '
+        /^## TODO Focus$/ { skip=1; next }
+        /^## / && skip { skip=0 }
+        !skip { print }
+    ' "$1"
+}
+
+insert_daily_todo_focus() {
+    local source_file="$1"
+    local block_file="$2"
+
+    awk -v block_file="${block_file}" '
+        BEGIN {
+            while ((getline line < block_file) > 0) {
+                block = block line ORS
+            }
+            close(block_file)
+        }
+
+        in_carryover && /^[[:space:]]*$/ {
+            next
+        }
+
+        in_carryover && /^## / {
+            print ""
+            printf "%s", block
+            inserted = 1
+            in_carryover = 0
+        }
+
+        { print }
+
+        /^## Tasks Carried Over from Yesterday$/ {
+            in_carryover = 1
+        }
+
+        END {
+            if (!inserted) {
+                print ""
+                printf "%s", block
+            }
+        }
+    ' "${source_file}"
+}
+
+update_daily_todo_focus() {
+    [[ -f "${JOURNAL_FILE}" ]] || return 0
+
+    local stripped block tmp
+    stripped="$(mktemp)"
+    block="$(mktemp)"
+    tmp="$(mktemp)"
+
+    render_daily_todo_focus > "${block}"
+    strip_daily_todo_focus "${JOURNAL_FILE}" > "${stripped}"
+    insert_daily_todo_focus "${stripped}" "${block}" > "${tmp}"
+
+    trim_trailing_blank_lines "${tmp}"
+    mv "${tmp}" "${JOURNAL_FILE}"
+    rm -f "${stripped}" "${block}"
+
+    journal_log "updated daily todo focus: ${JOURNAL_FILE}"
 }
 
 git_repo_label() {
@@ -302,20 +543,78 @@ update_daily_git_commits() {
     journal_log "updated daily git commits: ${JOURNAL_FILE}"
 }
 
+strip_daily_git_commits() {
+    awk '
+        /^## Git Commits Today$/ { skip=1; next }
+        /^## / && skip { skip=0 }
+        !skip { print }
+    ' "$1"
+}
+
+trim_trailing_blank_lines() {
+    local file="$1"
+
+    while [[ -s "${file}" && -z "$(tail -n 1 "${file}")" ]]; do
+        sed -i '$d' "${file}"
+    done
+}
+
+journal_has_template() {
+    [[ -f "${JOURNAL_FILE}" ]] || return 1
+
+    if [[ "${IS_WEEKEND}" -eq 1 ]]; then
+        grep -Eq '^## This Weekend Intentions$' "${JOURNAL_FILE}" &&
+            grep -Eq '^## Next Week Prep$' "${JOURNAL_FILE}"
+    else
+        grep -Eq '^## Morning$' "${JOURNAL_FILE}" &&
+            grep -Eq '^## Tasks for Tomorrow$' "${JOURNAL_FILE}"
+    fi
+}
+
+create_today_template() {
+    journal_log "creating template: weekend=${IS_WEEKEND} file=${JOURNAL_FILE}"
+    if [[ "${IS_WEEKEND}" -eq 1 ]]; then
+        create_template_weekend
+    else
+        create_template_weekday
+    fi
+    carry_forward_tasks
+}
+
+recover_untemplated_journal() {
+    local recovered
+    recovered="$(mktemp)"
+
+    strip_daily_git_commits "${JOURNAL_FILE}" > "${recovered}"
+    trim_trailing_blank_lines "${recovered}"
+
+    create_today_template
+
+    if grep -q '[^[:space:]]' "${recovered}"; then
+        {
+            echo ""
+            echo "## Recovered Notes"
+            echo ""
+            cat "${recovered}"
+        } >> "${JOURNAL_FILE}"
+    fi
+
+    rm -f "${recovered}"
+    journal_log "recovered untemplated journal: ${JOURNAL_FILE}"
+}
+
 ensure_today() {
     if [[ ! -f "${JOURNAL_FILE}" ]]; then
-        journal_log "creating template: weekend=${IS_WEEKEND} file=${JOURNAL_FILE}"
-        if [[ "${IS_WEEKEND}" -eq 1 ]]; then
-            create_template_weekend
-        else
-            create_template_weekday
-        fi
-        carry_forward_tasks
+        create_today_template
         log_success "Created today's journal entry"
+    elif ! journal_has_template; then
+        recover_untemplated_journal
+        log_success "Restored today's journal template"
     else
         journal_log "journal exists: ${JOURNAL_FILE}"
     fi
 
+    update_daily_todo_focus
     update_daily_git_commits
 }
 
