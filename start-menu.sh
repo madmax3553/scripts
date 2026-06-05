@@ -20,6 +20,7 @@ entries=(
     "  Files"
     "  Terminal"
     "  Browser"
+    "󰚩  Ask Antigravity"
     "  Messages"
     "  Clipboard"
     "  Screenshot"
@@ -55,6 +56,9 @@ case "$chosen" in
         ;;
     *Browser)
         qutebrowser &
+        ;;
+    *Ask\ Antigravity)
+        "$HOME/.local/bin/ask-antigravity.sh" &
         ;;
     *Messages)
         ferdium &
