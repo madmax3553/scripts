@@ -227,7 +227,11 @@ carry_forward_tasks() {
     new_tasks="$(mktemp)"
     tmp="$(mktemp)"
 
-    grep '^- \[ \]' "${yesterday_file}" > "${tasks_file}" || true
+    awk '
+        /^## Tasks for Tomorrow$/ { in_tasks = 1; next }
+        in_tasks && /^## / { in_tasks = 0 }
+        in_tasks && /^- \[ \]/ { print }
+    ' "${yesterday_file}" > "${tasks_file}" || true
     if [[ ! -s "${tasks_file}" ]]; then
         rm -f "${tasks_file}" "${new_tasks}" "${tmp}"
         return 0
@@ -607,6 +611,8 @@ ensure_today() {
     if [[ ! -f "${JOURNAL_FILE}" ]]; then
         create_today_template
         log_success "Created today's journal entry"
+        journal_log "updating watchlist streaming info..."
+        timeout 15 "${HOME}/.local/bin/update_watchlist.py" --append-diary "${JOURNAL_FILE}" || journal_log "watchlist update failed"
     elif ! journal_has_template; then
         recover_untemplated_journal
         log_success "Restored today's journal template"
