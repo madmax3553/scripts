@@ -12,9 +12,12 @@
 # Purpose: Git repository status checker with TUI
 # Dependencies: git, fzf
 # Author: groot
-# Modified: 2026-05-30
+# Modified: 2026-06-11
 
 set -e
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+ORIGINAL_ARGS=("$@")
 
 FIRST_ARG="${1:-}"
 SECOND_ARG="${2:-}"
@@ -680,7 +683,7 @@ confirm_yes_no() {
 }
 
 rescan() {
-    exec "$0"
+    exec "$SCRIPT_PATH" "${ORIGINAL_ARGS[@]}"
 }
 
 run_and_rescan() {

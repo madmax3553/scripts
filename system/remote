@@ -10,15 +10,21 @@
 #      ░    ░         ░ ░      ░ ░
 # Script: remote
 # Purpose: Remote server connection manager
-# Dependencies: ssh, sshfs (for mount), tmux (on remote for tmux mode), dialog or whiptail
+# Dependencies: ssh, sshfs (local and remote for mounts), tmux (on remote for tmux mode), dialog or whiptail
 # Author: groot
-# Modified: 2026-05-19
+# Modified: 2026-06-06
 
 set -euo pipefail
 CONFIG_FILE="$HOME/.config/remotes"
 MOUNT_DIR="/mnt"
 TUI_ACTIVE=0
 REMOTE_TMUX_SESSION="${REMOTE_TMUX_SESSION:-remote}"
+LOCAL_DRIVE_USER="${REMOTE_LOCAL_DRIVE_USER:-$(id -un)}"
+LOCAL_DRIVE_PATH="${REMOTE_LOCAL_DRIVE_PATH:-/}"
+LOCAL_DRIVE_MOUNT="${REMOTE_LOCAL_DRIVE_MOUNT:-local-root}"
+LOCAL_DRIVE_PORT="${REMOTE_LOCAL_DRIVE_PORT:-22222}"
+LOCAL_DRIVE_SSH_PORT="${REMOTE_LOCAL_DRIVE_SSH_PORT:-22}"
+LOCAL_DRIVE_AGENT_FORWARD="${REMOTE_LOCAL_DRIVE_AGENT_FORWARD:-1}"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 
 if [[ "$SCRIPT_PATH" != */* ]]; then
@@ -51,6 +57,36 @@ trim() {
     echo "$1" | xargs
 }
 
+shell_quote() {
+    local value="$1"
+    printf "'%s'" "${value//\'/\'\\\'\'}"
+}
+
+validate_port() {
+    local port="$1"
+
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || ((port < 1 || port > 65535)); then
+        echo "Invalid port: $port" >&2
+        return 1
+    fi
+}
+
+expand_local_path() {
+    local path="$1"
+
+    case "$path" in
+    "~")
+        printf "%s\n" "$HOME"
+        ;;
+    "~/"*)
+        printf "%s/%s\n" "$HOME" "${path#~/}"
+        ;;
+    *)
+        printf "%s\n" "$path"
+        ;;
+    esac
+}
+
 detect_terminal() {
     if command -v ghostty &>/dev/null; then
         echo "ghostty"
@@ -77,27 +113,27 @@ spawn_terminal() {
     term="$(detect_terminal)"
 
     case "$term" in
-        ghostty)
-            cmd=(ghostty --title="$title" -e "$@")
-            ;;
-        kitty)
-            cmd=(kitty --title "$title" "$@")
-            ;;
-        alacritty)
-            cmd=(alacritty --title "$title" -e "$@")
-            ;;
-        foot)
-            cmd=(foot --title "$title" "$@")
-            ;;
-        wezterm)
-            cmd=(wezterm start --cwd "$(pwd)" -- "$@")
-            ;;
-        xterm)
-            cmd=(xterm -title "$title" -e "$@")
-            ;;
-        *)
-            return 1
-            ;;
+    ghostty)
+        cmd=(ghostty --title="$title" -e "$@")
+        ;;
+    kitty)
+        cmd=(kitty --title "$title" "$@")
+        ;;
+    alacritty)
+        cmd=(alacritty --title "$title" -e "$@")
+        ;;
+    foot)
+        cmd=(foot --title "$title" "$@")
+        ;;
+    wezterm)
+        cmd=(wezterm start --cwd "$(pwd)" -- "$@")
+        ;;
+    xterm)
+        cmd=(xterm -title "$title" -e "$@")
+        ;;
+    *)
+        return 1
+        ;;
     esac
 
     if command -v setsid &>/dev/null; then
@@ -108,6 +144,21 @@ spawn_terminal() {
     fi
 
     return 0
+}
+
+spawn_terminal_hold_on_failure() {
+    local title="$1"
+    shift
+
+    spawn_terminal "$title" bash -lc '
+        "$@"
+        status=$?
+        if (( status != 0 )); then
+            printf "\nCommand failed with exit %s.\nPress Enter to close..." "$status" >&2
+            read -r _
+        fi
+        exit "$status"
+    ' bash "$@"
 }
 
 validate_tmux_session_name() {
@@ -145,6 +196,104 @@ connect_tmux_session() {
     ssh -tt "$target" "$remote_cmd"
 }
 
+local_drive_remote_command() {
+    local mode="$1"
+    local local_path="$2"
+    local remote_mount="$3"
+    local q_user q_path q_mount q_port q_session
+    local shell_cmd
+
+    validate_port "$LOCAL_DRIVE_PORT" || return 1
+
+    case "$mode" in
+    ssh) ;;
+    tmux) validate_tmux_session_name "$REMOTE_TMUX_SESSION" || return 1 ;;
+    *)
+        echo "Unknown local drive mode: $mode" >&2
+        return 1
+        ;;
+    esac
+
+    q_user="$(shell_quote "$LOCAL_DRIVE_USER")"
+    q_path="$(shell_quote "$local_path")"
+    q_mount="$(shell_quote "$remote_mount")"
+    q_port="$(shell_quote "$LOCAL_DRIVE_PORT")"
+    q_session="$(shell_quote "$REMOTE_TMUX_SESSION")"
+
+    shell_cmd="set -e; local_user=${q_user}; local_path=${q_path}; mount_dir=${q_mount}; "
+    shell_cmd+="reverse_port=${q_port}; tmux_session=${q_session}; mounted_by_remote=0; "
+    shell_cmd+='case "$mount_dir" in "~") mount_dir="$HOME" ;; "~/"*) mount_dir="$HOME/${mount_dir#~/}" ;; /*) ;; *) mount_dir="$HOME/$mount_dir" ;; esac; '
+    shell_cmd+='command -v sshfs >/dev/null 2>&1 || { echo "sshfs not found on remote host. Install sshfs first." >&2; exit 127; }; '
+    shell_cmd+='command -v mountpoint >/dev/null 2>&1 || { echo "mountpoint not found on remote host." >&2; exit 127; }; '
+    shell_cmd+='mkdir -p "$mount_dir"; '
+    shell_cmd+='if mountpoint -q "$mount_dir" 2>/dev/null; then echo "Already mounted: $mount_dir"; '
+    shell_cmd+='else echo "Mounting local ${local_path} at ${mount_dir} through reverse SSH port ${reverse_port}..."; '
+    shell_cmd+='sshfs -p "$reverse_port" '
+    shell_cmd+='-o StrictHostKeyChecking=accept-new '
+    shell_cmd+='-o ServerAliveInterval=15 '
+    shell_cmd+='-o ServerAliveCountMax=3 '
+    shell_cmd+='-o reconnect '
+    shell_cmd+='-o follow_symlinks '
+    shell_cmd+='"${local_user}@localhost:${local_path}" "$mount_dir"; '
+    shell_cmd+='mounted_by_remote=1; fi; '
+    shell_cmd+='mountpoint -q "$mount_dir" 2>/dev/null || { echo "Local drive mount is not active: $mount_dir" >&2; exit 1; }; '
+    shell_cmd+='cleanup_local_drive() { status=$?; if [ "$mounted_by_remote" = 1 ]; then '
+    shell_cmd+='echo "Unmounting local drive from $mount_dir..."; '
+    shell_cmd+='if command -v fusermount3 >/dev/null 2>&1; then fusermount3 -u "$mount_dir" 2>/dev/null || fusermount3 -uz "$mount_dir" 2>/dev/null || true; '
+    shell_cmd+='elif command -v fusermount >/dev/null 2>&1; then fusermount -u "$mount_dir" 2>/dev/null || fusermount -uz "$mount_dir" 2>/dev/null || true; '
+    shell_cmd+='else umount "$mount_dir" 2>/dev/null || true; fi; fi; exit "$status"; }; '
+    shell_cmd+='trap cleanup_local_drive EXIT INT TERM; '
+    shell_cmd+='echo "Local drive available at: $mount_dir"; '
+
+    case "$mode" in
+    ssh)
+        shell_cmd+='"${SHELL:-/bin/sh}" -l'
+        ;;
+    tmux)
+        shell_cmd+='command -v tmux >/dev/null 2>&1 || { echo "tmux not found on remote host. Install tmux first." >&2; exit 127; }; '
+        shell_cmd+='case "${LC_ALL:-${LC_CTYPE:-${LANG:-}}}" in *UTF-8*|*utf8*|*utf-8*) ;; *) export LANG=C.UTF-8; export LC_ALL=C.UTF-8; export LC_CTYPE=C.UTF-8 ;; esac; '
+        shell_cmd+='tmux -u set-environment -g LANG "$LANG" 2>/dev/null || true; '
+        shell_cmd+='tmux -u set-environment -g LC_CTYPE "${LC_CTYPE:-$LANG}" 2>/dev/null || true; '
+        shell_cmd+='[ -z "${LC_ALL:-}" ] || tmux -u set-environment -g LC_ALL "$LC_ALL" 2>/dev/null || true; '
+        shell_cmd+='set +e; tmux -u new-session -A -s "$tmux_session"; tmux_status=$?; set -e; '
+        shell_cmd+='printf "\ntmux detached. Local drive remains mounted at %s while this window stays open.\nPress Enter to unmount and close..." "$mount_dir"; '
+        shell_cmd+='read -r _; exit "$tmux_status"'
+        ;;
+    esac
+
+    printf "exec \"\${SHELL:-/bin/sh}\" -lc %s" "$(shell_quote "$shell_cmd")"
+}
+
+connect_local_drive() {
+    local user="$1"
+    local host="$2"
+    local mode="$3"
+    local local_path="${4:-$LOCAL_DRIVE_PATH}"
+    local remote_mount="${5:-$LOCAL_DRIVE_MOUNT}"
+    local target="${user}@${host}"
+    local remote_cmd
+    local ssh_opts=(-tt -o ExitOnForwardFailure=yes)
+
+    validate_port "$LOCAL_DRIVE_SSH_PORT" || return 1
+
+    local_path="$(expand_local_path "$local_path")"
+
+    if [[ ! -e "$local_path" ]]; then
+        echo "Local path does not exist: $local_path" >&2
+        return 1
+    fi
+
+    remote_cmd="$(local_drive_remote_command "$mode" "$local_path" "$remote_mount")" || return 1
+
+    if [[ "$LOCAL_DRIVE_AGENT_FORWARD" != "0" ]]; then
+        ssh_opts+=(-A)
+    fi
+
+    ssh_opts+=(-R "${LOCAL_DRIVE_PORT}:localhost:${LOCAL_DRIVE_SSH_PORT}")
+
+    ssh "${ssh_opts[@]}" "$target" "$remote_cmd"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TUI Functions
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,18 +303,19 @@ tui_main_menu() {
     while :; do
         choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
             --title "Main Menu" \
-            --menu "Select an option:" 22 60 11 \
+            --menu "Select an option:" 24 70 12 \
             1 "Connect to remote" \
             2 "Connect with tmux" \
-            3 "Mount remote (SSHFS)" \
-            4 "Unmount remote" \
-            5 "Add new remote" \
-            6 "Edit remote" \
-            7 "Set default remote" \
-            8 "Delete remote" \
-            9 "Ad-hoc connection" \
-            10 "Open remotes / close" \
-            11 "Exit" \
+            3 "Connect with local drive" \
+            4 "Mount remote (SSHFS)" \
+            5 "Unmount remote" \
+            6 "Add new remote" \
+            7 "Edit remote" \
+            8 "Set default remote" \
+            9 "Delete remote" \
+            10 "Ad-hoc connection" \
+            11 "Open remotes / close" \
+            12 "Exit" \
             3>&1 1>&2 2>&3)
 
         exit_status=$?
@@ -174,17 +324,18 @@ tui_main_menu() {
         # Temporarily disable errexit so failed actions don't kill the TUI
         set +e
         case "$choice" in
-            1) tui_connect ;;
-            2) tui_connect_tmux ;;
-            3) tui_mount ;;
-            4) tui_unmount ;;
-            5) tui_add ;;
-            6) tui_edit ;;
-            7) tui_set_default ;;
-            8) tui_delete ;;
-            9) tui_adhoc ;;
-            10) tui_active_remotes ;;
-            11) break ;;
+        1) tui_connect ;;
+        2) tui_connect_tmux ;;
+        3) tui_connect_local_drive ;;
+        4) tui_mount ;;
+        5) tui_unmount ;;
+        6) tui_add ;;
+        7) tui_edit ;;
+        8) tui_set_default ;;
+        9) tui_delete ;;
+        10) tui_adhoc ;;
+        11) tui_active_remotes ;;
+        12) break ;;
         esac
         set -e
     done
@@ -208,28 +359,28 @@ tui_launch_ssh() {
     local remote_cmd
 
     case "$proto" in
-        ssh)
-            if spawn_terminal "SSH: ${target}" ssh "$target"; then
-                return 0
-            else
-                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
-                return 1
-            fi
-            ;;
-        tmux)
-            if ! validate_tmux_session_name "$REMOTE_TMUX_SESSION"; then
-                "$DIALOG" --msgbox "Invalid REMOTE_TMUX_SESSION:\n${REMOTE_TMUX_SESSION}" 8 56
-                return 1
-            fi
+    ssh)
+        if spawn_terminal "SSH: ${target}" ssh "$target"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
+            return 1
+        fi
+        ;;
+    tmux)
+        if ! validate_tmux_session_name "$REMOTE_TMUX_SESSION"; then
+            "$DIALOG" --msgbox "Invalid REMOTE_TMUX_SESSION:\n${REMOTE_TMUX_SESSION}" 8 56
+            return 1
+        fi
 
-            remote_cmd="$(tmux_remote_command "$REMOTE_TMUX_SESSION")"
-            if spawn_terminal "SSH tmux: ${target}" ssh -tt "$target" "$remote_cmd"; then
-                return 0
-            else
-                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
-                return 1
-            fi
-            ;;
+        remote_cmd="$(tmux_remote_command "$REMOTE_TMUX_SESSION")"
+        if spawn_terminal "SSH tmux: ${target}" ssh -tt "$target" "$remote_cmd"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH in new window." 8 50
+            return 1
+        fi
+        ;;
     esac
 }
 
@@ -241,17 +392,33 @@ tui_launch_saved_remote() {
     local target="${user}@${host}"
 
     case "$proto" in
-        ssh|tmux)
-            tui_launch_ssh "$target" "$proto"
-            ;;
-        vnc|garchyvnc)
-            if spawn_terminal "Remote ${proto}: ${target}" "$SCRIPT_PATH" --connect "$name"; then
-                return 0
-            else
-                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn ${proto} in new window." 8 56
-                return 1
-            fi
-            ;;
+    ssh | tmux)
+        tui_launch_ssh "$target" "$proto"
+        ;;
+    ssh-local)
+        if spawn_terminal_hold_on_failure "SSH local drive: ${target}" "$SCRIPT_PATH" --connect-local "$name"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH with local drive." 8 56
+            return 1
+        fi
+        ;;
+    tmux-local)
+        if spawn_terminal_hold_on_failure "SSH tmux local drive: ${target}" "$SCRIPT_PATH" --tmux-local "$name"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH tmux with local drive." 8 60
+            return 1
+        fi
+        ;;
+    vnc | garchyvnc)
+        if spawn_terminal "Remote ${proto}: ${target}" "$SCRIPT_PATH" --connect "$name"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn ${proto} in new window." 8 56
+            return 1
+        fi
+        ;;
     esac
 }
 
@@ -307,6 +474,66 @@ tui_connect_tmux() {
     done
 }
 
+tui_connect_local_drive() {
+    local items name user host proto is_default local_path remote_mount mode option
+
+    while :; do
+        mapfile -t items < <(tui_build_remote_list)
+
+        if [ ${#items[@]} -eq 0 ]; then
+            "$DIALOG" --msgbox "No remotes configured." 6 40
+            return
+        fi
+
+        choice=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+            --title "Connect with Local Drive" \
+            --menu "Select a remote to launch (Cancel returns):" 20 68 10 \
+            "${items[@]}" \
+            3>&1 1>&2 2>&3)
+
+        [ $? -ne 0 ] && return
+
+        entry="$(get_entry_by_name "$choice")"
+        IFS=',' read -r name user host proto is_default <<<"$entry"
+
+        mode="ssh"
+        [[ "$proto" == tmux || "$proto" == tmux-local ]] && mode="tmux"
+
+        option=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+            --title "Local Drive Mode" \
+            --default-item "$mode" \
+            --menu "How should the remote session open?" 10 52 2 \
+            ssh "SSH shell" \
+            tmux "Remote tmux session" \
+            3>&1 1>&2 2>&3)
+        [ $? -ne 0 ] && return
+        mode="$option"
+
+        local_path=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+            --title "Local Path" \
+            --inputbox "Local path to expose:" 8 58 "$LOCAL_DRIVE_PATH" \
+            3>&1 1>&2 2>&3)
+        [ $? -ne 0 ] && return
+        local_path="$(trim "$local_path")"
+        [ -z "$local_path" ] && local_path="$LOCAL_DRIVE_PATH"
+
+        remote_mount=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
+            --title "Remote Mount Point" \
+            --inputbox "Remote mount point:" 8 58 "$LOCAL_DRIVE_MOUNT" \
+            3>&1 1>&2 2>&3)
+        [ $? -ne 0 ] && return
+        remote_mount="$(trim "$remote_mount")"
+        [ -z "$remote_mount" ] && remote_mount="$LOCAL_DRIVE_MOUNT"
+
+        if spawn_terminal_hold_on_failure "SSH local drive: ${user}@${host}" "$SCRIPT_PATH" --connect-local-mode "$mode" "$name" "$local_path" "$remote_mount"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH with local drive." 8 56
+            return 1
+        fi
+    done
+}
+
 tui_add() {
     local name user host proto make_default
 
@@ -339,9 +566,11 @@ tui_add() {
 
     proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
         --title "Protocol" \
-        --menu "Select protocol:" 13 48 4 \
+        --menu "Select protocol:" 15 58 6 \
         ssh "SSH terminal" \
         tmux "SSH tmux session" \
+        ssh-local "SSH with local drive" \
+        tmux-local "tmux with local drive" \
         vnc "VNC (tunnel)" \
         garchyvnc "VNC with remote setup" \
         3>&1 1>&2 2>&3)
@@ -354,7 +583,7 @@ tui_add() {
         make_default=""
     fi
 
-    printf "%s,%s,%s,%s,%s\n" "$name" "$user" "$host" "$proto" "" >> "$CONFIG_FILE"
+    printf "%s,%s,%s,%s,%s\n" "$name" "$user" "$host" "$proto" "" >>"$CONFIG_FILE"
 
     if [ "$make_default" = "yes" ]; then
         set_default "$name"
@@ -412,7 +641,7 @@ tui_delete() {
             for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
             if ($1 != name) print
         }
-    ' "$CONFIG_FILE" > "$tmp"
+    ' "$CONFIG_FILE" >"$tmp"
     mv "$tmp" "$CONFIG_FILE"
 
     "$DIALOG" --msgbox "'$choice' deleted." 6 40
@@ -471,9 +700,11 @@ tui_edit() {
     new_proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
         --title "Protocol" \
         --default-item "$proto" \
-        --menu "Select protocol:" 13 48 4 \
+        --menu "Select protocol:" 15 58 6 \
         ssh "SSH terminal" \
         tmux "SSH tmux session" \
+        ssh-local "SSH with local drive" \
+        tmux-local "tmux with local drive" \
         vnc "VNC (tunnel)" \
         garchyvnc "VNC with remote setup" \
         3>&1 1>&2 2>&3)
@@ -496,7 +727,7 @@ tui_edit() {
             }
             print
         }
-    ' "$CONFIG_FILE" > "$tmp"
+    ' "$CONFIG_FILE" >"$tmp"
     mv "$tmp" "$CONFIG_FILE"
 
     "$DIALOG" --msgbox "Remote '$new_name' updated." 6 40
@@ -517,9 +748,11 @@ tui_adhoc() {
 
     proto=$("$DIALOG" --clear --backtitle "Remote Connection Manager" \
         --title "Protocol" \
-        --menu "Select protocol:" 13 48 4 \
+        --menu "Select protocol:" 15 58 6 \
         ssh "SSH terminal" \
         tmux "SSH tmux session" \
+        ssh-local "SSH with local drive" \
+        tmux-local "tmux with local drive" \
         vnc "VNC (tunnel)" \
         garchyvnc "VNC with remote setup" \
         3>&1 1>&2 2>&3)
@@ -528,17 +761,33 @@ tui_adhoc() {
     local target="${user}@${host}"
 
     case "$proto" in
-        ssh|tmux)
-            tui_launch_ssh "$target" "$proto"
-            ;;
-        vnc|garchyvnc)
-            if spawn_terminal "Remote ${proto}: ${target}" "$SCRIPT_PATH" --adhoc-connect "$user" "$host" "$proto"; then
-                return 0
-            else
-                "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn ${proto} in new window." 8 56
-                return 1
-            fi
-            ;;
+    ssh | tmux)
+        tui_launch_ssh "$target" "$proto"
+        ;;
+    ssh-local)
+        if spawn_terminal_hold_on_failure "SSH local drive: ${target}" "$SCRIPT_PATH" --adhoc-connect-local "$user" "$host" "ssh"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH with local drive." 8 56
+            return 1
+        fi
+        ;;
+    tmux-local)
+        if spawn_terminal_hold_on_failure "SSH tmux local drive: ${target}" "$SCRIPT_PATH" --adhoc-connect-local "$user" "$host" "tmux"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn SSH tmux with local drive." 8 60
+            return 1
+        fi
+        ;;
+    vnc | garchyvnc)
+        if spawn_terminal "Remote ${proto}: ${target}" "$SCRIPT_PATH" --adhoc-connect "$user" "$host" "$proto"; then
+            return 0
+        else
+            "$DIALOG" --msgbox "No terminal emulator found.\nCannot spawn ${proto} in new window." 8 56
+            return 1
+        fi
+        ;;
     esac
 }
 
@@ -725,12 +974,12 @@ connect_remote() {
                 echo "SSH tunnel established (PID $tunnel_pid)."
                 echo "Launching VNC viewer ($vnc_client)..."
                 case "$vnc_client" in
-                    remmina)
-                        remmina -c vnc://localhost:5900
-                        ;;
-                    vncviewer)
-                        vncviewer localhost:5900
-                        ;;
+                remmina)
+                    remmina -c vnc://localhost:5900
+                    ;;
+                vncviewer)
+                    vncviewer localhost:5900
+                    ;;
                 esac
                 status=$?
                 cleanup_tunnel
@@ -791,35 +1040,51 @@ connect_remote() {
     }
 
     case "$proto" in
-        ssh)
-            ssh "$target" || status=$?
-            if [ $status -ne 0 ]; then
-                echo "SSH connection failed for $target (exit $status)." >&2
-                return $status
-            fi
-            return 0
-            ;;
-        tmux)
-            connect_tmux_session "$target" || status=$?
-            if [ $status -ne 0 ]; then
-                echo "SSH tmux connection failed for $target (exit $status)." >&2
-                return $status
-            fi
-            return 0
-            ;;
-        vnc)
-            run_vnc || return 1
-            return 0
-            ;;
-        garchyvnc)
-            run_remote_setup || return 1
-            run_vnc || return 1
-            return 0
-            ;;
-        *)
-            echo "Unknown protocol: $proto" >&2
-            return 1
-            ;;
+    ssh)
+        ssh "$target" || status=$?
+        if [ $status -ne 0 ]; then
+            echo "SSH connection failed for $target (exit $status)." >&2
+            return $status
+        fi
+        return 0
+        ;;
+    tmux)
+        connect_tmux_session "$target" || status=$?
+        if [ $status -ne 0 ]; then
+            echo "SSH tmux connection failed for $target (exit $status)." >&2
+            return $status
+        fi
+        return 0
+        ;;
+    ssh-local)
+        connect_local_drive "$user" "$host" "ssh" || status=$?
+        if [ $status -ne 0 ]; then
+            echo "SSH local drive connection failed for $target (exit $status)." >&2
+            return $status
+        fi
+        return 0
+        ;;
+    tmux-local)
+        connect_local_drive "$user" "$host" "tmux" || status=$?
+        if [ $status -ne 0 ]; then
+            echo "SSH tmux local drive connection failed for $target (exit $status)." >&2
+            return $status
+        fi
+        return 0
+        ;;
+    vnc)
+        run_vnc || return 1
+        return 0
+        ;;
+    garchyvnc)
+        run_remote_setup || return 1
+        run_vnc || return 1
+        return 0
+        ;;
+    *)
+        echo "Unknown protocol: $proto" >&2
+        return 1
+        ;;
     esac
 }
 
@@ -947,11 +1212,12 @@ active_record_summary() {
     local label
 
     case "$kind" in
-        mount) label="SSHFS mount" ;;
-        tmux) label="tmux SSH" ;;
-        vnc-tunnel) label="VNC tunnel" ;;
-        ssh) label="SSH" ;;
-        *) label="$kind" ;;
+    mount) label="SSHFS mount" ;;
+    local-drive) label="SSH local drive" ;;
+    tmux) label="tmux SSH" ;;
+    vnc-tunnel) label="VNC tunnel" ;;
+    ssh) label="SSH" ;;
+    *) label="$kind" ;;
     esac
 
     if [[ "$pid" == "-" ]]; then
@@ -964,7 +1230,9 @@ active_record_summary() {
 classify_ssh_process() {
     local args="$1"
 
-    if [[ "$args" == *"-L 5900:localhost:5900"* || "$args" == *"-L5900:localhost:5900"* ]]; then
+    if [[ "$args" == *"-R ${LOCAL_DRIVE_PORT}:localhost:22"* || "$args" == *"-R${LOCAL_DRIVE_PORT}:localhost:22"* ]]; then
+        echo "local-drive"
+    elif [[ "$args" == *"-L 5900:localhost:5900"* || "$args" == *"-L5900:localhost:5900"* ]]; then
         echo "vnc-tunnel"
     elif [[ "$args" == *"tmux -u new-session -A -s"* ]]; then
         echo "tmux"
@@ -1096,17 +1364,17 @@ close_active_record() {
     IFS=$'\t' read -r kind name target pid detail <<<"$record"
 
     case "$kind" in
-        mount)
-            unmount_remote "$name"
-            ;;
-        ssh|tmux|vnc-tunnel)
-            label="$(active_record_summary "$kind" "$name" "$target" "$pid" "$detail")"
-            close_pid "$pid" "$label"
-            ;;
-        *)
-            echo "Unknown active remote type: $kind" >&2
-            return 1
-            ;;
+    mount)
+        unmount_remote "$name"
+        ;;
+    ssh | tmux | local-drive | vnc-tunnel)
+        label="$(active_record_summary "$kind" "$name" "$target" "$pid" "$detail")"
+        close_pid "$pid" "$label"
+        ;;
+    *)
+        echo "Unknown active remote type: $kind" >&2
+        return 1
+        ;;
     esac
 }
 
@@ -1193,7 +1461,7 @@ set_default() {
             print
         }
         END { if (!found) exit 2 }
-    ' "$CONFIG_FILE" > "$tmp"
+    ' "$CONFIG_FILE" >"$tmp"
 
     if [ $? -ne 0 ]; then
         rm -f "$tmp"
@@ -1225,18 +1493,18 @@ add_entry() {
     host="$(trim "$host")"
 
     while :; do
-        read -rp "Protocol (ssh/tmux/vnc/garchyvnc): " proto
+        read -rp "Protocol (ssh/tmux/ssh-local/tmux-local/vnc/garchyvnc): " proto
         proto="$(trim "$proto")"
         case "$proto" in
-            ssh|tmux|vnc|garchyvnc) break ;;
-            *) echo "Please enter 'ssh', 'tmux', 'vnc', or 'garchyvnc'." >&2 ;;
+        ssh | tmux | ssh-local | tmux-local | vnc | garchyvnc) break ;;
+        *) echo "Please enter 'ssh', 'tmux', 'ssh-local', 'tmux-local', 'vnc', or 'garchyvnc'." >&2 ;;
         esac
     done
 
     read -rp "Set as default? (y/N): " make_default
     make_default="$(trim "$make_default")"
 
-    printf "%s,%s,%s,%s,%s\n" "$name" "$user" "$host" "$proto" "" >> "$CONFIG_FILE"
+    printf "%s,%s,%s,%s,%s\n" "$name" "$user" "$host" "$proto" "" >>"$CONFIG_FILE"
 
     if [ "${make_default,,}" = "y" ] || [ "${make_default,,}" = "yes" ]; then
         set_default "$name"
@@ -1251,11 +1519,11 @@ random_entry() {
     host="$(trim "$host")"
 
     while :; do
-        read -rp "Protocol (ssh/tmux/vnc/garchyvnc): " proto
+        read -rp "Protocol (ssh/tmux/ssh-local/tmux-local/vnc/garchyvnc): " proto
         proto="$(trim "$proto")"
         case "$proto" in
-            ssh|tmux|vnc|garchyvnc) break ;;
-            *) echo "Please enter 'ssh', 'tmux', 'vnc', or 'garchyvnc'." >&2 ;;
+        ssh | tmux | ssh-local | tmux-local | vnc | garchyvnc) break ;;
+        *) echo "Please enter 'ssh', 'tmux', 'ssh-local', 'tmux-local', 'vnc', or 'garchyvnc'." >&2 ;;
         esac
     done
 
@@ -1279,6 +1547,10 @@ CLI Mode:
   remote -D, --delete <name>   Delete a remote
   remote -c, --connect <name>  Connect to a saved remote
   remote -t, --tmux <name>     Connect through remote tmux session
+  remote --local-drive <name> [local-path] [remote-mount]
+                              Connect with local drive mounted on remote
+  remote --tmux-local <name> [local-path] [remote-mount]
+                              Connect tmux with local drive mounted on remote
   remote -m, --mount <name> [path]  Mount remote via SSHFS (home dir by default)
   remote -u, --unmount <name>  Unmount a mounted remote
   remote --mounts              List active SSHFS mounts
@@ -1286,8 +1558,14 @@ CLI Mode:
   remote --close <name|pid|all>  Close open remote connections/mounts
   remote -h, --help   Show this help
 
+Saved protocols: ssh, tmux, ssh-local, tmux-local, vnc, garchyvnc.
 Set REMOTE_TMUX_SESSION to choose the remote tmux session name (default: remote).
 SSHFS mounts are created under /mnt/<remote-name>.
+Local-drive mode reverse-forwards remote port 22222 to local SSH on port 22,
+then mounts local / under the remote user's home as local-root by default.
+Override with REMOTE_LOCAL_DRIVE_PORT, REMOTE_LOCAL_DRIVE_SSH_PORT,
+REMOTE_LOCAL_DRIVE_PATH, REMOTE_LOCAL_DRIVE_MOUNT, REMOTE_LOCAL_DRIVE_USER, and
+REMOTE_LOCAL_DRIVE_AGENT_FORWARD=0.
 If dialog/whiptail is not available, falls back to CLI prompts.
 EOF
 }
@@ -1312,7 +1590,7 @@ delete_entry() {
             for (i = 1; i <= NF; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
             if ($1 != name) print
         }
-    ' "$CONFIG_FILE" > "$tmp"
+    ' "$CONFIG_FILE" >"$tmp"
     mv "$tmp" "$CONFIG_FILE"
     echo "Deleted: $name"
 }
@@ -1347,12 +1625,12 @@ edit_entry() {
     [ -z "$new_host" ] && new_host="$old_host"
 
     while :; do
-        read -rp "Protocol (ssh/tmux/vnc/garchyvnc) [$old_proto]: " new_proto
+        read -rp "Protocol (ssh/tmux/ssh-local/tmux-local/vnc/garchyvnc) [$old_proto]: " new_proto
         new_proto="$(trim "$new_proto")"
         [ -z "$new_proto" ] && new_proto="$old_proto"
         case "$new_proto" in
-            ssh|tmux|vnc|garchyvnc) break ;;
-            *) echo "Please enter 'ssh', 'tmux', 'vnc', or 'garchyvnc'." >&2 ;;
+        ssh | tmux | ssh-local | tmux-local | vnc | garchyvnc) break ;;
+        *) echo "Please enter 'ssh', 'tmux', 'ssh-local', 'tmux-local', 'vnc', or 'garchyvnc'." >&2 ;;
         esac
     done
 
@@ -1372,146 +1650,206 @@ edit_entry() {
             }
             print
         }
-    ' "$CONFIG_FILE" > "$tmp"
+    ' "$CONFIG_FILE" >"$tmp"
     mv "$tmp" "$CONFIG_FILE"
     echo "Updated: $new_name"
 }
 
 case "${1:-}" in
-    -l|--list|list)
-        list_entries
-        ;;
-    -a|--add|add)
-        add_entry
-        ;;
-    -e|--edit|edit)
-        if [ -z "${2:-}" ]; then
-            echo "Missing name to edit." >&2
-            exit 1
-        fi
-        edit_entry "$2"
-        ;;
-    -d|--default|default)
-        if [ -z "${2:-}" ]; then
-            echo "Missing name for default." >&2
-            exit 1
-        fi
-        set_default "$2"
-        ;;
-    -D|--delete|delete)
-        if [ -z "${2:-}" ]; then
-            echo "Missing name to delete." >&2
-            exit 1
-        fi
-        delete_entry "$2"
-        ;;
-    -m|--mount|mount)
-        if [ -z "${2:-}" ]; then
-            echo "Missing name to mount." >&2
-            exit 1
-        fi
-        entry="$(get_entry_by_name "$2")"
-        if [ -z "$entry" ]; then
-            echo "No such remote: $2" >&2
-            exit 1
-        fi
-        IFS=',' read -r name user host proto is_default <<<"$entry"
-        mount_remote "$user" "$host" "$name" "${3:-}"
-        ;;
-    -u|--unmount|unmount)
-        if [ -z "${2:-}" ]; then
-            echo "Missing name to unmount." >&2
-            exit 1
-        fi
-        unmount_remote "$2"
-        ;;
-    --mounts|mounts)
-        list_mounts
-        ;;
-    -o|--open|open|--active|active)
-        list_active_remotes
-        ;;
-    --close|close)
-        if [ -z "${2:-}" ]; then
-            echo "Missing selector to close (use name, PID, target, or all)." >&2
-            exit 1
-        fi
-        close_active_remotes "$2"
-        ;;
-    -r|--random|random)
-        random_entry
-        ;;
-    --adhoc-connect)
-        if [[ -z "${2:-}" || -z "${3:-}" || -z "${4:-}" ]]; then
-            echo "Missing user, host, or protocol for ad-hoc connect." >&2
-            exit 1
-        fi
-        case "$4" in
-            ssh|tmux|vnc|garchyvnc) ;;
-            *)
-                echo "Unknown protocol: $4" >&2
-                exit 1
-                ;;
-        esac
-        connect_remote "$2" "$3" "$4"
-        ;;
-    -c|--connect)
-        if [ -z "${2:-}" ]; then
-            echo "Missing name for connect." >&2
-            exit 1
-        fi
-        entry="$(get_entry_by_name "$2")"
-        if [ -z "$entry" ]; then
-            echo "No such remote: $2" >&2
-            exit 1
-        fi
-        IFS=',' read -r name user host proto is_default <<<"$entry"
-        connect_remote "$user" "$host" "$proto"
-        ;;
-    -t|--tmux|tmux)
-        if [ -z "${2:-}" ]; then
-            echo "Missing name for tmux connect." >&2
-            exit 1
-        fi
-        entry="$(get_entry_by_name "$2")"
-        if [ -z "$entry" ]; then
-            echo "No such remote: $2" >&2
-            exit 1
-        fi
-        IFS=',' read -r name user host proto is_default <<<"$entry"
-        connect_remote "$user" "$host" "tmux"
-        ;;
-    "" )
-        # No arguments: launch TUI if available, else show help
-        if [ -n "$DIALOG" ]; then
-            tui_main_menu
-        else
-            entry="$(get_default_entry)"
-            if [ -z "$entry" ]; then
-                echo "No default remote set (install 'dialog' for TUI)." >&2
-                usage
-                exit 1
-            fi
-            IFS=',' read -r name user host proto is_default <<<"$entry"
-            connect_remote "$user" "$host" "$proto"
-        fi
-        ;;
-    -h|--help|help)
-        usage
-        ;;
-    -*)
-        echo "Unknown option: $1" >&2
-        usage
+-l | --list | list)
+    list_entries
+    ;;
+-a | --add | add)
+    add_entry
+    ;;
+-e | --edit | edit)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name to edit." >&2
+        exit 1
+    fi
+    edit_entry "$2"
+    ;;
+-d | --default | default)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name for default." >&2
+        exit 1
+    fi
+    set_default "$2"
+    ;;
+-D | --delete | delete)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name to delete." >&2
+        exit 1
+    fi
+    delete_entry "$2"
+    ;;
+-m | --mount | mount)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name to mount." >&2
+        exit 1
+    fi
+    entry="$(get_entry_by_name "$2")"
+    if [ -z "$entry" ]; then
+        echo "No such remote: $2" >&2
+        exit 1
+    fi
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+    mount_remote "$user" "$host" "$name" "${3:-}"
+    ;;
+-u | --unmount | unmount)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name to unmount." >&2
+        exit 1
+    fi
+    unmount_remote "$2"
+    ;;
+--mounts | mounts)
+    list_mounts
+    ;;
+-o | --open | open | --active | active)
+    list_active_remotes
+    ;;
+--close | close)
+    if [ -z "${2:-}" ]; then
+        echo "Missing selector to close (use name, PID, target, or all)." >&2
+        exit 1
+    fi
+    close_active_remotes "$2"
+    ;;
+-r | --random | random)
+    random_entry
+    ;;
+--adhoc-connect)
+    if [[ -z "${2:-}" || -z "${3:-}" || -z "${4:-}" ]]; then
+        echo "Missing user, host, or protocol for ad-hoc connect." >&2
+        exit 1
+    fi
+    case "$4" in
+    ssh | tmux | ssh-local | tmux-local | vnc | garchyvnc) ;;
+    *)
+        echo "Unknown protocol: $4" >&2
         exit 1
         ;;
+    esac
+    connect_remote "$2" "$3" "$4"
+    ;;
+--adhoc-connect-local)
+    if [[ -z "${2:-}" || -z "${3:-}" || -z "${4:-}" ]]; then
+        echo "Missing user, host, or mode for ad-hoc local-drive connect." >&2
+        exit 1
+    fi
+    case "$4" in
+    ssh | tmux) ;;
     *)
-        entry="$(get_entry_by_name "$1")"
+        echo "Unknown local-drive mode: $4" >&2
+        exit 1
+        ;;
+    esac
+    connect_local_drive "$2" "$3" "$4" "${5:-$LOCAL_DRIVE_PATH}" "${6:-$LOCAL_DRIVE_MOUNT}"
+    ;;
+--connect-local-mode)
+    if [[ -z "${2:-}" || -z "${3:-}" ]]; then
+        echo "Missing mode or name for local-drive connect." >&2
+        exit 1
+    fi
+    case "$2" in
+    ssh | tmux) ;;
+    *)
+        echo "Unknown local-drive mode: $2" >&2
+        exit 1
+        ;;
+    esac
+    entry="$(get_entry_by_name "$3")"
+    if [ -z "$entry" ]; then
+        echo "No such remote: $3" >&2
+        exit 1
+    fi
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+    connect_local_drive "$user" "$host" "$2" "${4:-$LOCAL_DRIVE_PATH}" "${5:-$LOCAL_DRIVE_MOUNT}"
+    ;;
+--local-drive | local-drive | --connect-local | connect-local)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name for local-drive connect." >&2
+        exit 1
+    fi
+    entry="$(get_entry_by_name "$2")"
+    if [ -z "$entry" ]; then
+        echo "No such remote: $2" >&2
+        exit 1
+    fi
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+    connect_local_drive "$user" "$host" "ssh" "${3:-$LOCAL_DRIVE_PATH}" "${4:-$LOCAL_DRIVE_MOUNT}"
+    ;;
+--tmux-local | tmux-local)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name for tmux local-drive connect." >&2
+        exit 1
+    fi
+    entry="$(get_entry_by_name "$2")"
+    if [ -z "$entry" ]; then
+        echo "No such remote: $2" >&2
+        exit 1
+    fi
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+    connect_local_drive "$user" "$host" "tmux" "${3:-$LOCAL_DRIVE_PATH}" "${4:-$LOCAL_DRIVE_MOUNT}"
+    ;;
+-c | --connect)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name for connect." >&2
+        exit 1
+    fi
+    entry="$(get_entry_by_name "$2")"
+    if [ -z "$entry" ]; then
+        echo "No such remote: $2" >&2
+        exit 1
+    fi
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+    connect_remote "$user" "$host" "$proto"
+    ;;
+-t | --tmux | tmux)
+    if [ -z "${2:-}" ]; then
+        echo "Missing name for tmux connect." >&2
+        exit 1
+    fi
+    entry="$(get_entry_by_name "$2")"
+    if [ -z "$entry" ]; then
+        echo "No such remote: $2" >&2
+        exit 1
+    fi
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+    connect_remote "$user" "$host" "tmux"
+    ;;
+"")
+    # No arguments: launch TUI if available, else show help
+    if [ -n "$DIALOG" ]; then
+        tui_main_menu
+    else
+        entry="$(get_default_entry)"
         if [ -z "$entry" ]; then
-            echo "No such remote: $1" >&2
+            echo "No default remote set (install 'dialog' for TUI)." >&2
             usage
             exit 1
         fi
         IFS=',' read -r name user host proto is_default <<<"$entry"
         connect_remote "$user" "$host" "$proto"
-        ;;
+    fi
+    ;;
+-h | --help | help)
+    usage
+    ;;
+-*)
+    echo "Unknown option: $1" >&2
+    usage
+    exit 1
+    ;;
+*)
+    entry="$(get_entry_by_name "$1")"
+    if [ -z "$entry" ]; then
+        echo "No such remote: $1" >&2
+        usage
+        exit 1
+    fi
+    IFS=',' read -r name user host proto is_default <<<"$entry"
+    connect_remote "$user" "$host" "$proto"
+    ;;
 esac
