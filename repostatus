@@ -9,10 +9,10 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
 #      ░    ░         ░ ░      ░ ░
 # Script: repostatus
-# Purpose: Git repository status checker with TUI
-# Dependencies: git, fzf
+# Purpose: Git repository manager with TUI and multi-system dotfiles sync
+# Dependencies: git, fzf (for interactive mode)
 # Author: groot
-# Modified: 2026-06-11
+# Modified: 2026-06-14
 
 set -e
 
@@ -21,6 +21,50 @@ ORIGINAL_ARGS=("$@")
 
 FIRST_ARG="${1:-}"
 SECOND_ARG="${2:-}"
+
+# Show help
+if [ "$FIRST_ARG" = "-h" ] || [ "$FIRST_ARG" = "--help" ]; then
+    cat <<EOF
+repostatus - Git repository manager with multi-system dotfiles sync
+
+USAGE:
+  $(basename "$0")              Interactive TUI mode (default)
+  $(basename "$0") --sync       Sync all dirty repositories
+  $(basename "$0") --commit     Commit all dirty repositories
+  $(basename "$0") --dotfiles   Sync dotfiles (host-specific branches)
+  $(basename "$0") --json-summary  JSON output for Waybar
+
+DOTFILES SYNC:
+  Manages dotfiles across multiple systems using per-host git branches.
+  
+  Architecture:
+    master           - primary machine (ArchyTux) source of truth
+    host-<hostname>  - secondary machines: sync from master, customizations only
+  
+  Branch strategy:
+  
+  Workflow (smart auto-discovery):
+    1. Detects hostname → manages host-<hostname> branch
+    2. Fetches master, updates local master
+    3. Scans for local changes vs master
+    4. Already customized files: kept as-is
+    5. New local changes: asks user to keep or sync to master
+    6. Kept files: auto-added to custom list for future syncs
+    7. Host→branch mapping maintained automatically
+  
+  Philosophy: Unified dotfiles by default. Only host-specific when necessary.
+  
+  Config files (auto-created):
+    - ~/.config/repostatus/dotfiles-custom-files (discovered custom files)
+    - ~/.config/repostatus/dotfiles-hosts (host to branch reference)
+
+EXAMPLES:
+  $(basename "$0")              # Interactive mode
+  $(basename "$0") --sync       # Quick sync all repos
+  $(basename "$0") --dotfiles   # Sync dotfiles with diff review
+EOF
+    exit 0
+fi
 
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/repostatus"
 FETCH_LOG="$CACHE_DIR/fetch.log"
@@ -280,6 +324,345 @@ commit_repos() {
     fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Dotfiles Sync (multi-system support with per-host customization)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Custom files that may differ per host (relative to dotfiles repo root)
+# Most dotfiles should be identical across all hosts (unified look & feel).
+# Only add files here if they MUST vary (e.g., hardware-specific power management).
+# Default is empty - users customize as needed.
+DOTFILES_CUSTOM_FILES=()
+
+dotfiles_save_custom_files() {
+    local dotfiles_dir="$1"
+    local savedir="$2"
+    local relpath dest
+
+    for relpath in "${DOTFILES_CUSTOM_FILES[@]}"; do
+        dest="$savedir/$relpath"
+        if [ -f "$dotfiles_dir/$relpath" ]; then
+            mkdir -p "$(dirname "$dest")"
+            cp "$dotfiles_dir/$relpath" "$dest"
+        elif [ -d "$dotfiles_dir/$relpath" ]; then
+            mkdir -p "$dest"
+            cp -r "$dotfiles_dir/$relpath/." "$dest/"
+        fi
+    done
+}
+
+dotfiles_restore_custom_files() {
+    local dotfiles_dir="$1"
+    local savedir="$2"
+    local relpath src dest
+
+    for relpath in "${DOTFILES_CUSTOM_FILES[@]}"; do
+        src="$savedir/$relpath"
+        dest="$dotfiles_dir/$relpath"
+        if [ -e "$src" ]; then
+            mkdir -p "$(dirname "$dest")"
+            cp -r "$src" "$dest"
+        fi
+    done
+}
+
+dotfiles_review_custom_file() {
+    local dotfiles_dir="$1"
+    local relpath="$2"
+    local file="$dotfiles_dir/$relpath"
+
+    [ ! -f "$file" ] && return 0
+
+    # Check if file exists on master
+    local on_master=false
+    if git -C "$dotfiles_dir" show "master:$relpath" &>/dev/null 2>&1; then
+        on_master=true
+    fi
+
+    if ! $on_master; then
+        printf '\n%s\n' "$relpath"
+        printf '  ℹ  New custom file (not in master)\n'
+        printf '  Keep this file on %s? [y/n] ' "$DOTFILES_BRANCH"
+        read -r -t 30 answer || answer="y"
+        if [[ "$answer" =~ ^[Nn] ]]; then
+            rm -f "$file"
+            printf '  ✓ Omitted\n'
+        else
+            printf '  ✓ Keeping\n'
+        fi
+        return 0
+    fi
+
+    if git -C "$dotfiles_dir" diff --quiet "master" -- "$relpath" 2>/dev/null; then
+        return 0
+    fi
+
+    printf '\n%s\n' "$relpath"
+    git -C "$dotfiles_dir" diff --stat "master" -- "$relpath" 2>/dev/null
+
+    printf '  Review full diff? [y/n] '
+    read -r -t 30 review || review="n"
+    if [[ "$review" =~ ^[Yy] ]]; then
+        printf '\n'
+        git -C "$dotfiles_dir" diff "master" -- "$relpath" 2>/dev/null | head -200
+        printf '\n'
+    fi
+
+    printf '  Use master (m) or keep local (k)? [m/k] '
+    local choice
+    while true; do
+        read -r -t 30 choice || choice="k"
+        case "$choice" in
+            [mM])
+                git -C "$dotfiles_dir" checkout "master" -- "$relpath" 2>/dev/null || true
+                printf '  ✓ Using master\n'
+                return 0
+                ;;
+            [kK])
+                printf '  ✓ Keeping local\n'
+                return 0
+                ;;
+            *)
+                printf '  Enter m or k: '
+                ;;
+        esac
+    done
+}
+
+sync_dotfiles() {
+    local dotfiles_dir="$1"
+
+    if [ ! -d "$dotfiles_dir/.git" ]; then
+        printf 'Not a git repository: %s\n' "$dotfiles_dir" >&2
+        return 1
+    fi
+
+    cd "$dotfiles_dir" || return 1
+
+    local host
+    host=$(hostname -s)
+    DOTFILES_BRANCH="host-${host}"
+    local host_map_file="$CONFIG_DIR/dotfiles-hosts"
+    
+    # Architecture: ArchyTux is master branch owner
+    # Other hosts sync from master and customize only when necessary
+    local primary_host="ArchyTux"
+
+    printf '\nDotfiles Sync\n'
+    printf '  Host: %s\n' "$host"
+    if [ "$host" = "$primary_host" ]; then
+        printf '  Role: Primary (master branch)\n'
+    else
+        printf '  Role: Secondary (syncs from master)\n'
+    fi
+    printf '  Branch: %s\n' "$DOTFILES_BRANCH"
+    printf '  Directory: %s\n' "$dotfiles_dir"
+
+    # Fetch origin
+    if ! git fetch origin 2>/dev/null; then
+        printf '  ⚠ Cannot fetch origin (offline?); using local master\n'
+    fi
+
+    # Stash uncommitted changes
+    local stashed=0
+    if ! git diff --quiet 2>/dev/null || ! git diff --cached --quiet 2>/dev/null; then
+        printf '  Stashing uncommitted changes...\n'
+        git stash push -m "repostatus: $(date +%Y-%m-%d_%H:%M)" 2>/dev/null || true
+        stashed=1
+    fi
+
+    # Update master
+    printf '  Updating master...\n'
+    git checkout master 2>/dev/null
+    git rebase origin/master 2>/dev/null || \
+        git pull --rebase origin master 2>/dev/null || \
+        printf '  ⚠ Could not update master\n'
+
+    # Create/checkout host branch
+    local branch_exists=false
+    git rev-parse --verify "$DOTFILES_BRANCH" &>/dev/null && branch_exists=true
+
+    if $branch_exists; then
+        printf '  Checking out existing branch: %s\n' "$DOTFILES_BRANCH"
+        git checkout "$DOTFILES_BRANCH"
+        # Get files that differ from master (existing customizations)
+        local -a changed_files
+        mapfile -t changed_files < <(git diff --name-only master 2>/dev/null)
+    else
+        printf '  Creating new branch: %s\n' "$DOTFILES_BRANCH"
+        git checkout -b "$DOTFILES_BRANCH" master
+        local changed_files=()
+    fi
+
+    # Discover local changes vs master
+    printf '  Scanning for local changes...\n'
+    local -a local_changes
+    mapfile -t local_changes < <(git diff --name-only master 2>/dev/null)
+
+    # Categorize files: already customized vs newly changed
+    local -a already_custom
+    local -a newly_changed
+
+    for file in "${local_changes[@]}"; do
+        if printf '%s\n' "${DOTFILES_CUSTOM_FILES[@]}" | grep -q "^$file$"; then
+            already_custom+=("$file")
+        else
+            newly_changed+=("$file")
+        fi
+    done
+
+    # Report status
+    printf '\n  Already customized (%d files): keeping as-is\n' "${#already_custom[@]}"
+    for file in "${already_custom[@]}"; do
+        printf '    ✓ %s\n' "$file"
+    done
+
+    # Ask about newly changed files
+    if [ ${#newly_changed[@]} -gt 0 ]; then
+        printf '\n  Found local changes not in custom list (%d files):\n' "${#newly_changed[@]}"
+        local new_customs=()
+        for file in "${newly_changed[@]}"; do
+            printf '\n  %s\n' "$file"
+            git diff --stat master -- "$file" 2>/dev/null || true
+            
+            printf '  Keep local changes? [k=keep/m=use master] '
+            read -r -t 30 choice || choice="m"
+            case "$choice" in
+                [kK])
+                    printf '    → Keeping as custom file\n'
+                    new_customs+=("$file")
+                    ;;
+                *)
+                    printf '    → Syncing to master\n'
+                    git checkout master -- "$file" 2>/dev/null || true
+                    ;;
+            esac
+        done
+
+        # Add new customs to list
+        if [ ${#new_customs[@]} -gt 0 ]; then
+            printf '\nAdding %d files to custom list...\n' "${#new_customs[@]}"
+            for file in "${new_customs[@]}"; do
+                DOTFILES_CUSTOM_FILES+=("$file")
+            done
+            dotfiles_save_config
+        fi
+    else
+        printf '  ✓ No new local changes detected\n'
+    fi
+
+    # Update host mapping
+    mkdir -p "$CONFIG_DIR"
+    {
+        # Read existing entries excluding this host
+        grep -v "^${host}:" "$host_map_file" 2>/dev/null || true
+        # Add/update current host
+        printf '%s:%s\n' "$host" "$DOTFILES_BRANCH"
+    } | sort -u > "$host_map_file.tmp"
+    mv "$host_map_file.tmp" "$host_map_file"
+
+    # Commit changes if any
+    if ! git diff --cached --quiet 2>/dev/null || ! git diff --quiet 2>/dev/null; then
+        printf '\nCommit changes? [y/n] '
+        read -r -t 30 commit_ans || commit_ans="n"
+        if [[ "$commit_ans" =~ ^[Yy] ]]; then
+            printf 'Commit message (default: sync): '
+            read -r -t 30 msg || msg=""
+            msg="${msg:-sync: $(date +%Y-%m-%d)}"
+            git add -A
+            git commit -m "$msg"
+            printf '  ✓ Committed\n'
+        fi
+    fi
+
+    # Pop stash if we stashed
+    if [ $stashed -eq 1 ]; then
+        git stash pop 2>/dev/null || printf '  ⚠ Stash pop had conflicts; resolve manually\n'
+    fi
+
+    printf '\n✓ Dotfiles sync complete on %s\n' "$DOTFILES_BRANCH"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dotfiles Config Management
+# ─────────────────────────────────────────────────────────────────────────────
+
+DOTFILES_CONFIG_FILE="${CONFIG_DIR}/dotfiles-custom-files"
+
+dotfiles_load_config() {
+    if [ -f "$DOTFILES_CONFIG_FILE" ]; then
+        DOTFILES_CUSTOM_FILES=()
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            line="${line%"${line##*[![:space:]]}"}"
+            [ -z "$line" ] || [[ "$line" == \#* ]] && continue
+            DOTFILES_CUSTOM_FILES+=("$line")
+        done < "$DOTFILES_CONFIG_FILE"
+    fi
+}
+
+dotfiles_save_config() {
+    mkdir -p "$CONFIG_DIR"
+    {
+        echo "# Dotfiles custom files (per-host customizations)"
+        echo "# One path per line, relative to dotfiles repo root"
+        echo ""
+        for file in "${DOTFILES_CUSTOM_FILES[@]}"; do
+            echo "$file"
+        done
+    } > "$DOTFILES_CONFIG_FILE"
+}
+
+show_dotfiles_config_menu() {
+    local editor="${EDITOR:-nano}"
+
+    clear
+    printf 'Edit custom dotfiles list\n'
+    printf 'Config file: %s\n' "$DOTFILES_CONFIG_FILE"
+    printf '\nOne path per line, relative to dotfiles root.\n'
+    printf 'Lines starting with # are comments.\n'
+    printf '\nOpening %s...\n' "$editor"
+    sleep 1
+
+    mkdir -p "$CONFIG_DIR"
+    
+    # Create default config if doesn't exist
+    if [ ! -f "$DOTFILES_CONFIG_FILE" ]; then
+        dotfiles_save_config
+    fi
+
+    # Open editor
+    "$editor" "$DOTFILES_CONFIG_FILE"
+
+    # Reload config
+    dotfiles_load_config
+
+    printf '\n✓ Config updated\n'
+    pause_for_user
+    rescan
+}
+
+show_dotfiles_hosts() {
+    local host_map_file="$CONFIG_DIR/dotfiles-hosts"
+    
+    clear
+    printf 'Dotfiles Host to Branch Mapping\n'
+    printf 'File: %s\n\n' "$host_map_file"
+    
+    if [ ! -f "$host_map_file" ]; then
+        printf '  (No hosts mapped yet - run sync to create)\n'
+    else
+        printf '  HOST            BRANCH\n'
+        printf '  ─────────────── ────────────────\n'
+        while IFS=: read -r host branch; do
+            printf '  %-15s %s\n' "$host" "$branch"
+        done < "$host_map_file"
+    fi
+    
+    printf '\n'
+    pause_for_user
+}
+
 fetch_all_repos() {
     local total=${#paths[@]}
     local current=0
@@ -457,6 +840,7 @@ EXCLUDE_DIRS=(
 
 load_user_excludes
 build_find_args
+dotfiles_load_config
 
 # Check if we should run in JSON mode (will be handled after repo scan)
 JSON_MODE=0
@@ -478,14 +862,31 @@ if [ "$FIRST_ARG" = "--commit" ]; then
     COMMIT_TARGET="$SECOND_ARG"
 fi
 
+# Check for dotfiles sync mode
+DOTFILES_MODE=0
+DOTFILES_DIR="${HOME}/dotfiles"
+if [ "$FIRST_ARG" = "--dotfiles" ]; then
+    DOTFILES_MODE=1
+fi
+
 INTERACTIVE_MODE=1
-if [ "$JSON_MODE" -eq 1 ] || [ "$FIRST_ARG" = "--sync" ] || [ "$FIRST_ARG" = "-s" ] || [ "$COMMIT_MODE" -eq 1 ]; then
+if [ "$JSON_MODE" -eq 1 ] || [ "$FIRST_ARG" = "--sync" ] || [ "$FIRST_ARG" = "-s" ] || [ "$COMMIT_MODE" -eq 1 ] || [ "$DOTFILES_MODE" -eq 1 ]; then
     INTERACTIVE_MODE=0
 fi
 
 if [ "$INTERACTIVE_MODE" -eq 1 ] && ! command -v fzf >/dev/null 2>&1; then
     echo "fzf is required for interactive mode." >&2
     exit 1
+fi
+
+# Handle dotfiles sync mode early (before repo scan)
+if [ "$DOTFILES_MODE" -eq 1 ]; then
+    if [ ! -d "$DOTFILES_DIR" ]; then
+        printf 'Dotfiles directory not found: %s\n' "$DOTFILES_DIR" >&2
+        exit 1
+    fi
+    sync_dotfiles "$DOTFILES_DIR"
+    exit 0
 fi
 
 if [ "$JSON_MODE" -eq 0 ]; then
@@ -739,6 +1140,12 @@ build_main_items() {
         printf 'action\tcommit_dirty\t💾  Commit all dirty repos\t-\t-\n'
     fi
 
+    if [ -d "$HOME/dotfiles" ]; then
+        printf 'action\tdotfiles\t📦  Sync dotfiles (host-specific)\t-\t-\n'
+        printf 'action\tdotfiles_hosts\t🖥  View host→branch mapping\t-\t-\n'
+        printf 'action\tdotfiles_config\t⚙  Configure custom files list\t-\t-\n'
+    fi
+
     if [ "${#invalid_git_dirs[@]}" -gt 0 ]; then
         printf 'action\tinvalid\t⚠  Invalid Git dirs (%d)\t-\t-\n' "${#invalid_git_dirs[@]}"
     fi
@@ -793,6 +1200,9 @@ fi
 case "$id" in
     sync_all) echo "Pull repositories that are behind. Dirty and diverged repos are skipped." ;;
     commit_dirty) echo "Commit and push all repositories currently marked dirty." ;;
+    dotfiles) echo "Sync dotfiles with per-host git branching. Auto-discovers customizations." ;;
+    dotfiles_hosts) echo "View which hosts map to which git branches (reference)." ;;
+    dotfiles_config) echo "Manually edit list of per-host custom files." ;;
     sync_group) echo "Pull repositories in this group that are behind. Dirty and diverged repos are skipped." ;;
     commit_group) echo "Commit and push dirty repositories in this group." ;;
     back) echo "Return to the group list." ;;
@@ -896,6 +1306,18 @@ handle_main_selection() {
             ;;
         commit_dirty)
             run_commit_dirty_repos
+            ;;
+        dotfiles)
+            clear
+            sync_dotfiles "$HOME/dotfiles"
+            pause_for_user
+            rescan
+            ;;
+        dotfiles_hosts)
+            show_dotfiles_hosts
+            ;;
+        dotfiles_config)
+            show_dotfiles_config_menu
             ;;
         invalid)
             show_invalid_git_dirs
