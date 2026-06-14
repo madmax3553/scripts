@@ -27,10 +27,13 @@ DIARY_DIR="${JOURNAL_DIR}/diary"
 TODO_FILE="${JOURNAL_DIR}/TODO.md"
 DASHBOARD_FILE="${JOURNAL_DIR}/index.md"
 NOTES_DIR="${JOURNAL_DIR}/notes"
+WATCHLIST_FILE="${NOTES_DIR}/watchlist.md"
+WATCHLIST_SCRIPT="${WATCHLIST_SCRIPT:-${HOME}/.local/bin/update_watchlist.py}"
 TERMINAL="${TERMINAL:-ghostty}"
 TITLE_PREFIX="${TITLE_PREFIX:-Journal}"
 DASHBOARD_TITLE="${TITLE_PREFIX} Dashboard"
 TODO_TITLE="${TITLE_PREFIX} TODO"
+WATCHLIST_TITLE="${TITLE_PREFIX} Watchlist"
 JOURNAL_FLOAT_CENTER="${JOURNAL_FLOAT_CENTER:-0}"
 LOG_FILE="${JOURNAL_LOG_FILE:-${XDG_STATE_HOME:-${HOME}/.local/state}/journal.log}"
 
@@ -612,7 +615,10 @@ ensure_today() {
         create_today_template
         log_success "Created today's journal entry"
         journal_log "updating watchlist streaming info..."
-        timeout 15 "${HOME}/.local/bin/update_watchlist.py" --append-diary "${JOURNAL_FILE}" || journal_log "watchlist update failed"
+        timeout 15 "${WATCHLIST_SCRIPT}" \
+            --watchlist "${WATCHLIST_FILE}" \
+            --archive-watched \
+            --append-diary "${JOURNAL_FILE}" || journal_log "watchlist update failed"
     elif ! journal_has_template; then
         recover_untemplated_journal
         log_success "Restored today's journal template"
@@ -914,6 +920,71 @@ cmd_surface_todo() {
     if ! focus_window_by_title "${TODO_TITLE}"; then
         launch_markdown_file "${TODO_TITLE}" "${TODO_FILE}"
     fi
+}
+
+cmd_watchlist() {
+    local subcmd="${1:-open}"
+    shift || true
+
+    case "${subcmd}" in
+        open)
+            if [[ -f "${WATCHLIST_FILE}" ]]; then
+                launch_markdown_file "${WATCHLIST_TITLE}" "${WATCHLIST_FILE}"
+            else
+                log_error "Watchlist file not found: ${WATCHLIST_FILE}"
+                exit 1
+            fi
+            ;;
+        update)
+            log_info "Updating watchlist availability and archive..."
+            "${WATCHLIST_SCRIPT}" \
+                --watchlist "${WATCHLIST_FILE}" \
+                --archive-watched \
+                "$@"
+            ;;
+        archive)
+            log_info "Archiving checked watchlist items..."
+            "${WATCHLIST_SCRIPT}" \
+                --watchlist "${WATCHLIST_FILE}" \
+                --no-streaming \
+                --archive-watched \
+                "$@"
+            ;;
+        suggest)
+            if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+                local count="$1"
+                shift
+                set -- --suggest-count "${count}" "$@"
+            fi
+
+            log_info "Requesting watchlist suggestions from agy..."
+            "${WATCHLIST_SCRIPT}" \
+                --watchlist "${WATCHLIST_FILE}" \
+                --no-streaming \
+                --suggest \
+                "$@"
+            ;;
+        help|--help|-h)
+            cat << EOF
+${HEADER}Watchlist Commands${RESET}
+
+${BOLD}Usage:${RESET}
+    journal.sh watchlist [open|update|archive|suggest]
+
+${BOLD}Commands:${RESET}
+    ${CYAN}open${RESET}             - Open notes/watchlist.md
+    ${CYAN}update${RESET}           - Refresh JustWatch statuses and archive watched items
+    ${CYAN}archive${RESET}          - Archive checked items without refreshing streaming data
+    ${CYAN}suggest [count]${RESET}  - Ask agy for suggestions and add them to the inbox
+
+EOF
+            ;;
+        *)
+            log_error "Unknown watchlist command: ${subcmd}"
+            cmd_watchlist help
+            exit 1
+            ;;
+    esac
 }
 
 # ===== Weekly Summary Command =====
@@ -1598,6 +1669,7 @@ ${BOLD}Commands:${RESET}
     ${CYAN}surface-dashboard${RESET}      - Focus existing dashboard or open if not found
     ${CYAN}todo${RESET}                   - Open master TODO list
     ${CYAN}surface-todo${RESET}           - Focus existing TODO list or open if not found
+    ${CYAN}watchlist${RESET}              - Open/update/archive/suggest watchlist items
     ${CYAN}plan${RESET}                   - Generate today's daily plan
     ${CYAN}commits${RESET}                - Update today's diary with git commits
     ${CYAN}review${RESET}                 - Review outstanding TODOs
@@ -1613,6 +1685,8 @@ ${BOLD}Examples:${RESET}
     journal.sh surface       # Focus existing or open
     journal.sh surface-dashboard  # Focus dashboard or open
     journal.sh surface-todo  # Focus TODO list or open
+    journal.sh watchlist update  # Refresh streaming statuses and archive watched items
+    journal.sh watchlist suggest 5  # Ask agy for 5 reviewable suggestions
     journal.sh plan          # Generate daily plan
     journal.sh commits       # Update today's git commit summary
     journal.sh review        # Show outstanding TODOs
@@ -1655,6 +1729,10 @@ main() {
             ;;
         surface-todo)
             cmd_surface_todo
+            ;;
+        watchlist)
+            shift
+            cmd_watchlist "$@"
             ;;
         plan)
             cmd_plan
