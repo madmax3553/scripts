@@ -36,13 +36,13 @@ USAGE:
 
 DOTFILES SYNC:
   Manages dotfiles across multiple systems using per-host git branches.
-  
+
   Architecture:
     master           - primary machine (ArchyTux) source of truth
     host-<hostname>  - secondary machines: sync from master, customizations only
-  
+
   Branch strategy:
-  
+
   Workflow (smart auto-discovery):
     1. Detects hostname → manages host-<hostname> branch
     2. Fetches master, updates local master
@@ -51,9 +51,9 @@ DOTFILES SYNC:
     5. New local changes: asks user to keep or sync to master
     6. Kept files: auto-added to custom list for future syncs
     7. Host→branch mapping maintained automatically
-  
+
   Philosophy: Unified dotfiles by default. Only host-specific when necessary.
-  
+
   Config files (auto-created):
     - ~/.config/repostatus/dotfiles-custom-files (discovered custom files)
     - ~/.config/repostatus/dotfiles-hosts (host to branch reference)
@@ -71,7 +71,7 @@ FETCH_LOG="$CACHE_DIR/fetch.log"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/repostatus"
 EXCLUDES_FILE="$CONFIG_DIR/excludes"
 mkdir -p "$CACHE_DIR"
-: > "$FETCH_LOG"
+: >"$FETCH_LOG"
 
 # Status indicators
 CLEAN="🟢"
@@ -153,14 +153,14 @@ get_repo_status() {
 # Plain text icons for fzf display
 get_status_icon_plain() {
     case "$1" in
-        clean)   echo "$CLEAN" ;;
-        dirty)   echo "$DIRTY" ;;
-        ahead)   echo "$AHEAD" ;;
-        behind)  echo "$BEHIND" ;;
-        diverged) echo "$DIVERGED" ;;
-        uninitialized) echo "$UNINITIALIZED" ;;
-        fetch_failed) echo "$FETCH_FAILED" ;;
-        *)       echo "❓" ;;
+    clean) echo "$CLEAN" ;;
+    dirty) echo "$DIRTY" ;;
+    ahead) echo "$AHEAD" ;;
+    behind) echo "$BEHIND" ;;
+    diverged) echo "$DIVERGED" ;;
+    uninitialized) echo "$UNINITIALIZED" ;;
+    fetch_failed) echo "$FETCH_FAILED" ;;
+    *) echo "❓" ;;
     esac
 }
 
@@ -168,11 +168,14 @@ get_worst_status() {
     local worst="clean"
     for status in "$@"; do
         case "$status" in
-            diverged) worst="diverged"; break ;;
-            fetch_failed) worst="fetch_failed" ;;
-            dirty|uninitialized) [ "$worst" != "fetch_failed" ] && worst="dirty" ;;
-            behind) [ "$worst" != "dirty" ] && [ "$worst" != "fetch_failed" ] && worst="behind" ;;
-            ahead) [ "$worst" != "dirty" ] && [ "$worst" != "behind" ] && [ "$worst" != "fetch_failed" ] && worst="ahead" ;;
+        diverged)
+            worst="diverged"
+            break
+            ;;
+        fetch_failed) worst="fetch_failed" ;;
+        dirty | uninitialized) [ "$worst" != "fetch_failed" ] && worst="dirty" ;;
+        behind) [ "$worst" != "dirty" ] && [ "$worst" != "fetch_failed" ] && worst="behind" ;;
+        ahead) [ "$worst" != "dirty" ] && [ "$worst" != "behind" ] && [ "$worst" != "fetch_failed" ] && worst="ahead" ;;
         esac
     done
     echo "$worst"
@@ -218,22 +221,22 @@ sync_repos() {
         printf '[%d/%d] Syncing %s\n' "$current" "$total" "$repo_name"
 
         case "$status" in
-            behind)
-                if git pull --quiet 2>/dev/null; then
-                    synced=$((synced + 1))
-                else
-                    failed+=("$repo_name")
-                fi
-                ;;
-            dirty)
-                skipped_dirty+=("$repo_name")
-                ;;
-            diverged)
-                skipped_diverged+=("$repo_name")
-                ;;
-            clean|ahead)
-                up_to_date=$((up_to_date + 1))
-                ;;
+        behind)
+            if git pull --quiet 2>/dev/null; then
+                synced=$((synced + 1))
+            else
+                failed+=("$repo_name")
+            fi
+            ;;
+        dirty)
+            skipped_dirty+=("$repo_name")
+            ;;
+        diverged)
+            skipped_diverged+=("$repo_name")
+            ;;
+        clean | ahead)
+            up_to_date=$((up_to_date + 1))
+            ;;
         esac
     done
 
@@ -293,10 +296,10 @@ commit_repos() {
         if [ "$status" = "dirty" ]; then
             # Stage all changes
             git add -A
-            
+
             # Create commit message
             local commit_msg="Update $repo_name: $(date '+%Y-%m-%d')"
-            
+
             # Attempt commit
             if git commit -m "$commit_msg" >/dev/null 2>&1; then
                 # Attempt push
@@ -413,18 +416,18 @@ dotfiles_review_custom_file() {
     while true; do
         read -r -t 30 choice || choice="k"
         case "$choice" in
-            [mM])
-                git -C "$dotfiles_dir" checkout "master" -- "$relpath" 2>/dev/null || true
-                printf '  ✓ Using master\n'
-                return 0
-                ;;
-            [kK])
-                printf '  ✓ Keeping local\n'
-                return 0
-                ;;
-            *)
-                printf '  Enter m or k: '
-                ;;
+        [mM])
+            git -C "$dotfiles_dir" checkout "master" -- "$relpath" 2>/dev/null || true
+            printf '  ✓ Using master\n'
+            return 0
+            ;;
+        [kK])
+            printf '  ✓ Keeping local\n'
+            return 0
+            ;;
+        *)
+            printf '  Enter m or k: '
+            ;;
         esac
     done
 }
@@ -443,7 +446,7 @@ sync_dotfiles() {
     host=$(hostname -s)
     DOTFILES_BRANCH="host-${host}"
     local host_map_file="$CONFIG_DIR/dotfiles-hosts"
-    
+
     # Architecture: ArchyTux is master branch owner
     # Other hosts sync from master and customize only when necessary
     local primary_host="ArchyTux"
@@ -474,8 +477,8 @@ sync_dotfiles() {
     # Update master
     printf '  Updating master...\n'
     git checkout master 2>/dev/null
-    git rebase origin/master 2>/dev/null || \
-        git pull --rebase origin master 2>/dev/null || \
+    git rebase origin/master 2>/dev/null ||
+        git pull --rebase origin master 2>/dev/null ||
         printf '  ⚠ Could not update master\n'
 
     # Create/checkout host branch
@@ -524,18 +527,18 @@ sync_dotfiles() {
         for file in "${newly_changed[@]}"; do
             printf '\n  %s\n' "$file"
             git diff --stat master -- "$file" 2>/dev/null || true
-            
+
             printf '  Keep local changes? [k=keep/m=use master] '
             read -r -t 30 choice || choice="m"
             case "$choice" in
-                [kK])
-                    printf '    → Keeping as custom file\n'
-                    new_customs+=("$file")
-                    ;;
-                *)
-                    printf '    → Syncing to master\n'
-                    git checkout master -- "$file" 2>/dev/null || true
-                    ;;
+            [kK])
+                printf '    → Keeping as custom file\n'
+                new_customs+=("$file")
+                ;;
+            *)
+                printf '    → Syncing to master\n'
+                git checkout master -- "$file" 2>/dev/null || true
+                ;;
             esac
         done
 
@@ -558,7 +561,7 @@ sync_dotfiles() {
         grep -v "^${host}:" "$host_map_file" 2>/dev/null || true
         # Add/update current host
         printf '%s:%s\n' "$host" "$DOTFILES_BRANCH"
-    } | sort -u > "$host_map_file.tmp"
+    } | sort -u >"$host_map_file.tmp"
     mv "$host_map_file.tmp" "$host_map_file"
 
     # Commit changes if any
@@ -597,7 +600,7 @@ dotfiles_load_config() {
             line="${line%"${line##*[![:space:]]}"}"
             [ -z "$line" ] || [[ "$line" == \#* ]] && continue
             DOTFILES_CUSTOM_FILES+=("$line")
-        done < "$DOTFILES_CONFIG_FILE"
+        done <"$DOTFILES_CONFIG_FILE"
     fi
 }
 
@@ -610,7 +613,7 @@ dotfiles_save_config() {
         for file in "${DOTFILES_CUSTOM_FILES[@]}"; do
             echo "$file"
         done
-    } > "$DOTFILES_CONFIG_FILE"
+    } >"$DOTFILES_CONFIG_FILE"
 }
 
 show_dotfiles_config_menu() {
@@ -625,7 +628,7 @@ show_dotfiles_config_menu() {
     sleep 1
 
     mkdir -p "$CONFIG_DIR"
-    
+
     # Create default config if doesn't exist
     if [ ! -f "$DOTFILES_CONFIG_FILE" ]; then
         dotfiles_save_config
@@ -644,11 +647,11 @@ show_dotfiles_config_menu() {
 
 show_dotfiles_hosts() {
     local host_map_file="$CONFIG_DIR/dotfiles-hosts"
-    
+
     clear
     printf 'Dotfiles Host to Branch Mapping\n'
     printf 'File: %s\n\n' "$host_map_file"
-    
+
     if [ ! -f "$host_map_file" ]; then
         printf '  (No hosts mapped yet - run sync to create)\n'
     else
@@ -656,9 +659,9 @@ show_dotfiles_hosts() {
         printf '  ─────────────── ────────────────\n'
         while IFS=: read -r host branch; do
             printf '  %-15s %s\n' "$host" "$branch"
-        done < "$host_map_file"
+        done <"$host_map_file"
     fi
-    
+
     printf '\n'
     pause_for_user
 }
@@ -687,7 +690,7 @@ fetch_all_repos() {
                 echo "[$(date --iso-8601=seconds)] ${repo_path}"
                 echo "$output"
                 echo ""
-            } >> "$FETCH_LOG"
+            } >>"$FETCH_LOG"
         fi
     done
 }
@@ -721,7 +724,7 @@ load_user_excludes() {
         fi
 
         USER_EXCLUDE_DIRS+=("$(normalize_exclude "$line")")
-    done < "$EXCLUDES_FILE"
+    done <"$EXCLUDES_FILE"
 }
 
 exclude_exists() {
@@ -752,7 +755,7 @@ add_user_exclude() {
     fi
 
     mkdir -p "$CONFIG_DIR"
-    printf '%s\n' "$exclude" >> "$EXCLUDES_FILE"
+    printf '%s\n' "$exclude" >>"$EXCLUDES_FILE"
     USER_EXCLUDE_DIRS+=("$exclude")
 }
 
@@ -762,11 +765,11 @@ remove_user_exclude() {
     local i
 
     mkdir -p "$CONFIG_DIR"
-    : > "$EXCLUDES_FILE"
+    : >"$EXCLUDES_FILE"
 
     for i in "${!USER_EXCLUDE_DIRS[@]}"; do
         if [ "$i" -ne "$remove_index" ]; then
-            printf '%s\n' "${USER_EXCLUDE_DIRS[$i]}" >> "$EXCLUDES_FILE"
+            printf '%s\n' "${USER_EXCLUDE_DIRS[$i]}" >>"$EXCLUDES_FILE"
             new_excludes+=("${USER_EXCLUDE_DIRS[$i]}")
         fi
     done
@@ -969,7 +972,7 @@ fi
 
 if [ "$NO_VALID_REPOS" -eq 0 ] && [ "$should_fetch" -eq 1 ]; then
     fetch_all_repos
-    date +%s > "$LAST_FETCH_FILE"
+    date +%s >"$LAST_FETCH_FILE"
 fi
 
 # Handle JSON mode output
@@ -1031,12 +1034,12 @@ if [ "$COMMIT_MODE" -eq 1 ]; then
                 dirty_repos+=("${paths[$i]}")
             fi
         done
-        
+
         if [ ${#dirty_repos[@]} -eq 0 ]; then
             echo "No dirty repositories found."
             exit 0
         fi
-        
+
         commit_repos "${dirty_repos[@]}"
     else
         # Commit specific repo
@@ -1164,7 +1167,7 @@ build_main_items() {
     fi
 
     for group in "${group_list[@]}"; do
-        IFS=',' read -ra group_indices <<< "${dir_repos[$group]}"
+        IFS=',' read -ra group_indices <<<"${dir_repos[$group]}"
         repo_count=${#group_indices[@]}
         icon=$(get_status_icon_plain "${dir_statuses[$group]}")
         display=$(printf '%s  %-24s %-14s %3d repos' \
@@ -1255,37 +1258,37 @@ show_main_menu() {
         local display
         local selected_path
         local selected_status
-        IFS=$'\t' read -r kind item_id display selected_path selected_status <<< "$line"
+        IFS=$'\t' read -r kind item_id display selected_path selected_status <<<"$line"
 
         case "$key" in
-            ctrl-r)
-                rescan
-                ;;
-            alt-a)
-                run_and_rescan sync_repos "${paths[@]}"
-                ;;
-            alt-p)
-                run_commit_dirty_repos
-                ;;
-            alt-x)
-                show_invalid_git_dirs
-                ;;
-            alt-e)
-                show_excludes_menu
-                ;;
-            alt-s)
-                if [ "$kind" = "group" ]; then
-                    run_sync_group "$item_id"
-                fi
-                ;;
-            alt-d)
-                if [ "$kind" = "group" ]; then
-                    run_commit_group_dirty_repos "$item_id"
-                fi
-                ;;
-            enter|"")
-                handle_main_selection "$kind" "$item_id" "$selected_path" "$selected_status"
-                ;;
+        ctrl-r)
+            rescan
+            ;;
+        alt-a)
+            run_and_rescan sync_repos "${paths[@]}"
+            ;;
+        alt-p)
+            run_commit_dirty_repos
+            ;;
+        alt-x)
+            show_invalid_git_dirs
+            ;;
+        alt-e)
+            show_excludes_menu
+            ;;
+        alt-s)
+            if [ "$kind" = "group" ]; then
+                run_sync_group "$item_id"
+            fi
+            ;;
+        alt-d)
+            if [ "$kind" = "group" ]; then
+                run_commit_group_dirty_repos "$item_id"
+            fi
+            ;;
+        enter | "")
+            handle_main_selection "$kind" "$item_id" "$selected_path" "$selected_status"
+            ;;
         esac
     done
 }
@@ -1301,36 +1304,36 @@ handle_main_selection() {
     fi
 
     case "$item_id" in
-        sync_all)
-            run_and_rescan sync_repos "${paths[@]}"
-            ;;
-        commit_dirty)
-            run_commit_dirty_repos
-            ;;
-        dotfiles)
-            clear
-            sync_dotfiles "$HOME/dotfiles"
-            pause_for_user
-            rescan
-            ;;
-        dotfiles_hosts)
-            show_dotfiles_hosts
-            ;;
-        dotfiles_config)
-            show_dotfiles_config_menu
-            ;;
-        invalid)
-            show_invalid_git_dirs
-            ;;
-        excludes)
-            show_excludes_menu
-            ;;
-        legend)
-            show_legend
-            ;;
-        rescan)
-            rescan
-            ;;
+    sync_all)
+        run_and_rescan sync_repos "${paths[@]}"
+        ;;
+    commit_dirty)
+        run_commit_dirty_repos
+        ;;
+    dotfiles)
+        clear
+        sync_dotfiles "$HOME/dotfiles"
+        pause_for_user
+        rescan
+        ;;
+    dotfiles_hosts)
+        show_dotfiles_hosts
+        ;;
+    dotfiles_config)
+        show_dotfiles_config_menu
+        ;;
+    invalid)
+        show_invalid_git_dirs
+        ;;
+    excludes)
+        show_excludes_menu
+        ;;
+    legend)
+        show_legend
+        ;;
+    rescan)
+        rescan
+        ;;
     esac
 }
 
@@ -1340,7 +1343,7 @@ build_group_paths() {
     local idx
 
     group_paths=()
-    IFS=',' read -ra group_indices <<< "${dir_repos[$group]}"
+    IFS=',' read -ra group_indices <<<"${dir_repos[$group]}"
     for idx in "${group_indices[@]}"; do
         group_paths+=("${paths[$idx]}")
     done
@@ -1352,7 +1355,7 @@ build_group_dirty_paths() {
     local idx
 
     group_dirty_paths=()
-    IFS=',' read -ra group_indices <<< "${dir_repos[$group]}"
+    IFS=',' read -ra group_indices <<<"${dir_repos[$group]}"
     for idx in "${group_indices[@]}"; do
         if [ "${statuses[$idx]}" = "dirty" ]; then
             group_dirty_paths+=("${paths[$idx]}")
@@ -1399,7 +1402,7 @@ build_group_repo_items() {
     printf 'action\tcommit_group\t💾  Commit dirty repos in %s\t-\t-\n' "$group"
     printf 'action\tback\t←  Back to groups\t-\t-\n'
 
-    IFS=',' read -ra group_indices <<< "${dir_repos[$group]}"
+    IFS=',' read -ra group_indices <<<"${dir_repos[$group]}"
     for idx in "${group_indices[@]}"; do
         icon=$(get_status_icon_plain "${statuses[$idx]}")
         display=$(printf '%s  %-30s %-14s %s' \
@@ -1448,34 +1451,34 @@ show_group_repos() {
         local display
         local selected_path
         local selected_status
-        IFS=$'\t' read -r kind item_id display selected_path selected_status <<< "$line"
+        IFS=$'\t' read -r kind item_id display selected_path selected_status <<<"$line"
 
         case "$key" in
-            ctrl-r)
-                rescan
-                ;;
-            alt-a)
-                run_sync_group "$group"
-                ;;
-            alt-p)
-                run_commit_group_dirty_repos "$group"
-                ;;
-            alt-s)
-                if [ "$kind" = "repo" ]; then
-                    run_and_rescan sync_repos "$selected_path"
-                fi
-                ;;
-            alt-d)
-                if [ "$kind" = "repo" ]; then
-                    run_commit_selected_repo "$selected_path" "$selected_status"
-                fi
-                ;;
-            enter|"")
-                if [ "$kind" = "action" ] && [ "$item_id" = "back" ]; then
-                    return
-                fi
-                handle_group_selection "$group" "$kind" "$item_id" "$selected_path" "$selected_status"
-                ;;
+        ctrl-r)
+            rescan
+            ;;
+        alt-a)
+            run_sync_group "$group"
+            ;;
+        alt-p)
+            run_commit_group_dirty_repos "$group"
+            ;;
+        alt-s)
+            if [ "$kind" = "repo" ]; then
+                run_and_rescan sync_repos "$selected_path"
+            fi
+            ;;
+        alt-d)
+            if [ "$kind" = "repo" ]; then
+                run_commit_selected_repo "$selected_path" "$selected_status"
+            fi
+            ;;
+        enter | "")
+            if [ "$kind" = "action" ] && [ "$item_id" = "back" ]; then
+                return
+            fi
+            handle_group_selection "$group" "$kind" "$item_id" "$selected_path" "$selected_status"
+            ;;
         esac
     done
 }
@@ -1492,15 +1495,15 @@ handle_group_selection() {
     fi
 
     case "$item_id" in
-        sync_group)
-            run_sync_group "$group"
-            ;;
-        commit_group)
-            run_commit_group_dirty_repos "$group"
-            ;;
-        back)
-            return
-            ;;
+    sync_group)
+        run_sync_group "$group"
+        ;;
+    commit_group)
+        run_commit_group_dirty_repos "$group"
+        ;;
+    back)
+        return
+        ;;
     esac
 }
 
@@ -1577,18 +1580,18 @@ show_excludes_menu() {
         local kind
         local item_id
         local display
-        IFS=$'\t' read -r kind item_id display <<< "$result"
+        IFS=$'\t' read -r kind item_id display <<<"$result"
 
         case "$kind:$item_id" in
-            action:add)
-                add_exclude_prompt
-                ;;
-            action:builtin)
-                show_builtin_excludes
-                ;;
-            exclude:*)
-                remove_exclude_prompt "$item_id"
-                ;;
+        action:add)
+            add_exclude_prompt
+            ;;
+        action:builtin)
+            show_builtin_excludes
+            ;;
+        exclude:*)
+            remove_exclude_prompt "$item_id"
+            ;;
         esac
     done
 }
@@ -1710,20 +1713,20 @@ show_invalid_git_dirs() {
         local git_dir
         local repo_dir
         local reason
-        IFS=$'\t' read -r index display git_dir repo_dir reason <<< "$line"
+        IFS=$'\t' read -r index display git_dir repo_dir reason <<<"$line"
 
         case "$key" in
-            alt-p)
-                add_invalid_exclude_and_rescan "$repo_dir"
-                ;;
-            alt-n)
-                add_invalid_exclude_and_rescan "$(basename "$repo_dir")"
-                ;;
-            enter|"")
-                clear
-                cd "$repo_dir" || exit 1
-                exec "${SHELL:-/bin/bash}"
-                ;;
+        alt-p)
+            add_invalid_exclude_and_rescan "$repo_dir"
+            ;;
+        alt-n)
+            add_invalid_exclude_and_rescan "$(basename "$repo_dir")"
+            ;;
+        enter | "")
+            clear
+            cd "$repo_dir" || exit 1
+            exec "${SHELL:-/bin/bash}"
+            ;;
         esac
     done
 }
