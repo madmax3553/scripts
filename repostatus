@@ -900,7 +900,7 @@ fi
 declare -a git_dirs
 while IFS= read -r -d '' git_dir; do
     git_dirs+=("$git_dir")
-done < <(find "${FIND_ARGS[@]}" 2>/dev/null | head -z -n 50)
+done < <(find "${FIND_ARGS[@]}" 2>/dev/null)
 
 NO_VALID_REPOS=0
 total_repos=${#git_dirs[@]}
