@@ -29,11 +29,14 @@ DASHBOARD_FILE="${JOURNAL_DIR}/index.md"
 NOTES_DIR="${JOURNAL_DIR}/notes"
 WATCHLIST_FILE="${NOTES_DIR}/watchlist.md"
 WATCHLIST_SCRIPT="${WATCHLIST_SCRIPT:-${HOME}/.local/bin/update_watchlist.py}"
+READLIST_FILE="${NOTES_DIR}/readlist.md"
+READLIST_SCRIPT="${READLIST_SCRIPT:-${HOME}/projects/scripts/journal/update_readlist.py}"
 TERMINAL="${TERMINAL:-ghostty}"
 TITLE_PREFIX="${TITLE_PREFIX:-Journal}"
 DASHBOARD_TITLE="${TITLE_PREFIX} Dashboard"
 TODO_TITLE="${TITLE_PREFIX} TODO"
 WATCHLIST_TITLE="${TITLE_PREFIX} Watchlist"
+READLIST_TITLE="${TITLE_PREFIX} Readlist"
 JOURNAL_FLOAT_CENTER="${JOURNAL_FLOAT_CENTER:-0}"
 LOG_FILE="${JOURNAL_LOG_FILE:-${XDG_STATE_HOME:-${HOME}/.local/state}/journal.log}"
 
@@ -987,6 +990,71 @@ EOF
     esac
 }
 
+cmd_readlist() {
+    local subcmd="${1:-open}"
+    shift || true
+
+    case "${subcmd}" in
+        open)
+            if [[ -f "${READLIST_FILE}" ]]; then
+                launch_markdown_file "${READLIST_TITLE}" "${READLIST_FILE}"
+            else
+                log_error "Readlist file not found: ${READLIST_FILE}"
+                exit 1
+            fi
+            ;;
+        import)
+            log_info "Importing Audible library into readlist..."
+            "${READLIST_SCRIPT}" \
+                --readlist "${READLIST_FILE}" \
+                --archive-finished \
+                "$@"
+            ;;
+        sync)
+            log_info "Syncing Audible library against readlist..."
+            "${READLIST_SCRIPT}" \
+                --readlist "${READLIST_FILE}" \
+                --sync \
+                "$@"
+            ;;
+        archive)
+            log_info "Archiving checked readlist items..."
+            "${READLIST_SCRIPT}" \
+                --readlist "${READLIST_FILE}" \
+                --no-import \
+                --archive-finished \
+                "$@"
+            ;;
+        help|--help|-h)
+            cat << EOF
+${HEADER}Readlist Commands${RESET}
+
+${BOLD}Usage:${RESET}
+    journal.sh readlist [open|import|sync|archive]
+
+${BOLD}Commands:${RESET}
+    ${CYAN}open${RESET}             - Open notes/readlist.md
+    ${CYAN}import${RESET}           - Import titles from Audible HTML and archive checked items
+    ${CYAN}sync${RESET}             - Import, compare owned set (delta), and fill missing metadata
+    ${CYAN}archive${RESET}          - Archive checked read items without importing
+
+${BOLD}Examples:${RESET}
+    journal.sh readlist import --audible-html ~/Downloads/Audible\ Library.html
+    journal.sh readlist import --fetch-audible-browser --audible-domain www.audible.ca
+    journal.sh readlist sync --fetch-audible-browser --audible-domain www.audible.ca
+    journal.sh readlist import --fetch-audible-api --audible-cookie-file ~/Downloads/audible-cookies.txt --audible-cookie-file ~/Downloads/amazon-cookies.txt
+    journal.sh readlist archive
+
+EOF
+            ;;
+        *)
+            log_error "Unknown readlist command: ${subcmd}"
+            cmd_readlist help
+            exit 1
+            ;;
+    esac
+}
+
 # ===== Weekly Summary Command =====
 
 todo_item_text() {
@@ -1670,6 +1738,7 @@ ${BOLD}Commands:${RESET}
     ${CYAN}todo${RESET}                   - Open master TODO list
     ${CYAN}surface-todo${RESET}           - Focus existing TODO list or open if not found
     ${CYAN}watchlist${RESET}              - Open/update/archive/suggest watchlist items
+    ${CYAN}readlist${RESET}               - Open/import/archive readlist items
     ${CYAN}plan${RESET}                   - Generate today's daily plan
     ${CYAN}commits${RESET}                - Update today's diary with git commits
     ${CYAN}review${RESET}                 - Review outstanding TODOs
@@ -1687,6 +1756,8 @@ ${BOLD}Examples:${RESET}
     journal.sh surface-todo  # Focus TODO list or open
     journal.sh watchlist update  # Refresh streaming statuses and archive watched items
     journal.sh watchlist suggest 5  # Ask agy for 5 reviewable suggestions
+    journal.sh readlist import --audible-html ~/Downloads/Audible\ Library.html
+    journal.sh readlist import --fetch-audible-browser --audible-domain www.audible.ca
     journal.sh plan          # Generate daily plan
     journal.sh commits       # Update today's git commit summary
     journal.sh review        # Show outstanding TODOs
@@ -1733,6 +1804,10 @@ main() {
         watchlist)
             shift
             cmd_watchlist "$@"
+            ;;
+        readlist)
+            shift
+            cmd_readlist "$@"
             ;;
         plan)
             cmd_plan

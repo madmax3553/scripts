@@ -12,7 +12,7 @@
 # Purpose: Display local network interface status in a Groot-styled terminal panel
 # Dependencies: ip, awk, date; optional: nmcli, resolvectl, tput
 # Author: groot
-# Modified: 2026-06-11
+# Modified: 2026-06-16
 
 set -euo pipefail
 
@@ -30,12 +30,9 @@ MIN_BOX_WIDTH=52
 LABEL_WIDTH=15
 
 NO_COLOR_MODE=0
-PAUSE_ON_EXIT=0
-OPEN_TERMINAL=0
-DEBUG_MODE=0
-DIAGNOSE_MODE=0
 BOX_WIDTH="$DEFAULT_BOX_WIDTH"
 VALUE_WIDTH=0
+TARGET_IFACE=""
 
 BORDER_COLOR="$BLUE"
 TITLE_COLOR="$LIGHT_CYAN"
@@ -61,254 +58,34 @@ LEASE_TIME="$NA"
 LEASE_EXPIRY="$NA"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Functions
+# CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [options]
+Usage: $(basename "$0") [options] [interface]
 
 Display the active network interface, address, gateway, DNS, and DHCP lease.
+With no interface, the one carrying the default route is used.
 
 Options:
-  -p, --pause     Wait for Enter before exiting
-  -t, --terminal  Open in a terminal when launched without a TTY
   -n, --no-color  Disable ANSI color output
-  -d, --debug     Print launch diagnostics to stderr
-  -D, --diagnose  Print launch and network diagnostics
   -h, --help      Show this help
 
 Environment:
   NETSTATUS_WIDTH  Override panel width (default: ${DEFAULT_BOX_WIDTH})
-  TERMINAL         Preferred terminal when launched without a TTY
 EOF
 }
 
 parse_args() {
     while (($#)); do
         case "$1" in
-            -p|--pause)
-                PAUSE_ON_EXIT=1
-                shift
-                ;;
-            -t|--terminal)
-                OPEN_TERMINAL=1
-                shift
-                ;;
-            -n|--no-color)
-                NO_COLOR_MODE=1
-                shift
-                ;;
-            -d|--debug)
-                DEBUG_MODE=1
-                shift
-                ;;
-            -D|--diagnose)
-                DEBUG_MODE=1
-                DIAGNOSE_MODE=1
-                shift
-                ;;
-            -h|--help)
-                usage
-                exit 0
-                ;;
-            *)
-                usage >&2
-                exit 1
-                ;;
+            -n|--no-color) NO_COLOR_MODE=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) usage >&2; exit 1 ;;
+            *) TARGET_IFACE="$1"; shift ;;
         esac
     done
-}
-
-debug_line() {
-    ((DEBUG_MODE)) || return 0
-    printf 'netstatus debug: %s\n' "$*" >&2
-}
-
-trace_line() {
-    [[ -d "$LOG_DIR" && -w "$LOG_DIR" ]] || return 0
-    [[ ! -e "$LOG_FILE" || -w "$LOG_FILE" ]] || return 0
-    printf '[%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" || true
-}
-
-tty_state() {
-    local fd="$1"
-
-    if [[ -t "$fd" ]]; then
-        printf 'yes'
-    else
-        printf 'no'
-    fi
-}
-
-fd_target() {
-    local fd="$1"
-    local target
-
-    target="$(readlink "/proc/$$/fd/${fd}" 2>/dev/null || true)"
-    [[ -n "$target" ]] && printf '%s' "$target" || printf 'unknown'
-}
-
-parent_command() {
-    local ppid="${PPID:-}"
-
-    [[ -n "$ppid" ]] || return 0
-    ps -p "$ppid" -o comm= 2>/dev/null | awk 'NF {print; exit}' || true
-}
-
-tty_open_state() {
-    local tty_fd
-
-    if { exec {tty_fd}>/dev/tty; } 2>/dev/null; then
-        exec {tty_fd}>&-
-        printf 'yes'
-    else
-        printf 'no'
-    fi
-}
-
-log_invocation() {
-    trace_line "start script=$(script_path) args=$*"
-    trace_line "cwd=$PWD parent=$(parent_command) pid=$$ ppid=${PPID:-unknown}"
-    trace_line "tty stdin=$(tty_state 0):$(fd_target 0) stdout=$(tty_state 1):$(fd_target 1) stderr=$(tty_state 2):$(fd_target 2)"
-    trace_line "PATH=$PATH"
-}
-
-script_path() {
-    local source_path="${BASH_SOURCE[0]}"
-    local resolved
-
-    if command -v readlink >/dev/null 2>&1; then
-        resolved="$(readlink -f -- "$source_path" 2>/dev/null || true)"
-        if [[ -n "$resolved" ]]; then
-            printf '%s' "$resolved"
-            return
-        fi
-    fi
-
-    printf '%s' "$source_path"
-}
-
-diagnose() {
-    local cmd
-
-    cat <<EOF
-netstatus diagnostics
-script:      $(script_path)
-cwd:         $PWD
-parent:      $(parent_command)
-pid/ppid:    $$/${PPID:-unknown}
-stdin:       tty=$(tty_state 0) target=$(fd_target 0)
-stdout:      tty=$(tty_state 1) target=$(fd_target 1)
-stderr:      tty=$(tty_state 2) target=$(fd_target 2)
-/dev/tty:    readable=$([[ -r /dev/tty ]] && printf yes || printf no) writable=$([[ -w /dev/tty ]] && printf yes || printf no)
-/dev/tty fd: writable=$(tty_open_state)
-PATH:        $PATH
-
-commands:
-EOF
-
-    for cmd in ip awk date nmcli resolvectl tput ghostty kitty notify-send; do
-        printf '  %-12s %s\n' "$cmd" "$(command -v "$cmd" 2>/dev/null || printf 'missing')"
-    done
-
-    cat <<EOF
-
-network probes:
-$(ip route show default 2>&1 | sed 's/^/  ip route default: /')
-$(ip -o link show up 2>&1 | sed 's/^/  ip link up:       /')
-
-log file:
-  $LOG_FILE
-EOF
-}
-
-terminal_candidates() {
-    local seen=""
-    local candidate
-
-    if [[ -n "${TERMINAL:-}" ]]; then
-        printf '%s\n' "$TERMINAL"
-        seen=":${TERMINAL}:"
-    fi
-
-    for candidate in ghostty kitty alacritty foot wezterm konsole gnome-terminal xterm; do
-        [[ "$seen" == *":${candidate}:"* ]] && continue
-        printf '%s\n' "$candidate"
-    done
-}
-
-launch_terminal() {
-    local terminal="$1"
-    local command="$2"
-    local terminal_name
-
-    terminal_name="$(basename "$terminal")"
-
-    case "$terminal_name" in
-        wezterm)
-            "$terminal" start -- bash -lc "$command"
-            ;;
-        gnome-terminal|kgx)
-            "$terminal" -- bash -lc "$command"
-            ;;
-        *)
-            "$terminal" -e bash -lc "$command"
-            ;;
-    esac
-}
-
-maybe_reopen_in_terminal() {
-    local source_path
-    local quoted_source
-    local command
-    local terminal
-
-    ((OPEN_TERMINAL)) || return 0
-    [[ "${NETSTATUS_NO_REEXEC:-0}" == "1" ]] && return 0
-    [[ -t 0 || -t 1 ]] && return 0
-
-    source_path="$(script_path)"
-    printf -v quoted_source '%q' "$source_path"
-    command="NETSTATUS_NO_REEXEC=1 ${quoted_source} --pause"
-    debug_line "detached launch detected; trying terminal reexec"
-
-    while IFS= read -r terminal; do
-        command -v "$terminal" >/dev/null 2>&1 || continue
-        debug_line "trying terminal: $terminal"
-        if launch_terminal "$terminal" "$command" >/dev/null 2>&1; then
-            debug_line "terminal launch succeeded: $terminal"
-            exit 0
-        fi
-        debug_line "terminal launch failed: $terminal"
-    done < <(terminal_candidates)
-
-    if command -v notify-send >/dev/null 2>&1; then
-        notify-send "Network Status" "Open a terminal and run: netstatus.sh" || true
-    fi
-}
-
-route_visible_output() {
-    local tty_fd
-
-    if [[ -t 1 ]]; then
-        return 0
-    fi
-
-    if [[ -t 0 || -t 2 ]]; then
-        if { exec {tty_fd}>/dev/tty; } 2>/dev/null; then
-            exec 1>&"$tty_fd"
-            debug_line "stdout is not a TTY; rendering to /dev/tty"
-            trace_line "routed output to /dev/tty"
-            return 0
-        fi
-    fi
-
-    if [[ -t 2 ]]; then
-        exec 1>&2
-        debug_line "stdout is not a TTY; rendering to stderr"
-        trace_line "routed output to stderr"
-    fi
 }
 
 disable_colors_if_needed() {
@@ -328,6 +105,10 @@ disable_colors_if_needed() {
         RESET_COLOR=""
     fi
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Layout
+# ─────────────────────────────────────────────────────────────────────────────
 
 terminal_columns() {
     local cols
@@ -368,6 +149,10 @@ calculate_layout() {
 
     VALUE_WIDTH=$((BOX_WIDTH - LABEL_WIDTH - 8))
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Parsing helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 repeat_char() {
     local char="$1"
@@ -534,6 +319,10 @@ format_epoch() {
     fi
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Interface details
+# ─────────────────────────────────────────────────────────────────────────────
+
 detect_interface() {
     local iface
 
@@ -560,12 +349,8 @@ interface_state() {
     fi
 
     case "$state" in
-        up|unknown)
-            printf 'UP'
-            ;;
-        *)
-            printf 'DOWN'
-            ;;
+        up|unknown) printf 'UP' ;;
+        *) printf 'DOWN' ;;
     esac
 }
 
@@ -573,18 +358,10 @@ interface_type() {
     local iface="$1"
 
     case "$iface" in
-        wl*)
-            printf 'wifi'
-            ;;
-        en*|eth*)
-            printf 'ethernet'
-            ;;
-        lo)
-            printf 'loopback'
-            ;;
-        *)
-            printf 'network'
-            ;;
+        wl*) printf 'wifi' ;;
+        en*|eth*) printf 'ethernet' ;;
+        lo) printf 'loopback' ;;
+        *) printf 'network' ;;
     esac
 }
 
@@ -599,24 +376,14 @@ interface_mac() {
     ip link show "$iface" 2>/dev/null | awk '/link\/ether/ {print $2; exit}' || true
 }
 
-read_lease_value() {
-    local lease_file="$1"
-    local key="$2"
-
-    awk -F= -v key="$key" '$1 == key {print $2; exit}' "$lease_file" 2>/dev/null || true
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# Network collection
+# ─────────────────────────────────────────────────────────────────────────────
 
 collect_nmcli_details() {
     local iface="$1"
-    local ip_raw
-    local gateway_raw
-    local dns_raw
-    local dhcp_raw
-    local connection_raw
-    local type_raw
-    local first_ip
-    local cidr
-    local value
+    local ip_raw gateway_raw dns_raw dhcp_raw connection_raw type_raw
+    local first_ip cidr value
 
     ip_raw="$(nmcli -g IP4.ADDRESS device show "$iface" 2>/dev/null || true)"
     gateway_raw="$(nmcli -g IP4.GATEWAY device show "$iface" 2>/dev/null || true)"
@@ -665,11 +432,7 @@ collect_nmcli_details() {
 
 collect_ip_details() {
     local iface="$1"
-    local ip_cidr
-    local gateway_raw
-    local dns_raw
-    local cidr
-    local value
+    local ip_cidr gateway_raw dns_raw cidr value
 
     ip_cidr="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}' || true)"
     if [[ -n "$ip_cidr" && "$IP_ADDR" == "$NA" ]]; then
@@ -721,11 +484,6 @@ collect_ip_details() {
                     printf "%s%s", sep, $2
                     sep = ", "
                 }
-                END {
-                    if (sep != "") {
-                        print ""
-                    }
-                }
             ' /etc/resolv.conf 2>/dev/null || true
         )"
         value="$(trim "$dns_raw")"
@@ -733,41 +491,8 @@ collect_ip_details() {
     fi
 }
 
-collect_systemd_lease() {
-    local iface="$1"
-    local ifindex=""
-    local lease_file=""
-    local candidate
-    local value
-
-    if [[ -r "/sys/class/net/${iface}/ifindex" ]]; then
-        ifindex="$(< "/sys/class/net/${iface}/ifindex")"
-    fi
-
-    if [[ -n "$ifindex" && -r "/run/systemd/netif/leases/${ifindex}" ]]; then
-        lease_file="/run/systemd/netif/leases/${ifindex}"
-    elif [[ -d /run/systemd/netif/leases ]]; then
-        for candidate in /run/systemd/netif/leases/*; do
-            [[ -f "$candidate" ]] || continue
-            lease_file="$candidate"
-            break
-        done
-    fi
-
-    [[ -z "$lease_file" ]] && return 0
-
-    value="$(read_lease_value "$lease_file" "SERVER_ADDRESS")"
-    value="$(trim "$value")"
-    [[ -n "$value" && "$DHCP_SERVER" == "$NA" ]] && DHCP_SERVER="$value"
-
-    value="$(read_lease_value "$lease_file" "LIFETIME")"
-    value="$(trim "$value")"
-    [[ -n "$value" && "$LEASE_TIME" == "$NA" ]] && LEASE_TIME="$(format_lease_time "$value")"
-}
-
 collect_network() {
-    INTERFACE="$(detect_interface)"
-    debug_line "detected interface: ${INTERFACE:-None}"
+    INTERFACE="${TARGET_IFACE:-$(detect_interface)}"
 
     if [[ -z "$INTERFACE" ]]; then
         INTERFACE="None"
@@ -785,8 +510,11 @@ collect_network() {
     fi
 
     collect_ip_details "$INTERFACE"
-    collect_systemd_lease "$INTERFACE"
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Rendering
+# ─────────────────────────────────────────────────────────────────────────────
 
 truncate_value() {
     local value="$1"
@@ -816,12 +544,8 @@ row_color() {
                 printf '%s' "$STATUS_DOWN_COLOR"
             fi
             ;;
-        muted)
-            printf '%s' "$MUTED_COLOR"
-            ;;
-        *)
-            printf '%s' "$VALUE_COLOR"
-            ;;
+        muted) printf '%s' "$MUTED_COLOR" ;;
+        *) printf '%s' "$VALUE_COLOR" ;;
     esac
 }
 
@@ -862,13 +586,6 @@ draw_section() {
     printf '%b│%b %b%-*s%b %b│%b\n' \
         "$BORDER_COLOR" "$RESET_COLOR" \
         "$SECTION_COLOR" "$title_width" "$title" "$RESET_COLOR" \
-        "$BORDER_COLOR" "$RESET_COLOR"
-}
-
-draw_blank() {
-    printf '%b│%b%*s%b│%b\n' \
-        "$BORDER_COLOR" "$RESET_COLOR" \
-        "$((BOX_WIDTH - 2))" '' \
         "$BORDER_COLOR" "$RESET_COLOR"
 }
 
@@ -913,51 +630,17 @@ render_panel() {
     draw_bottom
 }
 
-pause_if_requested() {
-    ((PAUSE_ON_EXIT)) || return 0
-
-    printf '\n%bPress Enter to close...%b' "$MUTED_COLOR" "$RESET_COLOR"
-    if [[ -t 0 ]]; then
-        read -r _ || true
-    elif [[ -r /dev/tty ]]; then
-        read -r _ < /dev/tty || true
-    else
-        printf '\n'
-    fi
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 main() {
-    local stdin_tty="no"
-    local stdout_tty="no"
-    local stderr_tty="no"
-
     parse_args "$@"
-    log_invocation "$@"
-
-    [[ -t 0 ]] && stdin_tty="yes"
-    [[ -t 1 ]] && stdout_tty="yes"
-    [[ -t 2 ]] && stderr_tty="yes"
-
-    debug_line "script: $(script_path)"
-    debug_line "args: $*"
-    debug_line "stdin_tty=${stdin_tty} stdout_tty=${stdout_tty} stderr_tty=${stderr_tty}"
-    debug_line "PATH=$PATH"
-    maybe_reopen_in_terminal
-    route_visible_output
     disable_colors_if_needed
     calculate_layout
-    debug_line "layout width: $BOX_WIDTH"
     require_commands "ip" "awk" "date"
-
-    if ((${DIAGNOSE_MODE:-0})); then
-        diagnose
-        exit 0
-    fi
-
     collect_network
     render_panel
-    pause_if_requested
-    trace_line "finish interface=$INTERFACE status=$STATUS"
 }
 
 main "$@"
