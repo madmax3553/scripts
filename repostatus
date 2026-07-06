@@ -827,6 +827,8 @@ declare -a FIND_ARGS
 
 # Directories to exclude
 EXCLUDE_DIRS=(
+    ".gemini"
+    ".nimble"
     ".local"
     ".cache"
     ".codex"

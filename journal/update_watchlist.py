@@ -1,9 +1,13 @@
 #!/home/groot/.local/share/journal-venv/bin/python3
 import argparse
+import fcntl
+import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date
@@ -14,8 +18,12 @@ from simplejustwatchapi import providers, search
 
 WATCHLIST_PATH = os.path.expanduser("~/journal/notes/watchlist.md")
 ARCHIVE_HEADING = "## Archive"
-WATCHED_UNRATED_HEADING = "### Watched - Unrated"
+WATCHED_UNRATED_HEADING = "### Watched"
 SUGGESTIONS_HEADING = "## Suggestions Inbox"
+IMPORT_HEADING = "## Imported from JustWatch (Needs metadata)"
+SEASON_SUFFIX_PATTERN = re.compile(r'\s+Season\s+(\d+)\s*$', re.IGNORECASE)
+SLUG_YEAR_PATTERN = re.compile(r'-(\d{4})$')
+JUSTWATCH_SLUG_PATTERN = re.compile(r'justwatch\.com/[a-z]{2}/(?:movie|tv-show)/([^)\s/]+)')
 ENTRY_PATTERN = re.compile(
     r'^(\s*-\s+\[([ xX])\]\s+\*\*([^*]+)\*\*(?:\s+\(([^)]+)\))?)(.*)$'
 )
@@ -149,6 +157,12 @@ def parse_args():
         "--no-streaming",
         action="store_true",
         help="Skip JustWatch status updates. Useful for archive/suggestion-only runs.",
+    )
+    parser.add_argument(
+        "--import-justwatch",
+        metavar="PATH",
+        help="Import new titles from a JustWatch watchlist JSON export "
+        "(list of objects with type/slug/title/url).",
     )
     parser.add_argument(
         "--suggest",
@@ -295,7 +309,7 @@ def collect_item_block(lines, start):
     end = start + 1
     while end < len(lines):
         stripped = lines[end].strip()
-        if lines[end].startswith("## ") or stripped == "---":
+        if lines[end].startswith("#") or stripped == "---":
             break
         if ENTRY_PATTERN.match(lines[end].rstrip("\n")):
             break
@@ -400,13 +414,23 @@ def archive_watched_items(lines, watched_date):
         if idx < limit:
             match = ENTRY_PATTERN.match(lines[idx].rstrip("\n"))
             if match and match.group(2).lower() == "x":
-                block, end = collect_item_block(lines, idx)
                 key = item_key_from_match(match)
                 if key not in existing_archive_keys:
+                    block, end = collect_item_block(lines, idx)
                     archive_blocks.append(archive_block(block, watched_date))
                     existing_archive_keys.add(key)
-                idx = end
-                continue
+                    idx = end
+                    continue
+
+                title = match.group(3).strip()
+                info = (match.group(4) or "").strip()
+                display = f"{title} ({info})" if info else title
+                print(
+                    f"Skipped archiving '{display}': already in archive; "
+                    "leaving it in place. Resolve the duplicate manually.",
+                    file=sys.stderr,
+                )
+                # Fall through so the entry (and its sub-bullets) stay put.
 
         new_lines.append(lines[idx])
         idx += 1
@@ -847,6 +871,151 @@ def insert_suggestions(lines, suggestion_lines, generated_date):
     return lines[:insert_at] + section + lines[insert_at:]
 
 
+def normalize_title(title):
+    title = unicodedata.normalize("NFKD", title)
+    title = "".join(c for c in title if not unicodedata.combining(c))
+    title = title.casefold().replace("&", "and")
+    return re.sub(r"[^a-z0-9]+", " ", title).strip()
+
+
+def existing_watchlist_keys(lines):
+    titles = set()
+    slugs = set()
+    for line in lines:
+        match = ENTRY_PATTERN.match(line.rstrip("\n"))
+        if match:
+            titles.add(normalize_title(match.group(3)))
+        slugs.update(JUSTWATCH_SLUG_PATTERN.findall(line))
+    return titles, slugs
+
+
+def load_justwatch_export(path):
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, list):
+        raise ValueError("Expected a JSON list of watchlist items.")
+
+    items = []
+    for raw in data:
+        if not isinstance(raw, dict):
+            continue
+        title = (raw.get("title") or "").strip()
+        slug = (raw.get("slug") or "").strip()
+        item_type = (raw.get("type") or "movie").strip()
+        if not title or not slug:
+            continue
+        items.append(
+            {"title": title, "slug": slug, "type": item_type, "url": raw.get("url")}
+        )
+    return items
+
+
+def format_import_entry(item, country):
+    season_match = SEASON_SUFFIX_PATTERN.search(item["title"])
+    title = SEASON_SUFFIX_PATTERN.sub("", item["title"]).strip()
+
+    if item["type"] == "tv-show":
+        info = " (TV Series)"
+    else:
+        year_match = SLUG_YEAR_PATTERN.search(item["slug"])
+        info = f" ({year_match.group(1)})" if year_match else ""
+
+    url = item.get("url") or (
+        f"https://www.justwatch.com/{country.lower()}/{item['type']}/{item['slug']}"
+    )
+    block = [f"- [ ] **{title}**{info} — 🕓 Not yet checked [JustWatch]({url})\n"]
+    if season_match:
+        block.append(
+            f"    - *Note:* Season {season_match.group(1)} on JustWatch watchlist\n"
+        )
+    return block
+
+
+def insert_import_entries(lines, entry_blocks):
+    if not entry_blocks:
+        return lines
+
+    flat = []
+    for block in entry_blocks:
+        flat.extend(block)
+
+    heading_idx = find_heading(lines, IMPORT_HEADING)
+    if heading_idx is None:
+        insert_at = None
+        for heading in (ARCHIVE_HEADING, SERVICES_HEADING):
+            idx = find_heading(lines, heading)
+            if idx is not None:
+                insert_at = idx
+                break
+        if insert_at is None:
+            body, footer = split_footer(lines)
+            insert_at = len(body)
+            lines = body + footer
+
+        section = [f"{IMPORT_HEADING}\n", "\n"] + flat + ["\n"]
+        return lines[:insert_at] + section + lines[insert_at:]
+
+    section_end = find_next_h2(lines, heading_idx)
+    insert_at = section_end
+    while insert_at > heading_idx + 1 and lines[insert_at - 1].strip() in ("", "---"):
+        insert_at -= 1
+    return lines[:insert_at] + flat + lines[insert_at:]
+
+
+def import_justwatch_items(lines, export_path, country):
+    export_items = load_justwatch_export(export_path)
+    known_titles, known_slugs = existing_watchlist_keys(lines)
+
+    blocks = []
+    skipped = 0
+    for item in export_items:
+        title_key = normalize_title(SEASON_SUFFIX_PATTERN.sub("", item["title"]))
+        if item["slug"] in known_slugs or title_key in known_titles:
+            skipped += 1
+            continue
+        blocks.append(format_import_entry(item, country))
+        known_titles.add(title_key)
+        known_slugs.add(item["slug"])
+
+    return insert_import_entries(lines, blocks), len(blocks), skipped
+
+
+def acquire_lock(watchlist_path):
+    """Serialize concurrent runs against the same watchlist file.
+
+    Returns an open file handle that must stay referenced for the
+    lifetime of the process; the lock is released when it closes.
+    """
+    lock_path = os.path.join(
+        os.path.dirname(os.path.abspath(watchlist_path)),
+        f".{os.path.basename(watchlist_path)}.lock",
+    )
+    lock_handle = open(lock_path, "w", encoding="utf-8")
+    fcntl.flock(lock_handle, fcntl.LOCK_EX)
+    return lock_handle
+
+
+def write_watchlist(path, lines):
+    """Atomically replace the watchlist so a killed run can't truncate it."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=".watchlist-", suffix=".tmp", dir=directory
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp:
+            tmp.writelines(lines)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.chmod(tmp_path, os.stat(path).st_mode)
+        os.replace(tmp_path, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
 def main():
     args = parse_args()
     watchlist_path = os.path.expanduser(args.watchlist)
@@ -854,6 +1023,8 @@ def main():
     if not os.path.exists(watchlist_path):
         print(f"Watchlist file not found at {watchlist_path}")
         sys.exit(1)
+
+    lock_handle = acquire_lock(watchlist_path)  # noqa: F841 (held until exit)
 
     with open(watchlist_path, "r", encoding="utf-8") as watchlist:
         lines = watchlist.readlines()
@@ -865,6 +1036,20 @@ def main():
 
     results = []
     should_write = False
+
+    if args.import_justwatch:
+        export_path = os.path.expanduser(args.import_justwatch)
+        if not os.path.exists(export_path):
+            print(f"JustWatch export not found at {export_path}", file=sys.stderr)
+            sys.exit(1)
+        lines, imported_count, skipped_count = import_justwatch_items(
+            lines, export_path, country
+        )
+        print(
+            f"Imported {imported_count} JustWatch item(s); "
+            f"{skipped_count} already present."
+        )
+        should_write = should_write or imported_count > 0
 
     if args.no_streaming:
         print("Skipping JustWatch update.")
@@ -911,8 +1096,7 @@ def main():
         should_write = should_write or bool(suggestion_lines)
 
     if should_write:
-        with open(watchlist_path, "w", encoding="utf-8") as watchlist:
-            watchlist.writelines(lines)
+        write_watchlist(watchlist_path, lines)
 
     if args.append_diary:
         append_diary_changes(os.path.expanduser(args.append_diary), country, my_services, results)

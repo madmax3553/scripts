@@ -618,7 +618,7 @@ ensure_today() {
         create_today_template
         log_success "Created today's journal entry"
         journal_log "updating watchlist streaming info..."
-        timeout 15 "${WATCHLIST_SCRIPT}" \
+        timeout 60 "${WATCHLIST_SCRIPT}" \
             --watchlist "${WATCHLIST_FILE}" \
             --archive-watched \
             --append-diary "${JOURNAL_FILE}" || journal_log "watchlist update failed"
@@ -967,18 +967,33 @@ cmd_watchlist() {
                 --suggest \
                 "$@"
             ;;
+        import)
+            local export_file="${1:-}"
+            if [[ -z "${export_file}" ]]; then
+                log_error "Usage: journal.sh watchlist import <justwatch-export.json>"
+                exit 1
+            fi
+            shift
+            log_info "Importing JustWatch watchlist export..."
+            "${WATCHLIST_SCRIPT}" \
+                --watchlist "${WATCHLIST_FILE}" \
+                --no-streaming \
+                --import-justwatch "${export_file}" \
+                "$@"
+            ;;
         help|--help|-h)
             cat << EOF
 ${HEADER}Watchlist Commands${RESET}
 
 ${BOLD}Usage:${RESET}
-    journal.sh watchlist [open|update|archive|suggest]
+    journal.sh watchlist [open|update|archive|suggest|import]
 
 ${BOLD}Commands:${RESET}
     ${CYAN}open${RESET}             - Open notes/watchlist.md
     ${CYAN}update${RESET}           - Refresh JustWatch statuses and archive watched items
     ${CYAN}archive${RESET}          - Archive checked items without refreshing streaming data
     ${CYAN}suggest [count]${RESET}  - Ask agy for suggestions and add them to the inbox
+    ${CYAN}import <file>${RESET}    - Add new titles from a JustWatch watchlist JSON export
 
 EOF
             ;;
