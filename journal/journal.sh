@@ -12,7 +12,7 @@
 # Purpose: Consolidated journal management with daily planning, TODO review, and window control
 # Dependencies: nvim, jq, hyprctl (optional), ghostty/kitty/alacritty (optional)
 # Author: groot
-# Modified: 2026-01-24
+# Modified: 2026-07-08
 
 set -euo pipefail
 
@@ -31,12 +31,14 @@ WATCHLIST_FILE="${NOTES_DIR}/watchlist.md"
 WATCHLIST_SCRIPT="${WATCHLIST_SCRIPT:-${HOME}/.local/bin/update_watchlist.py}"
 READLIST_FILE="${NOTES_DIR}/readlist.md"
 READLIST_SCRIPT="${READLIST_SCRIPT:-${HOME}/projects/scripts/journal/update_readlist.py}"
+TABS_FILE="${NOTES_DIR}/tabs.md"
 TERMINAL="${TERMINAL:-ghostty}"
 TITLE_PREFIX="${TITLE_PREFIX:-Journal}"
 DASHBOARD_TITLE="${TITLE_PREFIX} Dashboard"
 TODO_TITLE="${TITLE_PREFIX} TODO"
 WATCHLIST_TITLE="${TITLE_PREFIX} Watchlist"
 READLIST_TITLE="${TITLE_PREFIX} Readlist"
+TABS_TITLE="${TITLE_PREFIX} Tabs"
 JOURNAL_FLOAT_CENTER="${JOURNAL_FLOAT_CENTER:-0}"
 LOG_FILE="${JOURNAL_LOG_FILE:-${XDG_STATE_HOME:-${HOME}/.local/state}/journal.log}"
 
@@ -925,6 +927,23 @@ cmd_surface_todo() {
     fi
 }
 
+# Frozen browser tabs (iced) — the DB is owned by launcher/iced.sh and lives
+# in notes/ so it rides along with journal git backups.  iced.sh delegates
+# its "edit" pathway to surface-tabs so every entry point shares one window.
+cmd_tabs() {
+    if [[ ! -f "${TABS_FILE}" ]]; then
+        log_error "Tabs file not found: ${TABS_FILE} (freeze a tab with iced.sh first)"
+        exit 1
+    fi
+    launch_markdown_file "${TABS_TITLE}" "${TABS_FILE}"
+}
+
+cmd_surface_tabs() {
+    if ! focus_window_by_title "${TABS_TITLE}"; then
+        cmd_tabs
+    fi
+}
+
 cmd_watchlist() {
     local subcmd="${1:-open}"
     shift || true
@@ -1689,6 +1708,7 @@ update_dashboard() {
         echo "- [[diary/${TODAY}|Today]]"
         echo "- [[diary/index|All Entries]]"
         echo "- [[TODO|Main TODO List]]"
+        echo "- [[notes/tabs|Frozen Tabs (iced)]]"
         
     } > "$dashboard_file"
     
@@ -1752,6 +1772,8 @@ ${BOLD}Commands:${RESET}
     ${CYAN}surface-dashboard${RESET}      - Focus existing dashboard or open if not found
     ${CYAN}todo${RESET}                   - Open master TODO list
     ${CYAN}surface-todo${RESET}           - Focus existing TODO list or open if not found
+    ${CYAN}tabs${RESET}                   - Open frozen browser tabs (iced) list
+    ${CYAN}surface-tabs${RESET}           - Focus existing tabs list or open if not found
     ${CYAN}watchlist${RESET}              - Open/update/archive/suggest watchlist items
     ${CYAN}readlist${RESET}               - Open/import/archive readlist items
     ${CYAN}plan${RESET}                   - Generate today's daily plan
@@ -1769,6 +1791,7 @@ ${BOLD}Examples:${RESET}
     journal.sh surface       # Focus existing or open
     journal.sh surface-dashboard  # Focus dashboard or open
     journal.sh surface-todo  # Focus TODO list or open
+    journal.sh surface-tabs  # Focus frozen tabs (iced) list or open
     journal.sh watchlist update  # Refresh streaming statuses and archive watched items
     journal.sh watchlist suggest 5  # Ask agy for 5 reviewable suggestions
     journal.sh readlist import --audible-html ~/Downloads/Audible\ Library.html
@@ -1815,6 +1838,12 @@ main() {
             ;;
         surface-todo)
             cmd_surface_todo
+            ;;
+        tabs)
+            cmd_tabs
+            ;;
+        surface-tabs)
+            cmd_surface_tabs
             ;;
         watchlist)
             shift
