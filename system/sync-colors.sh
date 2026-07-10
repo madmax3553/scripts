@@ -981,6 +981,14 @@ if [ -f "$CONFIG_DIR/starship.toml" ]; then
     sed -i "s|\](#[0-9a-fA-F]\{6\})'$|](${GREEN})'|" "$CONFIG_DIR/starship.toml"
 fi
 
+# === QUTEBROWSER ===
+# Theme reads cyberdream.json directly (~/.config/qutebrowser/cyberdream.py).
+# If qutebrowser is running, re-source its config via IPC for live reload.
+if pgrep -x qutebrowser >/dev/null 2>&1; then
+    echo "Reloading qutebrowser config..."
+    qutebrowser ':config-source' >/dev/null 2>&1 || true
+fi
+
 echo ""
 echo "To apply changes:"
 echo "  - Swaync will update on next notification"
@@ -990,4 +998,5 @@ echo "  - sysc-greet: select 'Groot' theme via F1 menu"
 echo "  - Kitty: close and reopen terminal"
 echo "  - Waybar: run 'killall -SIGUSR2 waybar' to reload"
 echo "  - Starship: opens new shell to apply"
+echo "  - Qutebrowser: reloaded automatically if running (:config-source)"
 echo "  - Restart other applications (fuzzel, ghostty, wlogout, remmina)"
