@@ -20,6 +20,7 @@ STATE_DIR="${XDG_STATE_HOME:-${HOME}/.local/state}"
 LOG_FILE="${STATE_DIR}/timezone-update.log"
 LOCK_DIR="${STATE_DIR}/timezone-update.lock"
 SOURCE_URL="${TIMEZONE_SOURCE_URL:-https://ipapi.co/timezone/}"
+SOURCE_URLS="${TIMEZONE_SOURCE_URLS:-https://ipapi.co/timezone/ https://ipinfo.io/timezone https://worldtimeapi.org/api/ip.txt}"
 TIMEOUT="${TIMEZONE_UPDATE_TIMEOUT:-6}"
 OVERRIDE_TIMEZONE="${TIMEZONE_UPDATE_OVERRIDE-}"
 SELECTED_TIMEZONE=""
@@ -49,6 +50,55 @@ validate_timezone() {
         return 1
     fi
 
+    return 0
+}
+
+extract_timezone_from_response() {
+    local response="$1"
+    local candidate=""
+
+    candidate="$(printf '%s\n' "$response" | tr -d '\r' | head -n 1 | xargs)"
+    if [[ "$candidate" =~ ^[A-Za-z0-9._+-]+/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)?$ ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    candidate="$(printf '%s\n' "$response" | sed -nE 's/.*"timezone"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p' | head -n 1)"
+    if [[ "$candidate" =~ ^[A-Za-z0-9._+-]+/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)?$ ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    candidate="$(printf '%s\n' "$response" | sed -nE 's/^timezone:[[:space:]]*(.+)$/\1/p' | head -n 1 | xargs)"
+    if [[ "$candidate" =~ ^[A-Za-z0-9._+-]+/[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)?$ ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+    fi
+
+    return 1
+}
+
+detect_timezone() {
+    local source="$1"
+    local response=""
+    local candidate=""
+
+    if ! response="$(curl --fail --silent --show-error --location --max-time "$TIMEOUT" "$source" 2>>"$LOG_FILE")"; then
+        return 1
+    fi
+
+    if ! candidate="$(extract_timezone_from_response "$response")"; then
+        log "timezone source returned non-timezone payload: $source"
+        return 1
+    fi
+
+    if ! validate_timezone "$candidate"; then
+        log "timezone source returned invalid timezone: $source -> $candidate"
+        return 1
+    fi
+
+    timezone="$candidate"
+    log "timezone detected from source: $source -> $timezone"
     return 0
 }
 
@@ -329,11 +379,15 @@ else
         exit 1
     fi
 
-    timezone="$(
-        curl --fail --silent --show-error --location --max-time "$TIMEOUT" "$SOURCE_URL" 2>>"$LOG_FILE" |
-            tr -d '\r' |
-            head -n 1
-    )"
+    timezone=""
+
+    if [[ -n "$SOURCE_URL" ]] && detect_timezone "$SOURCE_URL"; then
+        :
+    else
+        for source in $SOURCE_URLS; do
+            detect_timezone "$source" && break
+        done
+    fi
 fi
 
 if [[ -z "$timezone" ]]; then

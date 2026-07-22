@@ -18,7 +18,8 @@ set -e
 
 # Configuration
 WINEPREFIX="/home/groot/Games/stfc-lutris"
-WINE_PATH="$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton10-25/files/bin"
+# WINE_PATH="$HOME/.local/share/Steam/compatibilitytools.d/GE-Proton10-25/files/bin"
+WINE_PATH="/usr/share/steam/compatibilitytools.d/proton-ge-custom/files/bin"
 GAME_DIR="$WINEPREFIX/drive_c/users/steamuser/AppData/Local/Star Trek Fleet Command"
 LAUNCHER_EXE="$GAME_DIR/launcher.exe"
 

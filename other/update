@@ -327,6 +327,7 @@ main() {
         run_with_spinner "Cleaning stale download directories..." sudo rm -rf /var/cache/pacman/pkg/download-* || true
         run_with_spinner "Cleaning pacman cache (keep latest 3)..." sudo paccache -r || true
         run_with_spinner "Cleaning yay cache..." yay -Sc --noconfirm || true
+        run_with_spinner "Purging trash older than 30 days (max 5GB)" autotrash -d 30 --trash_limit=5000 || true
     fi
 
     refresh_waybar

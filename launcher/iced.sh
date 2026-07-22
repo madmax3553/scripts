@@ -9,7 +9,7 @@
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
 #      ░    ░         ░ ░      ░ ░
 # Script: iced.sh
-# Purpose: Freeze/thaw browser tabs to a hand-editable Markdown DB; reclaim 100% browser RAM
+# Purpose: Freeze/thaw browser tabs to a hand-editable Markdown DB without closing the whole browser
 # Dependencies: fuzzel, wl-paste, pgrep, ps, mktemp, hyprctl, jq, awk
 #               optional: notify-send (keybind feedback), wl-copy (race-free grabs)
 #               qutebrowser: socat
@@ -114,7 +114,7 @@ BROWSER_GRAB=( _grab_qutebrowser _grab_urlbar _grab_chromium _grab_chromium )
 #   1. $ICED_BROWSER env var (explicit user override)
 #   2. hyprctl activewindow class (active Wayland surface)
 #   3. First browser process found running via pgrep
-#   4. "clipboard" sentinel → raw wl-paste with no process kill
+#   4. "clipboard" sentinel → raw wl-paste with no tab-close automation
 _detect_browser() {
     [[ -n "$FORCED_BROWSER" ]] && { echo "$FORCED_BROWSER"; return; }
 
@@ -130,7 +130,7 @@ _detect_browser() {
     # Patterns are ANCHORED on purpose: bare substring globs like *chrome*
     # match Electron apps and PWA wrappers (class "chrome-<appid>-Default",
     # "code", "discord", …) and send ice down the CDP path against a window
-    # that is not a browser — then kill_browser SIGTERMs innocent processes.
+    # that is not a browser — then tab-close automation hits the wrong app.
     case "${wclass,,}" in
         qutebrowser|org.qutebrowser.*)                     echo "qutebrowser"; return ;;
         firefox*|librewolf*|org.mozilla.*)                 echo "firefox";     return ;;
@@ -293,8 +293,8 @@ _grab_chromium() {
 # also learns HOW the URL was obtained — command substitution would run us
 # in a subshell and discard that flag:
 #   GRAB_URL    – the resolved URL
-#   GRAB_SOURCE – "primary"  (browser-verified: safe to kill the browser)
-#                 "clipboard" (unverified: may be stale; do NOT kill on it)
+#   GRAB_SOURCE – "primary"  (browser-verified: safe to close the active tab)
+#                 "clipboard" (unverified: may be stale; do NOT close on it)
 GRAB_URL=""
 GRAB_SOURCE=""
 
@@ -329,38 +329,72 @@ resolve_url() {
     GRAB_SOURCE="clipboard"
 }
 
-# ─── Process Termination ─────────────────────────────────────────────────────
+# ─── Active Tab Close ────────────────────────────────────────────────────────
 
-# Resolve PIDs by exact comm match (pgrep -x) to avoid name-prefix collisions
-# (e.g., 'chromium' vs 'chromium-sandbox').  Sends SIGTERM so the browser can
-# flush sessions, close sockets, and unlink lock files cleanly.
-kill_browser() {
-    local browser="$1" proc_names=""
+# Release held keybind modifiers before key injection (Hyprland keybind context).
+_release_keybind_mods() {
+    # key codes: 125/126=meta(l/r) 42/54=shift(l/r) 56/100=alt(l/r)
+    ydotool key 125:0 126:0 42:0 54:0 56:0 100:0 2>/dev/null || true
+}
 
-    local i
-    for i in "${!BROWSER_KEYS[@]}"; do
-        if [[ "${BROWSER_KEYS[$i]}" == "$browser" ]]; then
-            proc_names="${BROWSER_PROCS[$i]}"
-            break
-        fi
-    done
+_close_qutebrowser_tab() {
+    local socket=""
+    socket=$(find "$QUTE_IPC_DIR" -maxdepth 1 -name "ipc-*" -type s 2>/dev/null \
+        | head -1) || true
 
-    [[ -n "$proc_names" ]] || { log_warn "No proc name for browser '${browser}'"; return 0; }
-
-    # Single pgrep call: -x takes an ERE, so all comm-name alternatives
-    # collapse into one alternation instead of a fork per name
-    local -a pids=()
-    mapfile -t pids < <(pgrep -x "${proc_names// /|}" 2>/dev/null) || true
-
-    if (( ${#pids[@]} == 0 )); then
-        log_warn "No running process for '${browser}' (tried: ${proc_names}); tab saved, nothing killed"
-        print_warn "Browser not running; tab saved only"
-        return 0
+    if [[ -z "$socket" || ! -S "$socket" ]]; then
+        log_warn "qutebrowser IPC socket not found under ${QUTE_IPC_DIR}; cannot close tab"
+        return 1
     fi
 
-    kill -TERM "${pids[@]}"
-    log_info "SIGTERM → ${browser} PID(s): ${pids[*]}"
-    print_success "Browser terminated (PID ${pids[*]}); RAM fully reclaimed"
+    local payload
+    printf -v payload \
+        '{"args":[":tab-close"],"target_arg":null,"version":"1.0.0","protocol_version":1,"cwd":"%s"}' \
+        "$PWD"
+
+    printf '%s\n' "$payload" \
+        | timeout "$QUTE_IPC_TIMEOUT" socat - "UNIX-CONNECT:${socket}" >/dev/null 2>&1
+}
+
+_close_tab_hotkey() {
+    if ! command -v ydotool >/dev/null 2>&1; then
+        log_warn "ydotool not found; cannot send Ctrl+W to close the active tab"
+        return 1
+    fi
+
+    _release_keybind_mods
+    sleep 0.1
+
+    # key codes: 29=ctrl 17=w
+    ydotool key 29:1 17:1 17:0 29:0 2>/dev/null
+}
+
+close_active_tab() {
+    local browser="$1"
+
+    case "$browser" in
+        qutebrowser)
+            if _close_qutebrowser_tab; then
+                print_success "Closed active tab in qutebrowser"
+                log_info "Closed active tab via qutebrowser IPC"
+                return 0
+            fi
+            ;;
+        firefox|chromium|brave)
+            if _close_tab_hotkey; then
+                print_success "Closed active tab in ${browser}"
+                log_info "Closed active tab via Ctrl+W in ${browser}"
+                return 0
+            fi
+            ;;
+        *)
+            log_warn "Unknown browser '${browser}'; cannot close active tab automatically"
+            return 1
+            ;;
+    esac
+
+    print_warn "Saved tab, but could not auto-close active tab in ${browser}"
+    return 1
 }
 
 # ─── DB Helpers ──────────────────────────────────────────────────────────────
@@ -547,10 +581,9 @@ _resolve_category() {
 # 1. Resolve active browser + grab its current tab URL
 # 2. Validate; for new URLs resolve a category (CLI arg or fuzzel prompt) and
 #    append URL<TAB>browser<TAB>category to the flat-file DB
-# 3. SIGTERM the browser process to free all resident memory — but ONLY when
-#    the URL came from a verified browser grab.  A clipboard-fallback URL may
-#    be stale garbage; killing the browser on it silently discards the tab
-#    the user actually wanted frozen ("my tabs didn't survive").
+# 3. Close only the active browser tab — but ONLY when the URL came from a
+#    verified browser grab.  A clipboard-fallback URL may be stale garbage;
+#    closing on it could hit the wrong page ("my tab didn't survive").
 cmd_ice() {
     local category="${1:-}"
 
@@ -615,28 +648,35 @@ cmd_ice() {
     fi
 
     if [[ "$browser" == "clipboard" ]]; then
-        # Plain-clipboard mode: no browser context to terminate.
+        # Plain-clipboard mode: no browser context to close.
         # Explicit if — a bare `(( )) &&` list here would make the function
         # return 1 on duplicates under set -e.
         if (( froze_new )); then
             _notify normal "iced ❄" "Frozen from clipboard [${category}]: ${url}"
         fi
     elif [[ "$GRAB_SOURCE" == "primary" ]]; then
-        # Kill even on duplicate: the URL is safe in the DB either way and
-        # the user's intent is reclaiming the browser's RAM
-        kill_browser "$browser"
-        if (( froze_new )); then
-            _notify normal "iced ❄" "Frozen [${category}] (${browser} terminated): ${url}"
+        # Close even on duplicate: the URL is safe in the DB either way.
+        local tab_closed=0
+        if close_active_tab "$browser"; then
+            tab_closed=1
+        fi
+
+        if (( froze_new )) && (( tab_closed )); then
+            _notify normal "iced ❄" "Frozen [${category}] (closed tab in ${browser}): ${url}"
+        elif (( froze_new )); then
+            _notify low "iced ❄" "Frozen [${category}] but tab close failed in ${browser}: ${url}"
+        elif (( tab_closed )); then
+            _notify normal "iced ❄" "Closed tab in ${browser} (already frozen): ${url}"
         else
-            _notify normal "iced ❄" "${browser} terminated (already frozen): ${url}"
+            _notify low "iced ❄" "Already frozen; tab close failed in ${browser}: ${url}"
         fi
     else
-        # Unverified URL → refuse to kill; tell the user loudly so a stale
+        # Unverified URL → refuse to close; tell the user loudly so a stale
         # clipboard freeze can't masquerade as a successful ice
-        log_warn "URL came from clipboard fallback; NOT killing ${browser}"
+        log_warn "URL came from clipboard fallback; NOT closing tab in ${browser}"
         print_warn "Unverified (clipboard) URL saved; ${browser} left running"
         _notify critical "iced ❄ unverified" \
-            "Saved from clipboard — could not read ${browser}'s active tab, so it was NOT killed: ${url}"
+            "Saved from clipboard — could not read ${browser}'s active tab, so it was NOT closed: ${url}"
     fi
 }
 
@@ -856,7 +896,7 @@ usage() {
 ${BOLD}Usage:${RESET} $(basename "$0") <command> [args]
 
 ${BOLD}Commands:${RESET}
-  ${SUCCESS}ice [category]${RESET}  Grab active browser tab URL → freeze to DB → kill browser
+  ${SUCCESS}ice [category]${RESET}  Grab active browser tab URL → freeze to DB → close active tab
                   (category from arg, else fuzzel prompt; Esc → ${DEFAULT_CATEGORY})
   ${INFO}thaw${RESET}            fuzzel-select a frozen tab → reopen in its origin browser
                   (non-destructive: the entry stays listed until removed)
@@ -873,8 +913,8 @@ ${BOLD}Browser auto-detection (ice only):${RESET}
   Priority: \$ICED_BROWSER env > hyprctl activewindow class > process probe > clipboard
   Supported: qutebrowser (IPC), firefox (ydotool), chromium/brave (CDP port ${CDP_PORT}, then ydotool)
   Override:  ICED_BROWSER=firefox iced.sh ice work
-  Safety:    the browser is only killed when its active tab was read directly;
-             a raw-clipboard fallback URL is saved but never triggers a kill.
+  Safety:    tab-close automation runs only when the active tab was read directly;
+             a raw-clipboard fallback URL is saved but never triggers tab-close.
   Feedback:  every outcome raises a notify-send notification (keybind-safe).
 
 ${BOLD}Database:${RESET} ${TAB_DB}

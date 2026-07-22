@@ -1,1 +1,104 @@
 #!/usr/bin/env bash
+# Script: txtcliphist
+# Purpose: Clipboard history actions with cliphist (using fuzzel)
+# Dependencies: cliphist, wl-clipboard, fuzzel
+# Author: groot
+# Modified: 2026-03-07
+
+set -euo pipefail
+
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/cliphist"
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+ensure_cache_dir() {
+    if [ -e "$CACHE_DIR" ] && [ ! -d "$CACHE_DIR" ]; then
+        mv "$CACHE_DIR" "${CACHE_DIR}.bak.$(date +%s)"
+    fi
+    mkdir -p "$CACHE_DIR"
+}
+
+usage() {
+    cat <<EOH
+Usage: $(basename "$0") [command] [limit]
+
+Commands:
+  sel|select   Pick an entry and copy to clipboard (default)
+  delete       Pick an entry and delete it
+  wipe         Wipe the clipboard history
+  list         Print clipboard history list
+  out          Store stdin into cliphist (used by watcher)
+  help         Show this help message
+EOH
+}
+
+select_entry() {
+    local limit="${1:-}"
+    if require_command fuzzel; then
+        if [[ -n "$limit" ]]; then
+            cliphist list | head -n "$limit" | fuzzel --dmenu --prompt="Clipboard: "
+        else
+            cliphist list | fuzzel --dmenu --prompt="Clipboard: "
+        fi
+    else
+        echo "fuzzel not installed" >&2
+        exit 1
+    fi
+}
+
+case "${1:-sel}" in
+    out)
+        if ! require_command cliphist; then
+            echo "cliphist not installed" >&2
+            exit 1
+        fi
+        ensure_cache_dir
+        cliphist store
+        ;;
+    list)
+        ensure_cache_dir
+        cliphist list
+        ;;
+    sel|select|"")
+        for cmd in cliphist wl-copy; do
+            if ! require_command "$cmd"; then
+                echo "Missing dependency: $cmd" >&2
+                exit 1
+            fi
+        done
+        ensure_cache_dir
+        entry=$(select_entry "${2:-}" || true)
+        if [ -n "$entry" ]; then
+            printf '%s' "$entry" | cliphist decode | wl-copy
+        fi
+        ;;
+    delete)
+        if ! require_command cliphist; then
+            echo "cliphist not installed" >&2
+            exit 1
+        fi
+        ensure_cache_dir
+        entry=$(select_entry "${2:-}" || true)
+        if [ -n "$entry" ]; then
+            printf '%s' "$entry" | cliphist delete
+        fi
+        ;;
+    wipe)
+        if ! require_command cliphist; then
+            echo "cliphist not installed" >&2
+            exit 1
+        fi
+        ensure_cache_dir
+        cliphist wipe
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        echo "Unknown command: $1" >&2
+        usage >&2
+        exit 1
+        ;;
+esac
