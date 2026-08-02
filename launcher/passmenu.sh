@@ -60,6 +60,12 @@ readonly ROW_SHOW="📄 show fields"
 readonly ROW_FIELD_PREFIX="📋 copy "
 readonly DEFAULT_PASS_LENGTH="${PASSMENU_PASS_LENGTH:-32}"
 
+# Resume: after copying a field (e.g. the username) the entry is remembered;
+# relaunching within this window jumps straight back to that entry's actions.
+readonly RESUME_TIME="${PASSMENU_RESUME_TIME:-90}"
+readonly STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/passmenu"
+readonly STATE_FILE="${STATE_DIR}/last-entry"
+
 # ─── Security Notes ──────────────────────────────────────────────────────────
 #
 #   - Secrets travel via pipes/variables only — NEVER as command arguments
@@ -134,8 +140,76 @@ _url_host() {
     printf '%s' "$host"
 }
 
-_entry_name_suggestions() {
-    local url host
+# Domain of the site currently focused, best-effort. Browser window titles
+# rarely carry the URL, but many pages/tabs include the domain; also try the
+# clipboard (URL copied from the address bar). Empty output = no hint.
+_active_domain() {
+    local title domain
+    if command -v hyprctl >/dev/null 2>&1 && command -v jq >/dev/null 2>&1; then
+        title=$(hyprctl activewindow -j 2>/dev/null | jq -r '.title // empty') || title=""
+        # first domain-looking token in the title (e.g. "Sign in · github.com")
+        if [[ "$title" =~ ([a-zA-Z0-9][a-zA-Z0-9-]*\.)+[a-zA-Z]{2,} ]]; then
+            domain="${BASH_REMATCH[0]#www.}"
+            printf '%s' "$domain"
+            return 0
+        fi
+    fi
+
+    local url
+    url=$(_clipboard_url)
+    [[ -n "$url" ]] && _url_host "$url"
+}
+
+# Initial fuzzel search term: the active domain if it matches at least one
+# store entry, else its registrable part (last two labels), else nothing —
+# never prefill with a term that would empty the list.
+_initial_search() {
+    local entries="$1" domain base
+    domain=$(_active_domain)
+    [[ -n "$domain" ]] || return 0
+
+    if grep -qiF "$domain" <<< "$entries"; then
+        printf '%s' "$domain"
+        return 0
+    fi
+
+    base=$(grep -oE '[a-zA-Z0-9-]+\.[a-zA-Z]+$' <<< "$domain" || true)
+    if [[ -n "$base" ]] && grep -qiF "$base" <<< "$entries"; then
+        printf '%s' "$base"
+    fi
+}
+
+# ─── Resume State ────────────────────────────────────────────────────────────
+#
+# Copying a field (typically the username) remembers the entry; the next
+# launch within RESUME_TIME skips the search and reopens that entry's actions.
+
+_resume_remember() {
+    local entry="$1"
+    mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+    printf '%s\n' "$entry" > "$STATE_FILE" 2>/dev/null || true
+    chmod 600 "$STATE_FILE" 2>/dev/null || true
+}
+
+_resume_clear() {
+    rm -f "$STATE_FILE" 2>/dev/null || true
+}
+
+# Prints the remembered entry if fresh and still in the store, else nothing
+_resume_entry() {
+    [[ -f "$STATE_FILE" ]] || return 0
+    local age entry
+    age=$(( $(date +%s) - $(stat -c %Y "$STATE_FILE" 2>/dev/null || echo 0) ))
+    if (( age > RESUME_TIME )); then
+        _resume_clear
+        return 0
+    fi
+    entry=$(<"$STATE_FILE")
+    _entry_exists "$entry" || { _resume_clear; return 0; }
+    printf '%s' "$entry"
+}
+
+_entry_name_suggestions() {    local url host
     url=$(_clipboard_url)
     [[ -n "$url" ]] || return 0
 
@@ -224,8 +298,18 @@ cmd_menu() {
     [[ -d "$STORE_DIR" ]] || die "Password store not found: ${STORE_DIR}" 1
     _require_fuzzel_free
 
+    # ── Resume: just copied a field? jump straight back to that entry ───────
+    local resume
+    resume=$(_resume_entry)
+    if [[ -n "$resume" ]]; then
+        _resume_clear
+        log_info "Resuming entry: ${resume}"
+        _entry_actions "$resume"
+        return 0
+    fi
+
     # ── Stage 1: pick an entry ──────────────────────────────────────────────
-    local pass_entries entries entry
+    local pass_entries entries entry search
     pass_entries=$(_list_entries)
     if [[ -n "$pass_entries" ]]; then
         entries=$(printf '%s\n%s\n' "$ROW_NEW" "$pass_entries")
@@ -233,9 +317,13 @@ cmd_menu() {
         entries="$ROW_NEW"
     fi
 
+    # Prefill with the active site's domain when it matches something
+    search=$(_initial_search "$pass_entries")
+
     entry=$(fuzzel --dmenu \
         --prompt="🔐 pass › " \
         --placeholder="fuzzy-search or create new…" \
+        --search="$search" \
         <<< "$entries") || true
     [[ -n "$entry" ]] || { log_info "passmenu aborted: no entry selected"; exit 0; }
 
@@ -247,6 +335,14 @@ cmd_menu() {
     # Guard against fuzzel returning free-typed text that matches no entry
     grep -qxF "$entry" <<< "$pass_entries" \
         || die "No such entry: ${entry}" 1
+
+    _entry_actions "$entry"
+}
+
+# Decrypt an entry and run the action menu for it.
+# _entry_actions <entry>
+_entry_actions() {
+    local entry="$1"
 
     # ── Decrypt once; parse password / fields / otp ─────────────────────────
     # pinentry (pinentry-qt) pops its own dialog when the key is locked
@@ -303,6 +399,7 @@ cmd_menu() {
     # ── Dispatch ────────────────────────────────────────────────────────────
     case "$action" in
         "$ROW_PASS")
+            _resume_clear
             _clip_secret "Password [${entry}]" "$password"
             ;;
         "$ROW_OTP")
@@ -327,6 +424,8 @@ cmd_menu() {
             for i in "${!field_keys[@]}"; do
                 if [[ "${field_keys[$i]}" == "$want" ]]; then
                     _clip_secret "${want} [${entry}]" "${field_vals[$i]}"
+                    # Coming back for the password? skip the search next time
+                    _resume_remember "$entry"
                     found=1
                     break
                 fi
@@ -361,6 +460,14 @@ ${BOLD}Flow:${RESET}
 
 ${BOLD}Clipboard:${RESET} auto-clears after ${CLIP_TIME}s — only if it still holds the
 copied secret.  Override with PASSMENU_CLIP_TIME.
+
+${BOLD}Site awareness:${RESET} the active window title (hyprctl) or a URL on the
+clipboard seeds the initial search with the site's domain — only when it
+matches at least one store entry.
+
+${BOLD}Resume:${RESET} copying a field (e.g. login) remembers the entry; relaunching
+within ${RESUME_TIME}s reopens its action menu directly — one Enter away from
+the password.  Override with PASSMENU_RESUME_TIME.
 
 ${BOLD}Generation:${RESET} default length is ${DEFAULT_PASS_LENGTH}. Override with
 PASSMENU_PASS_LENGTH.
