@@ -16,7 +16,7 @@
 #               firefox:     ydotool (optional; falls back to clipboard)
 #               chromium/brave: curl (CDP JSON API; requires --remote-debugging-port)
 # Author: groot
-# Modified: 2026-07-08
+# Modified: 2026-09-06
 
 set -euo pipefail
 
@@ -53,16 +53,18 @@ die() {
 # from the journal dashboard (journal.sh tabs / surface-tabs).
 # Override the location with ICED_DB, or the journal root with JOURNAL_DIR.
 #
-#   ## category                       ← one section per category
-#   - https://url <!--browser-->      ← one bullet per frozen tab
+#   ## category                            ← one section per category
+#   - [readable name](https://url) <!--browser-->
+#   - https://url <!--browser-->           ← unnamed; menus show the URL
 #
-# Parsing rules (everything else — titles, prose, blanks — is ignored):
+# Parsing rules (everything else — prose, blanks — is ignored):
 #   - `## name` starts a category; bullets before any heading → DEFAULT_CATEGORY
 #   - `- url` or `* url`; a `[title](url)` markdown link also works
 #   - the trailing `<!--browser-->` comment records the origin browser so thaw
 #     can reopen there; hand-added bullets without it open via xdg-open
 #   - FILE ORDER IS AUTHORITATIVE: rearranging sections/bullets in an editor
 #     rearranges the fuzzel menus; new freezes insert at the top of their section
+#   - menus show the title when present (fuzzy-search still matches the URL)
 readonly JOURNAL_DIR="${JOURNAL_DIR:-$HOME/projects/journal}"
 readonly TAB_DB="${ICED_DB:-${JOURNAL_DIR}/notes/tabs.md}"
 
@@ -173,10 +175,12 @@ _clipboard_clear() {
     wl-copy --clear 2>/dev/null || true
 }
 
-# Poll the clipboard until non-empty (max ~1.6s); echoes content on success
+# Poll the clipboard until non-empty (max tries*0.2s, default ~1.6s);
+# echoes content on success.  Pass a smaller try count for optional extras
+# (page title) so a miss does not stall the freeze.
 _clipboard_poll() {
-    local content="" tries
-    for tries in {1..8}; do
+    local content="" tries max="${1:-8}"
+    for ((tries = 1; tries <= max; tries++)); do
         sleep 0.2
         content=$(wl-paste --no-newline 2>/dev/null) || true
         if [[ -n "$content" ]]; then
@@ -209,16 +213,38 @@ _grab_qutebrowser() {
     _clipboard_clear
 
     # timeout guards against hung qutebrowser; discard ack JSON from socket
+    if ! printf '%s\n' "$payload" \
+        | timeout "$QUTE_IPC_TIMEOUT" socat - "UNIX-CONNECT:${socket}" \
+        >/dev/null 2>&1; then
+        log_warn "qutebrowser IPC timed out, socat failed, or clipboard never updated"
+        return 1
+    fi
+
+    # IPC dispatch is async; poll for the clipboard flush instead of a
+    # single fixed sleep (slow event loop ticks caused stale grabs)
+    local url="" title=""
+    url=$(_clipboard_poll) || {
+        log_warn "qutebrowser IPC timed out, socat failed, or clipboard never updated"
+        return 1
+    }
+
+    # Optional second yank: page title for the freeze-name suggestion.
+    # Failure is non-fatal — ice still succeeds with a URL-only bullet.
+    printf -v payload \
+        '{"args":[":yank title"],"target_arg":null,"version":"1.0.0","protocol_version":1,"cwd":"%s"}' \
+        "$PWD"
+    _clipboard_clear
     if printf '%s\n' "$payload" \
         | timeout "$QUTE_IPC_TIMEOUT" socat - "UNIX-CONNECT:${socket}" \
         >/dev/null 2>&1; then
-        # IPC dispatch is async; poll for the clipboard flush instead of a
-        # single fixed sleep (slow event loop ticks caused stale grabs)
-        _clipboard_poll && return 0
+        title=$(_clipboard_poll 4) || true
     fi
 
-    log_warn "qutebrowser IPC timed out, socat failed, or clipboard never updated"
-    return 1
+    printf '%s' "$url"
+    if [[ -n "$title" && "$title" != "$url" ]]; then
+        printf '\n%s' "$title"
+    fi
+    return 0
 }
 
 # Firefox (and any browser with a Ctrl+L address bar): no native IPC on
@@ -263,16 +289,27 @@ _grab_urlbar() {
 # active/focused tab (type=page, not devtools/extension panels).
 # curl -sf fails silently if port isn't open → caller falls back to clipboard.
 _grab_cdp() {
-    local tab_url=""
-    tab_url=$(curl -sf --max-time 2 "http://127.0.0.1:${CDP_PORT}/json" 2>/dev/null \
-        | jq -r '[.[] | select(.type=="page")] | first | .url // empty') || true
+    local tab_url="" tab_title=""
+    local rec=""
+    rec=$(curl -sf --max-time 2 "http://127.0.0.1:${CDP_PORT}/json" 2>/dev/null \
+        | jq -r '[.[] | select(.type=="page")] | first
+            | (.url // empty), (.title // empty)') || true
+
+    tab_url="${rec%%$'\n'*}"
+    if [[ "$rec" == *$'\n'* ]]; then
+        tab_title="${rec#*$'\n'}"
+        tab_title="${tab_title%%$'\n'*}"
+    fi
 
     if [[ -z "$tab_url" ]]; then
         log_warn "CDP endpoint at port ${CDP_PORT} unreachable or returned no pages"
         return 1
     fi
 
-    echo "$tab_url"
+    printf '%s' "$tab_url"
+    if [[ -n "$tab_title" && "$tab_title" != "$tab_url" ]]; then
+        printf '\n%s' "$tab_title"
+    fi
 }
 
 # Chromium/Brave: prefer CDP (exact, no focus dependency) but chain to the
@@ -293,21 +330,40 @@ _grab_chromium() {
 # also learns HOW the URL was obtained — command substitution would run us
 # in a subshell and discard that flag:
 #   GRAB_URL    – the resolved URL
+#   GRAB_TITLE  – page title from the primary grab ("" when unknown)
 #   GRAB_SOURCE – "primary"  (browser-verified: safe to close the active tab)
 #                 "clipboard" (unverified: may be stale; do NOT close on it)
 GRAB_URL=""
+GRAB_TITLE=""
 GRAB_SOURCE=""
 
+# Split a grabber's stdout: line 1 = URL, optional line 2 = page title.
+# Grabbers run in command substitution so they cannot set these globals
+# themselves; the title is a best-effort extra and must never displace the URL.
+_grab_unpack() {
+    local grabbed="$1"
+    GRAB_URL="${grabbed%%$'\n'*}"
+    GRAB_TITLE=""
+    if [[ "$grabbed" == *$'\n'* ]]; then
+        GRAB_TITLE="${grabbed#*$'\n'}"
+        GRAB_TITLE="${GRAB_TITLE%%$'\n'*}"
+    fi
+}
+
 resolve_url() {
-    local browser="$1" url=""
+    local browser="$1" grabbed=""
     log_debug "Detected browser: ${browser}"
+    GRAB_URL=""
+    GRAB_TITLE=""
+    GRAB_SOURCE=""
 
     if [[ "$browser" != "clipboard" ]]; then
         # Walk the registry to find the matching grab function
         local i
         for i in "${!BROWSER_KEYS[@]}"; do
             if [[ "${BROWSER_KEYS[$i]}" == "$browser" ]]; then
-                url=$("${BROWSER_GRAB[$i]}" 2>/dev/null) || true
+                grabbed=$("${BROWSER_GRAB[$i]}" 2>/dev/null) || true
+                _grab_unpack "$grabbed"
                 break
             fi
         done
@@ -315,17 +371,16 @@ resolve_url() {
 
     # Validate the primary result is an HTTP/S URI; anything else (file://,
     # clipboard noise, empty string) routes to the clipboard fallback path
-    if [[ "$url" =~ ^https?:// ]]; then
-        GRAB_URL="$url"
+    if [[ "$GRAB_URL" =~ ^https?:// ]]; then
         GRAB_SOURCE="primary"
         return 0
     fi
 
     log_warn "Primary grab failed or returned non-URL; falling back to raw clipboard"
-    url=$(wl-paste --no-newline 2>/dev/null) || true
+    GRAB_URL=$(wl-paste --no-newline 2>/dev/null) || true
+    GRAB_TITLE=""
 
-    [[ -n "$url" ]] || die "No URL found via primary grab or clipboard" 1
-    GRAB_URL="$url"
+    [[ -n "$GRAB_URL" ]] || die "No URL found via primary grab or clipboard" 1
     GRAB_SOURCE="clipboard"
 }
 
@@ -433,10 +488,24 @@ readonly AWK_MD_LIB='
         }
         return ""
     }
+    # bullet line → title from [title](url); "" for a bare-URL bullet
+    function md_title(line) {
+        sub(/^[-*][[:space:]]+/, "", line)
+        sub(/[[:space:]]*<!--.*$/, "", line)
+        sub(/^[[:space:]]+/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+        if (match(line, /^\[[^\]]*\]\(/)) {
+            return substr(line, 2, RLENGTH - 3)
+        }
+        return ""
+    }
 '
 
-# Parse the Markdown DB into a canonical URL<TAB>browser<TAB>category stream —
-# the single source of truth every consumer (menus, lookups, counts) builds on.
+# Parse the Markdown DB into a canonical
+# URL<TAB>browser<TAB>category<TAB>title stream — the single source of truth
+# every consumer (menus, lookups, counts) builds on.  Title is empty for
+# unnamed (bare-URL) bullets.  Tabs/newlines in a hand-edited title are
+# flattened so fuzzel's TSV columns cannot split.
 _db_entries() {
     [[ -f "$TAB_DB" ]] || return 0
     awk -v def="$DEFAULT_CATEGORY" "$AWK_MD_LIB"'
@@ -444,7 +513,9 @@ _db_entries() {
         /^[-*][[:space:]]/ {
             u = md_url($0)
             if (u == "") next
-            printf "%s\t%s\t%s\n", u, md_browser($0), (cat == "" ? def : cat)
+            t = md_title($0)
+            gsub(/[\t\n\r]/, " ", t)
+            printf "%s\t%s\t%s\t%s\n", u, md_browser($0), (cat == "" ? def : cat), t
         }' "$TAB_DB"
 }
 
@@ -453,9 +524,13 @@ _write_skeleton() {
     cat > "$TAB_DB" <<'EOF'
 # ❄ iced tabs
 
-Frozen browser tabs. One `- URL` bullet per tab, grouped under `## category`
+Frozen browser tabs. One bullet per tab, grouped under `## category`
 headings. Edit freely for bulk management: move bullets between sections,
 delete lines, add new URLs, reorder anything — menu order follows file order.
+
+  - [readable name](https://example.com) <!--browser-->   ← named (menus show the name)
+  - https://example.com <!--browser-->                    ← unnamed (menus show the URL)
+
 The trailing `<!--browser-->` comment records where a tab reopens; bullets
 without one open in the default browser.
 EOF
@@ -497,26 +572,37 @@ _existing_categories() {
         }' "$TAB_DB"
 }
 
-# Render the DB as a fuzzel menu grouped under category sub-headings:
-#   ── work ──
-#     https://…
-#   ✎ edit tab list
+# Render the DB as a fuzzel TSV menu grouped under category sub-headings:
+#   col1 (accept)  col2 (display)           col3 unused — match is {1} {2}
+#   @cat:work      ── work ──
+#   https://…        readable name  ·  host   (or the URL when unnamed)
+#   @edit          ✎ edit tab list
 # Sections and entries appear in FILE order (manual edits control the layout).
 # Headings are unindented `── name ──`; tabs are indented two spaces so the
-# row types can never collide when parsing the selection.  The pinned edit row
-# is always last.
+# row types can never collide visually.  The pinned edit row is always last.
 _grouped_menu() {
     _db_entries | awk -F'\t' '
+        function host(u) {
+            sub(/^https?:\/\//, "", u)
+            sub(/\/.*$/, "", u)
+            return u
+        }
         {
             if (!($3 in seen)) { seen[$3] = 1; order[++n] = $3 }
-            items[$3] = items[$3] "  " $1 "\n"
+            if ($4 != "") {
+                display = "  " $4 "  ·  " host($1)
+            } else {
+                display = "  " $1
+            }
+            items[$3] = items[$3] $1 "\t" display "\n"
         }
         END {
             for (i = 1; i <= n; i++) {
-                printf "── %s ──\n%s", order[i], items[order[i]]
+                c = order[i]
+                printf "@cat:%s\t── %s ──\n%s", c, c, items[c]
             }
         }'
-    printf '%s\n' "$EDIT_ROW"
+    printf '@edit\t%s\n' "$EDIT_ROW"
 }
 
 # Present the grouped menu and classify the selection.  Sets:
@@ -524,6 +610,10 @@ _grouped_menu() {
 #   PICK_VALUE – the URL, the category name, or ""
 # Globals instead of stdout: fuzzel must own the terminal-free display and a
 # $() capture would also swallow the die-path notifications.
+#
+# fuzzel --with-nth=2 shows the readable name; --accept-nth=1 returns the
+# URL / sentinel so a title can never be mistaken for a URL.  --match-nth
+# searches BOTH the URL and the display name.
 PICK_TYPE="none"
 PICK_VALUE=""
 
@@ -538,19 +628,22 @@ _pick_entry() {
     fi
 
     sel=$(_grouped_menu | fuzzel --dmenu \
+        --with-nth=2 \
+        --accept-nth=1 \
+        --match-nth='{1} {2}' \
+        --only-match \
         --prompt="$prompt" \
-        --placeholder="fuzzy-search tabs; headings group by category") || true
+        --placeholder="fuzzy-search names or URLs; headings group by category") || true
 
     if [[ -z "$sel" ]]; then
         PICK_TYPE="none"; PICK_VALUE=""
-    elif [[ "$sel" == "$EDIT_ROW" ]]; then
+    elif [[ "$sel" == "@edit" ]]; then
         PICK_TYPE="edit"; PICK_VALUE=""
-    elif [[ "$sel" == "── "*" ──" ]]; then
-        PICK_VALUE="${sel#── }"
-        PICK_VALUE="${PICK_VALUE% ──}"
+    elif [[ "$sel" == @cat:* ]]; then
+        PICK_VALUE="${sel#@cat:}"
         PICK_TYPE="category"
     else
-        PICK_VALUE="${sel#  }"
+        PICK_VALUE="$sel"
         PICK_TYPE="url"
     fi
 }
@@ -576,16 +669,80 @@ _resolve_category() {
     printf '%s' "${cat:-$DEFAULT_CATEGORY}"
 }
 
+# Flatten a display name so it is safe in a Markdown [title](url) bullet and
+# as a fuzzel TSV field.  Empty / whitespace-only input → empty output.
+_sanitize_title() {
+    local t="${1:-}"
+    t="${t//$'\t'/ }"
+    t="${t//$'\n'/ }"
+    t="${t//$'\r'/ }"
+    t="${t//'['/}"
+    t="${t//']'/}"
+    t=$(printf '%s' "$t" | tr -s ' ')
+    t="${t#"${t%%[![:space:]]*}"}"
+    t="${t%"${t##*[![:space:]]}"}"
+    if (( ${#t} > 80 )); then
+        t="${t:0:80}"
+        t="${t%"${t##*[![:space:]]}"}"
+    fi
+    # A title that is just the URL is not more readable than a bare bullet
+    if [[ "$t" =~ ^https?:// ]]; then
+        t=""
+    fi
+    printf '%s' "$t"
+}
+
+# Resolve the display name for a new freeze:
+#   $1 = suggested page title (may be empty)
+#   $2 = explicit CLI name (wins when non-empty)
+# fuzzel: Enter on the suggestion keeps it, typing a custom name overrides,
+# Escape → unnamed (menus show the URL).  When fuzzel cannot run, the
+# suggestion is used as-is so a captured page title is not silently dropped.
+_resolve_name() {
+    local suggested="" name="${2:-}"
+
+    if [[ -n "$name" ]]; then
+        _sanitize_title "$name"
+        return
+    fi
+
+    suggested=$(_sanitize_title "${1:-}")
+
+    if command -v fuzzel >/dev/null 2>&1 \
+        && ! pgrep -x fuzzel >/dev/null 2>&1; then
+        name=$(
+            { [[ -n "$suggested" ]] && printf '%s\n' "$suggested"; } \
+            | fuzzel --dmenu \
+                --minimal-lines \
+                --prompt="❄ name › " \
+                --placeholder="${suggested:+Enter keeps suggestion; }type a name; Esc → URL only"
+        ) || true
+    else
+        name="$suggested"
+    fi
+
+    _sanitize_title "$name"
+}
+
+# Human-readable label for notifications: stored title, else the URL.
+_entry_label() {
+    local url="$1" label=""
+    label=$(_db_entries | URL="$url" awk -F'\t' \
+        '$1==ENVIRON["URL"] { print ($4 != "" ? $4 : $1); exit }') || true
+    printf '%s' "${label:-$url}"
+}
+
 # ─── Subcommand: ice ─────────────────────────────────────────────────────────
 
-# 1. Resolve active browser + grab its current tab URL
+# 1. Resolve active browser + grab its current tab URL (and page title)
 # 2. Validate; for new URLs resolve a category (CLI arg or fuzzel prompt) and
-#    append URL<TAB>browser<TAB>category to the flat-file DB
+#    an optional display name (CLI arg, fuzzel prompt, or captured title)
 # 3. Close only the active browser tab — but ONLY when the URL came from a
 #    verified browser grab.  A clipboard-fallback URL may be stale garbage;
 #    closing on it could hit the wrong page ("my tab didn't survive").
 cmd_ice() {
     local category="${1:-}"
+    local name="${2:-}"
 
     init_db
     require_commands "wl-paste" "pgrep"
@@ -611,13 +768,20 @@ cmd_ice() {
         log_warn "Duplicate skipped: ${url}"
         _notify low "iced ❄ duplicate" "Already frozen: ${url}"
     else
-        # Category is only worth asking for when we are actually appending;
-        # prompting on duplicates would be a pointless extra dialog
+        # Category/name are only worth asking for when we are actually
+        # appending; prompting on duplicates would be a pointless extra dialog
         category=$(_resolve_category "$category")
+        name=$(_resolve_name "${GRAB_TITLE:-}" "$name")
 
-        # Serialize the bullet; the origin-browser comment is omitted for
-        # clipboard-mode freezes (they reopen via xdg-open anyway)
-        local entry="- ${url}"
+        # Serialize the bullet; prefer [name](url) so the picker can show a
+        # readable label.  Origin-browser comment is omitted for clipboard-
+        # mode freezes (they reopen via xdg-open anyway).
+        local entry
+        if [[ -n "$name" ]]; then
+            entry="- [${name}](${url})"
+        else
+            entry="- ${url}"
+        fi
         [[ "$browser" != "clipboard" ]] && entry+=" <!--${browser}-->"
 
         # Insert at the TOP of the matching section (newest first, mirrors the
@@ -642,17 +806,20 @@ cmd_ice() {
                     print ENVIRON["ENTRY"]
                 }
             }'
-        print_success "Frozen [${category}]: ${url}"
-        log_success "Frozen [${category}]: ${url}"
+        local label="${name:-$url}"
+        print_success "Frozen [${category}]: ${label}"
+        log_success "Frozen [${category}]: ${label}"
         froze_new=1
     fi
+
+    local shown="${name:-$url}"
 
     if [[ "$browser" == "clipboard" ]]; then
         # Plain-clipboard mode: no browser context to close.
         # Explicit if — a bare `(( )) &&` list here would make the function
         # return 1 on duplicates under set -e.
         if (( froze_new )); then
-            _notify normal "iced ❄" "Frozen from clipboard [${category}]: ${url}"
+            _notify normal "iced ❄" "Frozen from clipboard [${category}]: ${shown}"
         fi
     elif [[ "$GRAB_SOURCE" == "primary" ]]; then
         # Close even on duplicate: the URL is safe in the DB either way.
@@ -662,9 +829,9 @@ cmd_ice() {
         fi
 
         if (( froze_new )) && (( tab_closed )); then
-            _notify normal "iced ❄" "Frozen [${category}] (closed tab in ${browser}): ${url}"
+            _notify normal "iced ❄" "Frozen [${category}] (closed tab in ${browser}): ${shown}"
         elif (( froze_new )); then
-            _notify low "iced ❄" "Frozen [${category}] but tab close failed in ${browser}: ${url}"
+            _notify low "iced ❄" "Frozen [${category}] but tab close failed in ${browser}: ${shown}"
         elif (( tab_closed )); then
             _notify normal "iced ❄" "Closed tab in ${browser} (already frozen): ${url}"
         else
@@ -676,7 +843,7 @@ cmd_ice() {
         log_warn "URL came from clipboard fallback; NOT closing tab in ${browser}"
         print_warn "Unverified (clipboard) URL saved; ${browser} left running"
         _notify critical "iced ❄ unverified" \
-            "Saved from clipboard — could not read ${browser}'s active tab, so it was NOT closed: ${url}"
+            "Saved from clipboard — could not read ${browser}'s active tab, so it was NOT closed: ${shown}"
     fi
 }
 
@@ -739,9 +906,11 @@ cmd_thaw() {
 
     _launch_in "$browser" "$url"
 
+    local label
+    label=$(_entry_label "$url")
     log_info "Thawed (kept in DB): ${url}"
-    print_success "Launched: ${url}"
-    _notify normal "iced 🔥" "Thawed in ${via} (kept in list): ${url}"
+    print_success "Launched: ${label}"
+    _notify normal "iced 🔥" "Thawed in ${via} (kept in list): ${label}"
 }
 
 # Launch a URL in the given canonical browser, trying each installed binary
@@ -826,12 +995,14 @@ cmd_remove() {
         url)
             # Delete only the bullet whose PARSED url matches — comment and
             # markdown-link decorations on the line don't affect the match
+            local label
+            label=$(_entry_label "$PICK_VALUE")
             SEL="$PICK_VALUE" _db_rewrite '
                 /^[-*][[:space:]]/ && md_url($0) == ENVIRON["SEL"] { next }
                 { print }'
             log_info "Removed from DB: ${PICK_VALUE}"
-            print_success "Removed: ${PICK_VALUE}"
-            _notify normal "iced ✂" "Removed: ${PICK_VALUE}"
+            print_success "Removed: ${label}"
+            _notify normal "iced ✂" "Removed: ${label}"
             ;;
     esac
 }
@@ -896,8 +1067,11 @@ usage() {
 ${BOLD}Usage:${RESET} $(basename "$0") <command> [args]
 
 ${BOLD}Commands:${RESET}
-  ${SUCCESS}ice [category]${RESET}  Grab active browser tab URL → freeze to DB → close active tab
+  ${SUCCESS}ice [category] [name...]${RESET}
+                  Grab active browser tab URL → freeze to DB → close active tab
                   (category from arg, else fuzzel prompt; Esc → ${DEFAULT_CATEGORY})
+                  (name from remaining args, else fuzzel prompt with page-title
+                   suggestion; Esc → unnamed, menus show the URL)
   ${INFO}thaw${RESET}            fuzzel-select a frozen tab → reopen in its origin browser
                   (non-destructive: the entry stays listed until removed)
   ${ERROR}remove${RESET}          fuzzel-select a tab to delete — or a ${BOLD}heading${RESET} to delete
@@ -907,7 +1081,8 @@ ${BOLD}Commands:${RESET}
                    override launcher: ICED_EDITOR="ghostty -e nvim")
 
 ${BOLD}Menu:${RESET} tabs are grouped under ── category ── sub-headings in FILE order —
-rearrange the Markdown by hand and the menus follow.
+rearrange the Markdown by hand and the menus follow. Named tabs show the
+name (plus host); unnamed tabs show the URL. Fuzzy search matches both.
 
 ${BOLD}Browser auto-detection (ice only):${RESET}
   Priority: \$ICED_BROWSER env > hyprctl activewindow class > process probe > clipboard
@@ -918,8 +1093,9 @@ ${BOLD}Browser auto-detection (ice only):${RESET}
   Feedback:  every outcome raises a notify-send notification (keybind-safe).
 
 ${BOLD}Database:${RESET} ${TAB_DB}
-  Markdown: '## category' headings, '- URL <!--browser-->' bullets.
-  Hand-edit freely; plain '- URL' bullets and '[title](url)' links both parse.
+  Markdown: '## category' headings, '- [name](URL) <!--browser-->' (or plain
+  '- URL') bullets. Hand-edit freely; rename by wrapping the URL in a
+  markdown link. Both forms parse; menus prefer the name when present.
   Lives in the journal repo (git-backed); linked from the journal dashboard
   and openable via 'journal.sh tabs' / 'journal.sh surface-tabs'.
   Override the location with ICED_DB (or JOURNAL_DIR for the repo root).
@@ -935,7 +1111,7 @@ EOF
 # ─── Entrypoint ──────────────────────────────────────────────────────────────
 
 case "${1:-}" in
-    ice)            cmd_ice "${2:-}" ;;
+    ice)            cmd_ice "${2:-}" "${*:3}" ;;
     thaw)           cmd_thaw   ;;
     remove)         cmd_remove ;;
     edit)           cmd_edit   ;;
