@@ -606,14 +606,17 @@ _grouped_menu() {
 }
 
 # Present the grouped menu and classify the selection.  Sets:
-#   PICK_TYPE  – "url" | "category" | "edit" | "none"
-#   PICK_VALUE – the URL, the category name, or ""
+#   PICK_TYPE   – "url" | "category" | "edit" | "search" | "none"
+#   PICK_VALUE  – the URL, the category name, the search query, or ""
 # Globals instead of stdout: fuzzel must own the terminal-free display and a
 # $() capture would also swallow the die-path notifications.
 #
 # fuzzel --with-nth=2 shows the readable name; --accept-nth=1 returns the
 # URL / sentinel so a title can never be mistaken for a URL.  --match-nth
 # searches BOTH the URL and the display name.
+#
+# When --only-match is removed, fuzzel can return custom text (not from the menu);
+# we detect this and treat it as a Google search query.
 PICK_TYPE="none"
 PICK_VALUE=""
 
@@ -631,7 +634,6 @@ _pick_entry() {
         --with-nth=2 \
         --accept-nth=1 \
         --match-nth='{1} {2}' \
-        --only-match \
         --prompt="$prompt" \
         --placeholder="fuzzy-search names or URLs; headings group by category") || true
 
@@ -880,8 +882,36 @@ cmd_thaw() {
             exit 0
             ;;
         category)
-            _notify low "iced" "'${PICK_VALUE}' is a heading — pick a tab to thaw"
-            print_warn "Headings cannot be thawed; pick a tab"
+            # Open all tabs in the selected category
+            local urls_opened=0
+            
+            # Use process substitution (not pipe) to avoid subshell so variables persist
+            while IFS=$'\t' read -r url browser_from_db; do
+                # Skip empty lines and non-URLs
+                [[ -n "$url" ]] || continue
+                [[ "$url" =~ ^https?:// ]] || continue
+                
+                # Determine the browser to launch in
+                if [[ -z "$browser_from_db" || "$browser_from_db" == "clipboard" ]]; then
+                    browser_from_db="clipboard"
+                fi
+
+                _launch_in "$browser_from_db" "$url"
+                urls_opened=$(( urls_opened + 1 ))
+                # Small delay between launches to avoid overwhelming the browser
+                sleep 0.15
+            done < <(_db_entries | awk -F'\t' -v cat="$PICK_VALUE" \
+                '$3 == cat { print $1 "\t" $2 }')
+
+            if (( urls_opened > 0 )); then
+                log_info "Opened ${urls_opened} tab(s) from category '${PICK_VALUE}'"
+                print_success "Opened ${urls_opened} tab(s) from '${PICK_VALUE}'"
+                _notify normal "iced 🔥" "Opened ${urls_opened} tab(s) from '${PICK_VALUE}'"
+            else
+                log_warn "No tabs found in category '${PICK_VALUE}'"
+                print_warn "No tabs found in '${PICK_VALUE}'"
+                _notify low "iced" "No tabs found in '${PICK_VALUE}'"
+            fi
             exit 0
             ;;
     esac
@@ -921,7 +951,22 @@ _launch_in() {
     local -a candidates=()
 
     case "$browser" in
-        qutebrowser) candidates=( qutebrowser ) ;;
+        qutebrowser)
+            # Try IPC first (more reliable for multiple tabs), fall back to CLI
+            local socket=""
+            socket=$(find "$QUTE_IPC_DIR" -maxdepth 1 -name "ipc-*" -type s 2>/dev/null | head -1) || true
+            if [[ -n "$socket" && -S "$socket" ]]; then
+                local payload
+                printf -v payload '{"args":[":open -t %s"],"target_arg":null,"version":"1.0.0","protocol_version":1,"cwd":"%s"}' \
+                    "$url" "$PWD"
+                if printf '%s\n' "$payload" | timeout 2 socat - "UNIX-CONNECT:${socket}" >/dev/null 2>&1; then
+                    log_info "Launched via qutebrowser IPC: ${url}"
+                    return 0
+                fi
+                log_warn "qutebrowser IPC failed; trying CLI"
+            fi
+            candidates=( "qutebrowser --target=tab" )
+            ;;
         firefox)     candidates=( firefox firefox-esr librewolf ) ;;
         chromium)    candidates=( chromium chromium-browser google-chrome-stable google-chrome ) ;;
         brave)       candidates=( brave brave-browser ) ;;
@@ -929,8 +974,8 @@ _launch_in() {
 
     local c
     for c in "${candidates[@]}"; do
-        if command -v "$c" >/dev/null 2>&1; then
-            "$c" "$url" >/dev/null 2>&1 & disown
+        if command -v "${c%% *}" >/dev/null 2>&1; then
+            $c "$url" >/dev/null 2>&1 & disown
             log_info "Launched via ${c}: ${url}"
             return 0
         fi
@@ -1074,6 +1119,7 @@ ${BOLD}Commands:${RESET}
                    suggestion; Esc → unnamed, menus show the URL)
   ${INFO}thaw${RESET}            fuzzel-select a frozen tab → reopen in its origin browser
                   (non-destructive: the entry stays listed until removed)
+                  FEATURE: select a heading to open ${BOLD}all tabs${RESET} in that category
   ${ERROR}remove${RESET}          fuzzel-select a tab to delete — or a ${BOLD}heading${RESET} to delete
                   that entire section
   ${WARN}edit${RESET}            open the Markdown DB in \$EDITOR for bulk management
@@ -1083,6 +1129,10 @@ ${BOLD}Commands:${RESET}
 ${BOLD}Menu:${RESET} tabs are grouped under ── category ── sub-headings in FILE order —
 rearrange the Markdown by hand and the menus follow. Named tabs show the
 name (plus host); unnamed tabs show the URL. Fuzzy search matches both.
+
+${BOLD}Thaw Menu Features:${RESET}
+  • Select a ${BOLD}heading${RESET} (── name ──): opens all tabs in that category
+  • Select a tab: opens the individual tab
 
 ${BOLD}Browser auto-detection (ice only):${RESET}
   Priority: \$ICED_BROWSER env > hyprctl activewindow class > process probe > clipboard
