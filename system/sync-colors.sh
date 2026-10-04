@@ -971,14 +971,19 @@ echo "Updating starship..."
 # Starship uses $variable syntax in its format strings, so we can't use heredoc.
 # Instead, do targeted sed replacements on hex color values.
 if [ -f "$CONFIG_DIR/starship.toml" ]; then
+    # NOTE: starship.toml is a single-file stow symlink (unlike most other
+    # targets here, which live inside stow-folded directories). Plain
+    # `sed -i` replaces the file via a temp-file+rename, which destroys the
+    # symlink and silently diverges this file from the dotfiles repo.
+    # --follow-symlinks makes sed edit through the link in place instead.
     # Update fg/white color references (used for distro, username)
-    sed -i "s|(\#[0-9a-fA-F]\{6\}) '|(${FG}) '|g" "$CONFIG_DIR/starship.toml"
+    sed -i --follow-symlinks "s|(\#[0-9a-fA-F]\{6\}) '|(${FG}) '|g" "$CONFIG_DIR/starship.toml"
     # Update yellow color references (used for hostname, device)
-    sed -i "s|\[\$hostname\](#[0-9a-fA-F]\{6\})|\[\$hostname](${YELLOW})|" "$CONFIG_DIR/starship.toml"
-    sed -i "s|\[\$env_value\](#[0-9a-fA-F]\{6\})'$|\[\$env_value](${YELLOW})'|" "$CONFIG_DIR/starship.toml"
+    sed -i --follow-symlinks "s|\[\$hostname\](#[0-9a-fA-F]\{6\})|\[\$hostname](${YELLOW})|" "$CONFIG_DIR/starship.toml"
+    sed -i --follow-symlinks "s|\[\$env_value\](#[0-9a-fA-F]\{6\})'$|\[\$env_value](${YELLOW})'|" "$CONFIG_DIR/starship.toml"
     # Update green color references (git branch, git status, staged)
-    sed -i "s|bold #[0-9a-fA-F]\{6\}\"|bold ${GREEN}\"|g" "$CONFIG_DIR/starship.toml"
-    sed -i "s|\](#[0-9a-fA-F]\{6\})'$|](${GREEN})'|" "$CONFIG_DIR/starship.toml"
+    sed -i --follow-symlinks "s|bold #[0-9a-fA-F]\{6\}\"|bold ${GREEN}\"|g" "$CONFIG_DIR/starship.toml"
+    sed -i --follow-symlinks "s|\](#[0-9a-fA-F]\{6\})'$|](${GREEN})'|" "$CONFIG_DIR/starship.toml"
 fi
 
 # === SUPERFILE ===

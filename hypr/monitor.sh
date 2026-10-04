@@ -22,9 +22,22 @@ MODE="hyprland"
 MULTI_MONITOR=0
 CONNECTED=""
 
-CONFIG_FILE="${CONFIG_FILE:-/home/groot/.config/hypr/dynamic-monitors.conf}"
 LUA_CONFIG_FILE="${LUA_CONFIG_FILE:-/home/groot/.config/hypr/dynamic-monitors.lua}"
-LOG_FILE="${LOG_FILE:-/var/log/monitor-switch.log}"
+STATE_DIR="${STATE_DIR:-/home/groot/.local/state/hypr}"
+LOG_FILE="${LOG_FILE:-$STATE_DIR/monitor-switch.log}"
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-1048576}" # 1 MiB
+
+mkdir -p "$STATE_DIR"
+
+rotate_log_if_needed() {
+    if [[ -f "$LOG_FILE" ]]; then
+        local size
+        size=$(stat -c%s "$LOG_FILE" 2>/dev/null || echo 0)
+        if (( size > LOG_MAX_BYTES )); then
+            mv -f "$LOG_FILE" "${LOG_FILE}.1"
+        fi
+    fi
+}
 
 usage() {
     cat <<EOF
@@ -107,11 +120,6 @@ find_external_hyprland() {
 }
 
 write_docked_config() {
-    cat > "$CONFIG_FILE" << EOL
-        monitor = $DOCKED_MONITOR, preferred, auto, auto
-        monitor = $MOBILE_MONITOR, disable
-EOL
-
     cat > "$LUA_CONFIG_FILE" << EOL
 hl.monitor({ output = "$DOCKED_MONITOR", mode = "preferred", position = "auto", scale = "auto" })
 hl.monitor({ output = "$MOBILE_MONITOR", disabled = true })
@@ -124,14 +132,6 @@ write_multi_config() {
     {
         while IFS= read -r monitor; do
             [[ -n "$monitor" ]] || continue
-            printf '        monitor = %s, preferred, auto, auto\n' "$monitor"
-        done <<< "$1"
-        printf '        monitor = %s, 1920x1080, auto, 1\n' "$MOBILE_MONITOR"
-    } > "$CONFIG_FILE"
-
-    {
-        while IFS= read -r monitor; do
-            [[ -n "$monitor" ]] || continue
             printf 'hl.monitor({ output = "%s", mode = "preferred", position = "auto", scale = "auto" })\n' "$monitor"
         done <<< "$1"
         printf 'hl.monitor({ output = "%s", mode = "1920x1080", position = "auto", scale = 1 })\n' "$MOBILE_MONITOR"
@@ -139,14 +139,12 @@ write_multi_config() {
 }
 
 write_mobile_config() {
-    cat > "$CONFIG_FILE" << EOL
-        monitor = $MOBILE_MONITOR, 1920x1080, auto, 1
-EOL
-
     cat > "$LUA_CONFIG_FILE" << EOL
 hl.monitor({ output = "$MOBILE_MONITOR", mode = "1920x1080", position = "auto", scale = 1 })
 EOL
 }
+
+rotate_log_if_needed
 
 #Case flags to have systemd vs hyprctl
 case "$MODE" in
@@ -209,8 +207,6 @@ esac
       echo "$name: $status"
     done
   fi
-  echo "APPLIED CONFIG:"
-  cat "$CONFIG_FILE"
   echo "APPLIED LUA CONFIG:"
   cat "$LUA_CONFIG_FILE"
   echo ""
