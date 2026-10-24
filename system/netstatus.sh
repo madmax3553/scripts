@@ -33,6 +33,7 @@ NO_COLOR_MODE=0
 BOX_WIDTH="$DEFAULT_BOX_WIDTH"
 VALUE_WIDTH=0
 TARGET_IFACE=""
+PRINT_PORTAL_URL_ONLY=0
 
 BORDER_COLOR="$BLUE"
 TITLE_COLOR="$LIGHT_CYAN"
@@ -41,6 +42,7 @@ LABEL_COLOR="$YELLOW"
 VALUE_COLOR="$LIGHT_WHITE"
 MUTED_COLOR="$DIM"
 STATUS_UP_COLOR="$SUCCESS"
+STATUS_WARN_COLOR="$WARN"
 STATUS_DOWN_COLOR="$ERROR"
 RESET_COLOR="$RESET"
 
@@ -53,9 +55,21 @@ IP_ADDR="$NA"
 NETMASK="$NA"
 GATEWAY="$NA"
 DNS="$NA"
+SYSTEM_DNS="$NA"
 DHCP_SERVER="$NA"
 LEASE_TIME="$NA"
 LEASE_EXPIRY="$NA"
+PORTAL_STATE="$NA"
+PORTAL_URL="$NA"
+PORTAL_IP="$NA"
+
+# Direct-IP HTTP probe target (Firefox detectportal Fastly anycast IP, port 80)
+# Using a literal IP with a Host header triggers captive portal TCP/80
+# interception without requiring system DNS resolution.
+PROBE_IP="151.101.193.91"
+PROBE_HOST="detectportal.firefox.com"
+PROBE_PATH="/success.txt"
+PROBE_EXPECTED="success"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -65,10 +79,12 @@ usage() {
     cat <<EOF
 Usage: $(basename "$0") [options] [interface]
 
-Display the active network interface, address, gateway, DNS, and DHCP lease.
-With no interface, the one carrying the default route is used.
+Display the active network interface, address, gateway, DNS, DHCP lease,
+and captive portal status. With no interface, the one carrying the default
+route is used.
 
 Options:
+  -p, --portal    Print only the captured captive portal URL (if detected)
   -n, --no-color  Disable ANSI color output
   -h, --help      Show this help
 
@@ -80,6 +96,7 @@ EOF
 parse_args() {
     while (($#)); do
         case "$1" in
+            -p|--portal) PRINT_PORTAL_URL_ONLY=1; shift ;;
             -n|--no-color) NO_COLOR_MODE=1; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) usage >&2; exit 1 ;;
@@ -101,6 +118,7 @@ disable_colors_if_needed() {
         VALUE_COLOR=""
         MUTED_COLOR=""
         STATUS_UP_COLOR=""
+        STATUS_WARN_COLOR=""
         STATUS_DOWN_COLOR=""
         RESET_COLOR=""
     fi
@@ -428,11 +446,18 @@ collect_nmcli_details() {
         value="$(format_epoch "$value")"
         [[ -n "$value" ]] && LEASE_EXPIRY="$value"
     fi
+
+    value="$(extract_dhcp_option "captive_portal_uri" "$dhcp_raw")"
+    [[ -z "$value" ]] && value="$(extract_dhcp_option "unknown_114" "$dhcp_raw")"
+    value="$(trim "$value")"
+    if [[ -n "$value" && "$value" =~ ^https?:// ]]; then
+        PORTAL_URL="$value"
+    fi
 }
 
 collect_ip_details() {
     local iface="$1"
-    local ip_cidr gateway_raw dns_raw cidr value
+    local ip_cidr gateway_raw dns_raw global_dns_raw cidr value
 
     ip_cidr="$(ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk '{print $4; exit}' || true)"
     if [[ -n "$ip_cidr" && "$IP_ADDR" == "$NA" ]]; then
@@ -475,6 +500,16 @@ collect_ip_details() {
         )"
         value="$(normalize_list "$dns_raw")"
         [[ -n "$value" && "$DNS" == "$NA" ]] && DNS="$value"
+
+        global_dns_raw="$(
+            resolvectl dns 2>/dev/null |
+                awk -F': ' '/^Global:/ {print $2; exit}' || true
+        )"
+        if [[ -n "$global_dns_raw" ]]; then
+            SYSTEM_DNS="$(normalize_list "${global_dns_raw// /|}")"
+        elif [[ -n "$value" ]]; then
+            SYSTEM_DNS="$value"
+        fi
     fi
 
     if [[ "$DNS" == "$NA" && -r /etc/resolv.conf ]]; then
@@ -488,6 +523,188 @@ collect_ip_details() {
         )"
         value="$(trim "$dns_raw")"
         [[ -n "$value" ]] && DNS="$value"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Captive Portal Detection & DHCP DNS Bypass
+# ─────────────────────────────────────────────────────────────────────────────
+
+extract_url_host() {
+    local url="$1"
+    awk -F/ '{print $3}' <<< "$url" | cut -d: -f1
+}
+
+resolve_via_dns_server() {
+    local domain="$1"
+    local server="$2"
+
+    [[ -z "$domain" || -z "$server" || "$server" == "$NA" ]] && return 0
+
+    if [[ "$domain" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        printf '%s' "$domain"
+        return 0
+    fi
+
+    command -v python3 >/dev/null 2>&1 || return 0
+
+    python3 - "$domain" "$server" 2>/dev/null <<'PY' || true
+import random, socket, struct, sys
+
+domain, server = sys.argv[1].strip("."), sys.argv[2].strip()
+tid = random.randint(0, 65535)
+qname = b"".join(bytes([len(p)]) + p.encode("ascii") for p in domain.split(".")) + b"\x00"
+packet = struct.pack(">HHHHHH", tid, 0x0100, 1, 0, 0, 0) + qname + struct.pack(">HH", 1, 1)
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2.0)
+sock.sendto(packet, (server, 53))
+data, _ = sock.recvfrom(512)
+sock.close()
+
+ancount = struct.unpack(">H", data[6:8])[0]
+idx = 12
+while idx < len(data) and data[idx] != 0:
+    idx += 1 + data[idx]
+idx += 5  # null byte + qtype + qclass
+
+for _ in range(ancount):
+    if data[idx] & 0xC0 == 0xC0:
+        idx += 2
+    else:
+        while idx < len(data) and data[idx] != 0:
+            idx += 1 + data[idx]
+        idx += 1
+    rtype, rclass, _, rdlen = struct.unpack(">HHIH", data[idx:idx + 10])
+    idx += 10
+    if rtype == 1 and rclass == 1 and rdlen == 4:
+        print(socket.inet_ntoa(data[idx:idx + 4]))
+        break
+    idx += rdlen
+PY
+}
+
+detect_captive_portal() {
+    local iface="$1"
+    local response headers body http_code location meta_url portal_host dhcp_dns target_ip resolved_ip
+
+    if [[ "$STATUS" != "UP" || "$IP_ADDR" == "$NA" ]]; then
+        PORTAL_STATE="OFFLINE"
+        return
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        PORTAL_STATE="$NA"
+        return
+    fi
+
+    dhcp_dns="${DNS%%,*}"
+    [[ "$dhcp_dns" == "$NA" || -z "$dhcp_dns" ]] && dhcp_dns="$DHCP_SERVER"
+    [[ "$dhcp_dns" == "$NA" || -z "$dhcp_dns" ]] && dhcp_dns="$GATEWAY"
+
+    # First resolve PROBE_HOST directly against the interface's DHCP DNS
+    # (catches DNS-hijacking portals), falling back to PROBE_IP (catches
+    # transparent TCP/80 HTTP interception without needing any DNS).
+    target_ip=""
+    if [[ -n "$dhcp_dns" && "$dhcp_dns" != "$NA" ]]; then
+        target_ip="$(resolve_via_dns_server "$PROBE_HOST" "$dhcp_dns")"
+    fi
+    [[ -z "$target_ip" ]] && target_ip="$PROBE_IP"
+
+    response="$(
+        curl -s -i --interface "$iface" \
+            --connect-timeout 2 -m 4 \
+            -H "Host: ${PROBE_HOST}" \
+            -H "User-Agent: Mozilla/5.0 (X11; Linux x86_64) CaptiveNetworkSupport" \
+            "http://${target_ip}${PROBE_PATH}" 2>/dev/null || true
+    )"
+
+    if [[ -z "$response" ]]; then
+        PORTAL_STATE="OFFLINE"
+        return
+    fi
+
+    headers="${response%%$'\r\n\r\n'*}"
+    body="${response#*$'\r\n\r\n'}"
+    http_code="$(awk 'NR==1 {print $2}' <<< "$headers")"
+    location="$(awk -F': ' 'tolower($1) == "location" {print $2; exit}' <<< "$headers" | tr -d '\r')"
+
+    if [[ "$http_code" == "200" && "$(trim "$body")" == "$PROBE_EXPECTED" ]]; then
+        PORTAL_STATE="CLEAR (Online)"
+        PORTAL_URL="$NA"
+        PORTAL_IP="$NA"
+        if command -v resolvectl >/dev/null 2>&1; then
+            sudo -n resolvectl revert "$iface" 2>/dev/null || true
+        fi
+        return
+    fi
+
+    PORTAL_STATE="DETECTED"
+
+    if [[ -n "$location" ]]; then
+        PORTAL_URL="$location"
+    else
+        # Some portals return 200 OK with an HTML meta-refresh or JS redirect
+        meta_url="$(
+            grep -oiE 'https?://[^"'\'' >]+' <<< "$body" | head -n1 || true
+        )"
+        if [[ -n "$meta_url" ]]; then
+            PORTAL_URL="$meta_url"
+        elif [[ "$PORTAL_URL" == "$NA" ]]; then
+            PORTAL_URL="http://neverssl.com"
+        fi
+    fi
+
+    portal_host="$(extract_url_host "$PORTAL_URL")"
+    dhcp_dns="${DNS%%,*}"
+    [[ "$dhcp_dns" == "$NA" || -z "$dhcp_dns" ]] && dhcp_dns="$DHCP_SERVER"
+    [[ "$dhcp_dns" == "$NA" || -z "$dhcp_dns" ]] && dhcp_dns="$GATEWAY"
+
+    if [[ -n "$portal_host" && -n "$dhcp_dns" && "$dhcp_dns" != "$NA" ]]; then
+        resolved_ip="$(resolve_via_dns_server "$portal_host" "$dhcp_dns")"
+        if [[ -n "$resolved_ip" ]]; then
+            PORTAL_IP="${resolved_ip} (@${dhcp_dns})"
+        fi
+    fi
+
+    # While behind a captive portal, hotels block external DNS (9.9.9.9) and
+    # use private portal hostnames (e.g. mafod.cust.blueprintrf.com).
+    # Temporarily route DNS on this interface via DHCP DNS so clicking the
+    # portal URL works in the browser, and spawn a background watcher to
+    # automatically revert back to Quad9 once authentication succeeds.
+    if [[ -n "$dhcp_dns" && "$dhcp_dns" != "$NA" ]] && command -v resolvectl >/dev/null 2>&1; then
+        if sudo -n resolvectl dns "$iface" "$dhcp_dns" 2>/dev/null; then
+            sudo -n resolvectl domain "$iface" "~." 2>/dev/null || true
+            sudo -n resolvectl default-route "$iface" yes 2>/dev/null || true
+            sudo -n resolvectl dnsovertls "$iface" no 2>/dev/null || true
+            SYSTEM_DNS="${dhcp_dns} (Portal Temp -> Quad9)"
+
+            # Follow local controller meta-refresh / 302 redirect if present
+            local hop2_body hop2_url hop3_url
+            hop2_body="$(curl -s -L --interface "$iface" --connect-timeout 2 -m 4 "$PORTAL_URL" 2>/dev/null || true)"
+            hop2_url="$(grep -oiE 'https?://[^"'\'' >]+' <<< "$hop2_body" | head -n1 || true)"
+            if [[ -n "$hop2_url" ]]; then
+                hop3_url="$(curl -s -o /dev/null -w '%{redirect_url}' --interface "$iface" --connect-timeout 2 -m 4 "$hop2_url" 2>/dev/null || true)"
+                if [[ -n "$hop3_url" ]]; then
+                    PORTAL_URL="$hop3_url"
+                else
+                    PORTAL_URL="$hop2_url"
+                fi
+            fi
+
+            nohup bash -c '
+                for ((i = 0; i < 150; i++)); do
+                    sleep 3
+                    out="$(curl -s --interface "'"$iface"'" --connect-timeout 2 -m 3 -H "Host: '"$PROBE_HOST"'" "http://'"$PROBE_IP""$PROBE_PATH"'" 2>/dev/null || true)"
+                    if [[ "$out" == "'"$PROBE_EXPECTED"'" ]]; then
+                        sudo -n resolvectl revert "'"$iface"'" 2>/dev/null || true
+                        exit 0
+                    fi
+                done
+                sudo -n resolvectl revert "'"$iface"'" 2>/dev/null || true
+            ' </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
+        fi
     fi
 }
 
@@ -510,6 +727,7 @@ collect_network() {
     fi
 
     collect_ip_details "$INTERFACE"
+    detect_captive_portal "$INTERFACE"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -538,8 +756,10 @@ row_color() {
 
     case "$kind" in
         status)
-            if [[ "$value" == "UP" ]]; then
+            if [[ "$value" == "UP" || "$value" == "CLEAR (Online)" ]]; then
                 printf '%s' "$STATUS_UP_COLOR"
+            elif [[ "$value" == "DETECTED" ]]; then
+                printf '%s' "$STATUS_WARN_COLOR"
             else
                 printf '%s' "$STATUS_DOWN_COLOR"
             fi
@@ -621,13 +841,23 @@ render_panel() {
     draw_row "Address" "$IP_ADDR"
     draw_row "Netmask" "$NETMASK"
     draw_row "Gateway" "$GATEWAY"
-    draw_row "DNS" "$DNS"
+    draw_row "DHCP DNS" "$DNS"
+    draw_row "System DNS" "$SYSTEM_DNS"
     draw_rule
     draw_section "DHCP"
     draw_row "Server" "$DHCP_SERVER"
     draw_row "Lease" "$LEASE_TIME"
     draw_row "Expires" "$LEASE_EXPIRY"
+    draw_rule
+    draw_section "Captive Portal"
+    draw_row "Status" "$PORTAL_STATE" "status"
+    draw_row "Portal URL" "$PORTAL_URL"
+    draw_row "Portal IP" "$PORTAL_IP"
     draw_bottom
+
+    if [[ "$PORTAL_URL" != "$NA" ]]; then
+        printf '%bPortal URL:%b %s\n' "$LABEL_COLOR" "$RESET_COLOR" "$PORTAL_URL"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -640,6 +870,15 @@ main() {
     calculate_layout
     require_commands "ip" "awk" "date"
     collect_network
+
+    if ((PRINT_PORTAL_URL_ONLY)); then
+        if [[ "$PORTAL_URL" != "$NA" ]]; then
+            printf '%s\n' "$PORTAL_URL"
+            exit 0
+        fi
+        exit 1
+    fi
+
     render_panel
 }
 

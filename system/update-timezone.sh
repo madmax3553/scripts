@@ -12,7 +12,7 @@
 # Purpose: Prompt to update the system timezone from the current public IP location
 # Dependencies: curl, timedatectl, sudo optional, fuzzel optional, notify-send optional
 # Author: groot
-# Modified: 2026-06-06
+# Modified: 2026-10-07
 
 set -euo pipefail
 
@@ -23,6 +23,9 @@ SOURCE_URL="${TIMEZONE_SOURCE_URL:-https://ipapi.co/timezone/}"
 SOURCE_URLS="${TIMEZONE_SOURCE_URLS:-https://ipapi.co/timezone/ https://ipinfo.io/timezone https://worldtimeapi.org/api/ip.txt}"
 TIMEOUT="${TIMEZONE_UPDATE_TIMEOUT:-6}"
 OVERRIDE_TIMEZONE="${TIMEZONE_UPDATE_OVERRIDE-}"
+# This site's LAN, not the company SSID. Other offices share "NOV".
+# Space-separated CIDRs and/or gateway IPs. SSID alone is not enough.
+TRUSTED_NETWORKS="${TIMEZONE_TRUSTED_NETWORKS:-10.114.80.0/22 10.114.80.1}"
 SELECTED_TIMEZONE=""
 
 mkdir -p "$STATE_DIR"
@@ -210,6 +213,68 @@ find_nearby_timezone() {
     printf '%s\t%s\n' "$best_zone" "$best_diff"
 }
 
+ip_in_cidr() {
+    local ip="$1"
+    local cidr="$2"
+    local base prefix
+    local -a ip_octets base_octets
+    local i shift bit ip_bit base_bit
+
+    [[ "$cidr" == */* ]] || return 1
+    base="${cidr%/*}"
+    prefix="${cidr#*/}"
+    [[ "$prefix" =~ ^[0-9]+$ ]] && ((prefix >= 0 && prefix <= 32)) || return 1
+    [[ "$ip" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    ip_octets=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")
+    [[ "$base" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || return 1
+    base_octets=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}")
+
+    for i in 0 1 2 3; do
+        ((ip_octets[i] <= 255 && base_octets[i] <= 255)) || return 1
+        for bit in 7 6 5 4 3 2 1 0; do
+            shift=$((i * 8 + (7 - bit)))
+            ((shift < prefix)) || return 0
+            ip_bit=$(( (ip_octets[i] >> bit) & 1 ))
+            base_bit=$(( (base_octets[i] >> bit) & 1 ))
+            ((ip_bit == base_bit)) || return 1
+        done
+    done
+}
+
+active_lan_addrs() {
+    ip -4 -o addr show scope global 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }'
+}
+
+default_gateways() {
+    ip -4 route show default 2>/dev/null | awk '{ for (i = 1; i <= NF; i++) if ($i == "via") print $(i + 1) }'
+}
+
+trusted_network_active() {
+    local token ip gateway
+
+    [[ -n "$TRUSTED_NETWORKS" ]] || return 1
+
+    for token in $TRUSTED_NETWORKS; do
+        if [[ "$token" == */* ]]; then
+            while IFS= read -r ip; do
+                [[ -n "$ip" ]] || continue
+                if ip_in_cidr "$ip" "$token"; then
+                    log "trusted network match: $ip in $token"
+                    return 0
+                fi
+            done < <(active_lan_addrs)
+        else
+            while IFS= read -r gateway; do
+                [[ "$gateway" == "$token" ]] || continue
+                log "trusted network match: gateway $gateway"
+                return 0
+            done < <(default_gateways)
+        fi
+    done
+
+    return 1
+}
+
 format_offset_delta() {
     local delta="$1"
     local abs_delta="${delta#-}"
@@ -230,8 +295,15 @@ build_timezone_choices() {
     local label
     local printed="|"
 
-    printf '%s\tdetected\n' "$detected"
-    printed="${printed}${detected}|"
+    if [[ -n "$current" && -f "/usr/share/zoneinfo/$current" ]]; then
+        printf '%s\tkeep current\n' "$current"
+        printed="${printed}${current}|"
+    fi
+
+    if [[ "$printed" != *"|$detected|"* ]]; then
+        printf '%s\tdetected\n' "$detected"
+        printed="${printed}${detected}|"
+    fi
 
     for direction in east west; do
         nearby="$(find_nearby_timezone "$detected" "$direction" || true)"
@@ -246,9 +318,6 @@ build_timezone_choices() {
         printed="${printed}${zone}|"
     done
 
-    if [[ -n "$current" && "$printed" != *"|$current|"* && -f "/usr/share/zoneinfo/$current" ]]; then
-        printf '%s\tcurrent\n' "$current"
-    fi
 }
 
 select_timezone_choice() {
@@ -402,6 +471,11 @@ fi
 current="$(timedatectl show --property=Timezone --value 2>/dev/null || true)"
 if [[ "$current" == "$timezone" ]]; then
     log "timezone already current: $timezone"
+    exit 0
+fi
+
+if trusted_network_active; then
+    log "skipping timezone prompt on trusted network: ${current:-unknown} -> $timezone"
     exit 0
 fi
 
