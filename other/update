@@ -252,6 +252,20 @@ refresh_waybar() {
     fi
 }
 
+# Recover from damaged or stale repository database signatures without changing
+# pacman's signature policy or rebuilding the trusted keyring.
+repair_pacman_sync_databases() {
+    warn "Detected a pacman repository database signature error. Refreshing cached databases..."
+
+    if ! run_with_spinner "Removing cached pacman sync databases..." \
+        sudo find /var/lib/pacman/sync -maxdepth 1 -type f \
+        \( -name '*.db' -o -name '*.db.sig' \) -delete; then
+        return 1
+    fi
+
+    run_with_spinner "Forcing pacman database resync..." sudo pacman -Syy
+}
+
 # ------------------------------------------------------------------
 # Main Logic
 # ------------------------------------------------------------------
@@ -287,7 +301,23 @@ main() {
             cat "$YAY_LOG" >>"$LOG_FILE"
         else
             cat "$YAY_LOG" >>"$LOG_FILE"
-            if grep -q "exists in filesystem" "$YAY_LOG"; then
+            if grep -Eqi 'GPGME error: No data|invalid or corrupted database.*(PGP signature|signature)|failed to synchronize all databases' "$YAY_LOG"; then
+                fail "Repository database signature check failed."
+                if repair_pacman_sync_databases; then
+                    info "Retrying system update after repository database refresh..."
+                    if yay -Syu --noconfirm 2>&1 | tee -a "$LOG_FILE"; then
+                        ok
+                    else
+                        fail "System update failed after refreshing repository databases."
+                        SYSTEM_ERRORS="${SYSTEM_ERRORS}yay -Syu failed after pacman database signature repair\n"
+                        ERRORS_OCCURRED=1
+                    fi
+                else
+                    fail "Could not refresh pacman repository databases."
+                    SYSTEM_ERRORS="${SYSTEM_ERRORS}pacman database signature repair failed\n"
+                    ERRORS_OCCURRED=1
+                fi
+            elif grep -q "exists in filesystem" "$YAY_LOG"; then
                 fail "System update failed due to file conflicts."
                 local packages=$(grep "exists in filesystem" "$YAY_LOG" | cut -d: -f1 | sort -u | xargs)
                 warn "Conflicting packages: $packages"
