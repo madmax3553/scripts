@@ -804,6 +804,12 @@ fg_muted = "$BG_ALT"
 border_focus = "$BLUE"
 GREET_EOF
 
+# Sync to system greetd theme if writable
+if [ -w "/etc/greetd/themes/groot.toml" ]; then
+    cp "$CONFIG_DIR/sysc-greet/themes/groot.toml" "/etc/greetd/themes/groot.toml"
+fi
+
+
 # === KITTY ===
 echo "Updating kitty..."
 cat > "$CONFIG_DIR/kitty/kitty.conf" << KITTY_EOF
