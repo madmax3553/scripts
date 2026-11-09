@@ -22,7 +22,13 @@ PERF_MODE="perf-mode"
 
 # Get current status to show in fuzzel
 GOV=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
-BOOST=$(cat /sys/devices/system/cpu/cpufreq/boost)
+if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+    BOOST=$(( 1 - $(cat /sys/devices/system/cpu/intel_pstate/no_turbo) ))
+elif [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+    BOOST=$(cat /sys/devices/system/cpu/cpufreq/boost)
+else
+    BOOST=0
+fi
 
 OPTIONS="󰓅 High Performance\n󰈐 Low Power (Cool & Quiet)\n󰘳 Show TUI Menu"
 

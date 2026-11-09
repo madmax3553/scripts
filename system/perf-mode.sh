@@ -22,7 +22,26 @@ source "/home/groot/projects/scripts/lib/colors.sh"
 # Configuration
 LOW_GOVERNOR="powersave"
 HIGH_GOVERNOR="performance"
-BOOST_PATH="/sys/devices/system/cpu/cpufreq/boost"
+
+# Normalize boost path across Intel (intel_pstate/no_turbo) and AMD (cpufreq/boost)
+read_boost() {
+    if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+        echo $(( 1 - $(cat /sys/devices/system/cpu/intel_pstate/no_turbo) ))
+    elif [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+        cat /sys/devices/system/cpu/cpufreq/boost
+    else
+        echo 0
+    fi
+}
+
+write_boost() {
+    local enable=$1
+    if [[ -f /sys/devices/system/cpu/intel_pstate/no_turbo ]]; then
+        echo $(( 1 - enable )) > /sys/devices/system/cpu/intel_pstate/no_turbo
+    elif [[ -f /sys/devices/system/cpu/cpufreq/boost ]]; then
+        echo "$enable" > /sys/devices/system/cpu/cpufreq/boost
+    fi
+}
 
 # Dark theme for dialog - precisely matching repostatus
 export DIALOGRC=""
@@ -67,12 +86,12 @@ trap cleanup EXIT
 
 get_status_text() {
     local gov=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
-    local boost=$(cat "$BOOST_PATH")
+    local boost=$(read_boost)
     local cur_freq=$(grep "cpu MHz" /proc/cpuinfo | head -n 1 | awk '{print $4}')
     local max_freq=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)
     
     printf "Governor:     %s\n" "$gov"
-    printf "AMD Boost:    %s\n" "$( [[ "$boost" == "1" ]] && echo "ENABLED" || echo "DISABLED" )"
+    printf "Turbo Boost:  %s\n" "$( [[ "$boost" == "1" ]] && echo "ENABLED" || echo "DISABLED" )"
     printf "Max Freq:     %s MHz\n" "$(expr $max_freq / 1000)"
     printf "Current:      ~%s MHz\n" "${cur_freq%.*}"
 }
@@ -101,13 +120,13 @@ set_mode() {
             systemctl stop auto-cpufreq tlp > /dev/null 2>&1 || true
             
             cpupower frequency-set -g "$LOW_GOVERNOR" > /dev/null
-            echo 0 > "$BOOST_PATH"
+            write_boost 0
             cpupower frequency-set -u 1400MHz > /dev/null
             ;;
         high)
             cpupower frequency-set -u 2100MHz > /dev/null
             cpupower frequency-set -g "$HIGH_GOVERNOR" > /dev/null
-            echo 1 > "$BOOST_PATH"
+            write_boost 1
 
             # Restart competing services to let them take over if needed
             systemctl start auto-cpufreq tlp > /dev/null 2>&1 || true

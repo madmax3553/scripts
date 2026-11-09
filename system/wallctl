@@ -43,6 +43,7 @@ TRASH_DIR="$CACHE_DIR/trash"
 THUMB_CACHE_DIR="$CACHE_DIR/thumbcache"
 THUMB_GEN_TIMEOUT_SEC=4
 LOCK_FILE="$STATE_DIR/screensaver.lock"
+ROTATION_LOCK_FILE="$STATE_DIR/rotation.lock"
 SCREENSAVER_LIST_FILE="$STATE_DIR/screensaver.list"
 SEEN_HASH_LOG="$STATE_DIR/seen_hashes.tsv"
 
@@ -521,6 +522,7 @@ ARCHIVE_AGE_DAYS=$ARCHIVE_AGE_DAYS
 ARCHIVE_BATCH=$ARCHIVE_BATCH
 SCREENSAVER_INTERVAL=$SCREENSAVER_INTERVAL
 SCREENSAVER_MODE="$SCREENSAVER_MODE"
+ROTATION_INTERVAL=$ROTATION_INTERVAL
 ROTATION_POOL="$ROTATION_POOL"
 SCREENSAVER_POOL="$SCREENSAVER_POOL"
 REVIEW_POOL="$REVIEW_POOL"
@@ -642,6 +644,7 @@ load_config() {
     source "$CONFIG_FILE"
     : "${WALLPAPER_DIR_OLD:=$WALLPAPER_DIR_BASE/old}"
     : "${ROTATION_POOL:=current}"
+    : "${ROTATION_INTERVAL:=1800}"
     : "${SCREENSAVER_POOL:=current+old}"
     : "${REVIEW_POOL:=new}"
     : "${WALLCTL_VIEWER:=}"
@@ -1231,8 +1234,10 @@ render_dashboard() {
     left+="$(printf "  ${BOLD}%-20s${RESET} %-6s  %s, %ss" \
            "screensaver" "$saver_state" "$SCREENSAVER_MODE" "$SCREENSAVER_INTERVAL")"
     left+=$'\n'
-    left+="$(printf "  ${BOLD}%-20s${RESET} %-6s  pool: %s" \
-           "rotation" "on" "$ROTATION_POOL")"
+    local rot_state
+    if rotation_is_running; then rot_state="on"; else rot_state="off"; fi
+    left+="$(printf "  ${BOLD}%-20s${RESET} %-6s  pool: %s, %ss" \
+           "rotation" "$rot_state" "$ROTATION_POOL" "$ROTATION_INTERVAL")"
 
     # Build right column (current wallpaper preview)
     local right="" current_wp=""
@@ -3669,6 +3674,37 @@ start_overlay_screensaver() {
     return 0
 }
 
+cmd_restore() {
+    load_config
+
+    # Ensure awww daemon is running first
+    if ! ensure_awww_ready; then
+        die "awww daemon failed to start or become operational"
+    fi
+
+    # Try to restore last wallpaper from awww cache
+    local last_wallpaper
+    if last_wallpaper=$(get_current_wallpaper 2>/dev/null) && [[ -f "$last_wallpaper" ]]; then
+        awww img "$last_wallpaper" --transition-type wipe --transition-duration 1 >/dev/null 2>&1
+        print_success "wallpaper restored: $(basename "$last_wallpaper")"
+        return 0
+    fi
+
+    # Fallback: pick a random wallpaper from the current pool
+    local pool_files=()
+    shopt -s nullglob
+    pool_files=("$WALLPAPER_DIR_CURRENT"/*)
+    shopt -u nullglob
+
+    if (( ${#pool_files[@]} == 0 )); then
+        die "no wallpapers in current pool and no cached wallpaper to restore"
+    fi
+
+    local random_wall="${pool_files[$RANDOM % ${#pool_files[@]}]}"
+    awww img "$random_wall" --transition-type wipe --transition-duration 1 >/dev/null 2>&1
+    print_success "wallpaper applied (random): $(basename "$random_wall")"
+}
+
 cmd_screensaver() {
     local action="${1:-}"
     log_screensaver_dispatch "$action"
@@ -3763,6 +3799,101 @@ cmd_screensaver() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# cmd_rotate  (background wallpaper rotation daemon)
+# ─────────────────────────────────────────────────────────────────────────────
+
+rotation_is_running() {
+    [[ -f "$ROTATION_LOCK_FILE" ]] || return 1
+    local pid
+    pid=$(cat "$ROTATION_LOCK_FILE" 2>/dev/null || true)
+    [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+    rm -f "$ROTATION_LOCK_FILE"
+    return 1
+}
+
+cmd_rotate() {
+    local action="${1:-start}"
+    load_config
+    NO_PAUSE=1
+    CLEAR_ON_EXIT=0
+    case "$action" in
+        start)
+            if rotation_is_running; then
+                log "rotate start ignored: already running"
+                print_info "rotation already running (pid=$(cat "$ROTATION_LOCK_FILE"))"
+                return 0
+            fi
+            # Write a small self-contained daemon script so we don't need to
+            # source the entire wallctl binary (which calls main "$@" at EOF).
+            local daemon_script="$STATE_DIR/rotation-daemon.sh"
+            mkdir -p "$STATE_DIR"
+            cat > "$daemon_script" <<DAEMON_EOF
+#!/usr/bin/env bash
+LOCK_FILE='$ROTATION_LOCK_FILE'
+SCREENSAVER_LOCK='$LOCK_FILE'
+INTERVAL='$ROTATION_INTERVAL'
+WALLCTL='$SCRIPT_NAME'
+printf '%s\n' "\$\$" > "\$LOCK_FILE"
+trap 'rm -f "\$LOCK_FILE"; exit 0' EXIT INT TERM
+while :; do
+    sleep "\$INTERVAL"
+    # Skip rotation while screensaver is active
+    if [[ -f "\$SCREENSAVER_LOCK" ]]; then
+        pid=\$(awk -F: '{print \$1}' "\$SCREENSAVER_LOCK" 2>/dev/null)
+        kill -0 "\$pid" 2>/dev/null && continue
+    fi
+    "\$WALLCTL" apply random >/dev/null 2>&1 || true
+done
+DAEMON_EOF
+            chmod +x "$daemon_script"
+            setsid --fork bash "$daemon_script" >/dev/null 2>&1
+            local i=0
+            while (( i < 20 )); do
+                rotation_is_running && break
+                sleep 0.1
+                (( i++ ))
+            done
+            if rotation_is_running; then
+                log "rotate start ok: interval=${ROTATION_INTERVAL}s pool=${ROTATION_POOL} pid=$(cat "$ROTATION_LOCK_FILE")"
+                print_success "rotation daemon started (every ${ROTATION_INTERVAL}s, pool=${ROTATION_POOL})"
+            else
+                log "rotate start failed: daemon did not write lock file"
+                print_warn "rotation daemon may not have started"
+            fi
+            ;;
+        stop)
+            if rotation_is_running; then
+                local pid
+                pid=$(cat "$ROTATION_LOCK_FILE" 2>/dev/null || true)
+                kill "$pid" 2>/dev/null || true
+                rm -f "$ROTATION_LOCK_FILE"
+                log "rotate stop ok: pid=${pid:-unknown}"
+                print_success "rotation daemon stopped"
+            else
+                print_info "rotation not running"
+            fi
+            ;;
+        toggle)
+            if rotation_is_running; then
+                cmd_rotate stop
+            else
+                cmd_rotate start
+            fi
+            ;;
+        status)
+            if rotation_is_running; then
+                print_info "rotation: on (interval=${ROTATION_INTERVAL}s pool=${ROTATION_POOL} pid=$(cat "$ROTATION_LOCK_FILE"))"
+            else
+                print_info "rotation: off (interval=${ROTATION_INTERVAL}s pool=${ROTATION_POOL})"
+            fi
+            ;;
+        *)
+            die "Usage: $SCRIPT_NAME rotate {start|stop|toggle|status}"
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # cmd_config (grouped)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -3794,6 +3925,7 @@ cmd_config() {
         printf "  12) screensaver delay    %ss\n" "$SCREENSAVER_INTERVAL"
         printf "  13) screensaver mode     %s\n" "$SCREENSAVER_MODE"
         printf "  14) image viewer         %s\n" "${WALLCTL_VIEWER:-auto}"
+        printf "  19) rotation interval    %ss\n" "$ROTATION_INTERVAL"
 
         print_section "Advanced"
         printf "  15) hash retention       %sd\n" "$HASH_RETENTION_DAYS"
@@ -3919,6 +4051,11 @@ cmd_config() {
                 printf "user agent: "
                 read -r value
                 [[ -n "$value" ]] && USER_AGENT="$value" || true
+                ;;
+            19)
+                printf "rotation interval seconds: "
+                read -r value
+                [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 60 )) && ROTATION_INTERVAL="$value" || print_warn "invalid seconds (min 60)"
                 ;;
             e|E)
                 ${EDITOR:-nano} "$CONFIG_FILE"
@@ -4078,6 +4215,8 @@ Commands:
   config                        Edit runtime configuration
   screensaver {start|stop|toggle|status}
                                 Control pseudo-screensaver loop
+  rotate {start|stop|toggle|status}
+                                Control background wallpaper rotation daemon
   help                          Show this help
 
 Review keys (grid):
@@ -4133,9 +4272,13 @@ main() {
         remove|rm|delete) cmd_remove "$@" ;;
         browse|thumbnails) cmd_browse "$@" ;;
         config) cmd_config "$@" ;;
+        restore) cmd_restore "$@" ;;
         screensaver) cmd_screensaver "$@" ;;
         screensaver-start) cmd_screensaver start ;;
         screensaver-stop) cmd_screensaver stop ;;
+        rotate) cmd_rotate "$@" ;;
+        rotate-start) cmd_rotate start ;;
+        rotate-stop) cmd_rotate stop ;;
         help|-h|--help) usage ;;
         *) die "Unknown command: $cmd" ;;
     esac
