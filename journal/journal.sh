@@ -12,7 +12,7 @@
 # Purpose: Consolidated journal management with daily planning, TODO review, and window control
 # Dependencies: nvim, jq, hyprctl (optional), ghostty/kitty/alacritty (optional)
 # Author: groot
-# Modified: 2026-01-24
+# Modified: 2026-07-08
 
 set -euo pipefail
 
@@ -27,10 +27,18 @@ DIARY_DIR="${JOURNAL_DIR}/diary"
 TODO_FILE="${JOURNAL_DIR}/TODO.md"
 DASHBOARD_FILE="${JOURNAL_DIR}/index.md"
 NOTES_DIR="${JOURNAL_DIR}/notes"
+WATCHLIST_FILE="${NOTES_DIR}/watchlist.md"
+WATCHLIST_SCRIPT="${WATCHLIST_SCRIPT:-${HOME}/.local/bin/update_watchlist.py}"
+READLIST_FILE="${NOTES_DIR}/readlist.md"
+READLIST_SCRIPT="${READLIST_SCRIPT:-${HOME}/projects/scripts/journal/update_readlist.py}"
+TABS_FILE="${NOTES_DIR}/tabs.md"
 TERMINAL="${TERMINAL:-ghostty}"
 TITLE_PREFIX="${TITLE_PREFIX:-Journal}"
 DASHBOARD_TITLE="${TITLE_PREFIX} Dashboard"
 TODO_TITLE="${TITLE_PREFIX} TODO"
+WATCHLIST_TITLE="${TITLE_PREFIX} Watchlist"
+READLIST_TITLE="${TITLE_PREFIX} Readlist"
+TABS_TITLE="${TITLE_PREFIX} Tabs"
 JOURNAL_FLOAT_CENTER="${JOURNAL_FLOAT_CENTER:-0}"
 LOG_FILE="${JOURNAL_LOG_FILE:-${XDG_STATE_HOME:-${HOME}/.local/state}/journal.log}"
 
@@ -222,15 +230,260 @@ carry_forward_tasks() {
 
     [[ ! -f "${yesterday_file}" ]] && return 0
 
-    # Grab unchecked tasks and append under the carry-over section
-    local tasks
-    tasks="$(grep '^- \[ \]' "${yesterday_file}" || true)"
-    [[ -z "${tasks}" ]] && return 0
+    local tasks_file new_tasks tmp
+    tasks_file="$(mktemp)"
+    new_tasks="$(mktemp)"
+    tmp="$(mktemp)"
 
-    # Insert after the carry-over heading if not already present
-    if ! grep -q "${tasks}" "${JOURNAL_FILE}"; then
-        sed -i "/^## Tasks Carried Over from Yesterday/a ${tasks}" "${JOURNAL_FILE}"
+    awk '
+        /^## Tasks for Tomorrow$/ { in_tasks = 1; next }
+        in_tasks && /^## / { in_tasks = 0 }
+        in_tasks && /^- \[ \]/ { print }
+    ' "${yesterday_file}" > "${tasks_file}" || true
+    if [[ ! -s "${tasks_file}" ]]; then
+        rm -f "${tasks_file}" "${new_tasks}" "${tmp}"
+        return 0
     fi
+
+    local task
+    while IFS= read -r task; do
+        [[ -n "${task}" ]] || continue
+        if ! grep -Fqx -- "${task}" "${JOURNAL_FILE}"; then
+            printf '%s\n' "${task}" >> "${new_tasks}"
+        fi
+    done < "${tasks_file}"
+
+    if [[ ! -s "${new_tasks}" ]]; then
+        rm -f "${tasks_file}" "${new_tasks}" "${tmp}"
+        return 0
+    fi
+
+    awk -v tasks_file="${new_tasks}" '
+        { print }
+
+        /^## Tasks Carried Over from Yesterday$/ {
+            while ((getline task < tasks_file) > 0) {
+                print task
+            }
+            close(tasks_file)
+            inserted = 1
+        }
+
+        END {
+            if (!inserted) {
+                print ""
+                print "## Tasks Carried Over from Yesterday"
+                while ((getline task < tasks_file) > 0) {
+                    print task
+                }
+                close(tasks_file)
+            }
+        }
+    ' "${JOURNAL_FILE}" > "${tmp}"
+
+    mv "${tmp}" "${JOURNAL_FILE}"
+    rm -f "${tasks_file}" "${new_tasks}"
+}
+
+collect_priority_todos() {
+    [[ -f "${TODO_FILE}" ]] || return 0
+
+    awk '
+        /^## / {
+            section = substr($0, 4)
+            next
+        }
+
+        section == "High Priority" { priority = "High" }
+        section == "Medium Priority" { priority = "Medium" }
+        section == "Low Priority" { priority = "Low" }
+        section != "High Priority" && section != "Medium Priority" && section != "Low Priority" { priority = "" }
+
+        priority != "" && /^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\]/ {
+            item = $0
+            sub(/^[[:space:]]*[-*][[:space:]]*\[[[:space:]]\][[:space:]]*/, "", item)
+            gsub(/\t/, " ", item)
+            print priority "\t" section "\t" NR "\t" item
+        }
+    ' "${TODO_FILE}"
+}
+
+todo_is_weekend_tagged() {
+    local item="${1,,}"
+
+    [[ "${item}" =~ (^|[[:space:]])#weekends?($|[[:space:][:punct:]]) ]] ||
+        [[ "${item}" =~ (^|[[:space:]])@weekends?($|[[:space:][:punct:]]) ]] ||
+        [[ "${item}" =~ \[weekends?\] ]] ||
+        [[ "${item}" =~ \(weekends?\) ]]
+}
+
+render_todo_rows() {
+    local rows_file="$1"
+    local mode="$2"
+    local limit="$3"
+    local count=0
+    local priority section line item
+
+    while IFS=$'\t' read -r priority section line item; do
+        [[ -n "${item}" ]] || continue
+
+        case "${mode}" in
+            high)
+                [[ "${priority}" == "High" ]] || continue
+                ;;
+            weekend)
+                todo_is_weekend_tagged "${item}" || continue
+                ;;
+        esac
+
+        printf -- '- [[../TODO|TODO.md]] `%s` %s\n' "${priority}" "${item}"
+        count=$((count + 1))
+        (( count >= limit )) && break
+    done < "${rows_file}"
+
+    if (( count == 0 )); then
+        case "${mode}" in
+            weekend)
+                echo "- No priority TODOs tagged yet. Add \`#weekend\` to pin one here."
+                ;;
+            *)
+                echo "- No matching priority TODOs."
+                ;;
+        esac
+    fi
+}
+
+render_longest_todo_rows() {
+    local rows_file="$1"
+    local limit="$2"
+    local scored
+    scored="$(mktemp)"
+
+    local priority section line item age sort_age age_label
+    while IFS=$'\t' read -r priority section line item; do
+        [[ -n "${item}" ]] || continue
+
+        age="$(todo_age_days "${item}" || true)"
+        if [[ "${age}" =~ ^[0-9]+$ ]]; then
+            sort_age="${age}"
+            age_label="${age}d"
+        else
+            sort_age=0
+            age_label="age unknown"
+        fi
+
+        printf '%08d\t%08d\t%s\t%s\t%s\n' "${sort_age}" "${line}" "${priority}" "${age_label}" "${item}" >> "${scored}"
+    done < "${rows_file}"
+
+    if [[ ! -s "${scored}" ]]; then
+        echo "- No priority TODOs."
+        rm -f "${scored}"
+        return 0
+    fi
+
+    sort -t $'\t' -k1,1nr -k2,2n "${scored}" | head -n "${limit}" | while IFS=$'\t' read -r sort_age line priority age_label item; do
+        printf -- '- [[../TODO|TODO.md]] `%s` %s *(%s)*\n' "${priority}" "${item}" "${age_label}"
+    done
+
+    rm -f "${scored}"
+}
+
+render_daily_todo_focus() {
+    echo "## TODO Focus"
+    echo ""
+    echo "*Auto-generated: $(date '+%Y-%m-%d %H:%M %Z'). Source: [[../TODO|TODO.md]]*"
+    echo ""
+
+    if [[ ! -f "${TODO_FILE}" ]]; then
+        echo "- TODO.md not found: ${TODO_FILE}"
+        echo ""
+        return 0
+    fi
+
+    local rows_file total
+    rows_file="$(mktemp)"
+    collect_priority_todos > "${rows_file}"
+    total="$(wc -l < "${rows_file}" | tr -d ' ')"
+
+    echo "- Open priority TODOs: ${total}"
+    echo "- Master list: [[../TODO|TODO.md]]"
+    echo ""
+    echo "### Most Important"
+    render_todo_rows "${rows_file}" high 3
+    echo ""
+    echo "### Weekend Tagged"
+    render_todo_rows "${rows_file}" weekend 3
+    echo ""
+    echo "### Longest Open"
+    render_longest_todo_rows "${rows_file}" 3
+    echo ""
+
+    rm -f "${rows_file}"
+}
+
+strip_daily_todo_focus() {
+    awk '
+        /^## TODO Focus$/ { skip=1; next }
+        /^## / && skip { skip=0 }
+        !skip { print }
+    ' "$1"
+}
+
+insert_daily_todo_focus() {
+    local source_file="$1"
+    local block_file="$2"
+
+    awk -v block_file="${block_file}" '
+        BEGIN {
+            while ((getline line < block_file) > 0) {
+                block = block line ORS
+            }
+            close(block_file)
+        }
+
+        in_carryover && /^[[:space:]]*$/ {
+            next
+        }
+
+        in_carryover && /^## / {
+            print ""
+            printf "%s", block
+            inserted = 1
+            in_carryover = 0
+        }
+
+        { print }
+
+        /^## Tasks Carried Over from Yesterday$/ {
+            in_carryover = 1
+        }
+
+        END {
+            if (!inserted) {
+                print ""
+                printf "%s", block
+            }
+        }
+    ' "${source_file}"
+}
+
+update_daily_todo_focus() {
+    [[ -f "${JOURNAL_FILE}" ]] || return 0
+
+    local stripped block tmp
+    stripped="$(mktemp)"
+    block="$(mktemp)"
+    tmp="$(mktemp)"
+
+    render_daily_todo_focus > "${block}"
+    strip_daily_todo_focus "${JOURNAL_FILE}" > "${stripped}"
+    insert_daily_todo_focus "${stripped}" "${block}" > "${tmp}"
+
+    trim_trailing_blank_lines "${tmp}"
+    mv "${tmp}" "${JOURNAL_FILE}"
+    rm -f "${stripped}" "${block}"
+
+    journal_log "updated daily todo focus: ${JOURNAL_FILE}"
 }
 
 git_repo_label() {
@@ -302,20 +555,83 @@ update_daily_git_commits() {
     journal_log "updated daily git commits: ${JOURNAL_FILE}"
 }
 
+strip_daily_git_commits() {
+    awk '
+        /^## Git Commits Today$/ { skip=1; next }
+        /^## / && skip { skip=0 }
+        !skip { print }
+    ' "$1"
+}
+
+trim_trailing_blank_lines() {
+    local file="$1"
+
+    while [[ -s "${file}" && -z "$(tail -n 1 "${file}")" ]]; do
+        sed -i '$d' "${file}"
+    done
+}
+
+journal_has_template() {
+    [[ -f "${JOURNAL_FILE}" ]] || return 1
+
+    if [[ "${IS_WEEKEND}" -eq 1 ]]; then
+        grep -Eq '^## This Weekend Intentions$' "${JOURNAL_FILE}" &&
+            grep -Eq '^## Next Week Prep$' "${JOURNAL_FILE}"
+    else
+        grep -Eq '^## Morning$' "${JOURNAL_FILE}" &&
+            grep -Eq '^## Tasks for Tomorrow$' "${JOURNAL_FILE}"
+    fi
+}
+
+create_today_template() {
+    journal_log "creating template: weekend=${IS_WEEKEND} file=${JOURNAL_FILE}"
+    if [[ "${IS_WEEKEND}" -eq 1 ]]; then
+        create_template_weekend
+    else
+        create_template_weekday
+    fi
+    carry_forward_tasks
+}
+
+recover_untemplated_journal() {
+    local recovered
+    recovered="$(mktemp)"
+
+    strip_daily_git_commits "${JOURNAL_FILE}" > "${recovered}"
+    trim_trailing_blank_lines "${recovered}"
+
+    create_today_template
+
+    if grep -q '[^[:space:]]' "${recovered}"; then
+        {
+            echo ""
+            echo "## Recovered Notes"
+            echo ""
+            cat "${recovered}"
+        } >> "${JOURNAL_FILE}"
+    fi
+
+    rm -f "${recovered}"
+    journal_log "recovered untemplated journal: ${JOURNAL_FILE}"
+}
+
 ensure_today() {
     if [[ ! -f "${JOURNAL_FILE}" ]]; then
-        journal_log "creating template: weekend=${IS_WEEKEND} file=${JOURNAL_FILE}"
-        if [[ "${IS_WEEKEND}" -eq 1 ]]; then
-            create_template_weekend
-        else
-            create_template_weekday
-        fi
-        carry_forward_tasks
+        create_today_template
         log_success "Created today's journal entry"
+        journal_log "updating watchlist streaming info..."
+        timeout 60 "${WATCHLIST_SCRIPT}" \
+            --watchlist "${WATCHLIST_FILE}" \
+            --archive-watched \
+            --append-diary "${JOURNAL_FILE}" || journal_log "watchlist update failed"
+    elif ! journal_has_template; then
+        recover_untemplated_journal
+        log_success "Restored today's journal template"
     else
         journal_log "journal exists: ${JOURNAL_FILE}"
     fi
 
+    update_daily_todo_focus
     update_daily_git_commits
 }
 
@@ -609,6 +925,168 @@ cmd_surface_todo() {
     if ! focus_window_by_title "${TODO_TITLE}"; then
         launch_markdown_file "${TODO_TITLE}" "${TODO_FILE}"
     fi
+}
+
+# Frozen browser tabs (iced) — the DB is owned by launcher/iced.sh and lives
+# in notes/ so it rides along with journal git backups.  iced.sh delegates
+# its "edit" pathway to surface-tabs so every entry point shares one window.
+cmd_tabs() {
+    if [[ ! -f "${TABS_FILE}" ]]; then
+        log_error "Tabs file not found: ${TABS_FILE} (freeze a tab with iced.sh first)"
+        exit 1
+    fi
+    launch_markdown_file "${TABS_TITLE}" "${TABS_FILE}"
+}
+
+cmd_surface_tabs() {
+    if ! focus_window_by_title "${TABS_TITLE}"; then
+        cmd_tabs
+    fi
+}
+
+cmd_watchlist() {
+    local subcmd="${1:-open}"
+    shift || true
+
+    case "${subcmd}" in
+        open)
+            if [[ -f "${WATCHLIST_FILE}" ]]; then
+                launch_markdown_file "${WATCHLIST_TITLE}" "${WATCHLIST_FILE}"
+            else
+                log_error "Watchlist file not found: ${WATCHLIST_FILE}"
+                exit 1
+            fi
+            ;;
+        update)
+            log_info "Updating watchlist availability and archive..."
+            "${WATCHLIST_SCRIPT}" \
+                --watchlist "${WATCHLIST_FILE}" \
+                --archive-watched \
+                "$@"
+            ;;
+        archive)
+            log_info "Archiving checked watchlist items..."
+            "${WATCHLIST_SCRIPT}" \
+                --watchlist "${WATCHLIST_FILE}" \
+                --no-streaming \
+                --archive-watched \
+                "$@"
+            ;;
+        suggest)
+            if [[ "${1:-}" =~ ^[0-9]+$ ]]; then
+                local count="$1"
+                shift
+                set -- --suggest-count "${count}" "$@"
+            fi
+
+            log_info "Requesting watchlist suggestions from agy..."
+            "${WATCHLIST_SCRIPT}" \
+                --watchlist "${WATCHLIST_FILE}" \
+                --no-streaming \
+                --suggest \
+                "$@"
+            ;;
+        import)
+            local export_file="${1:-}"
+            if [[ -z "${export_file}" ]]; then
+                log_error "Usage: journal.sh watchlist import <justwatch-export.json>"
+                exit 1
+            fi
+            shift
+            log_info "Importing JustWatch watchlist export..."
+            "${WATCHLIST_SCRIPT}" \
+                --watchlist "${WATCHLIST_FILE}" \
+                --no-streaming \
+                --import-justwatch "${export_file}" \
+                "$@"
+            ;;
+        help|--help|-h)
+            cat << EOF
+${HEADER}Watchlist Commands${RESET}
+
+${BOLD}Usage:${RESET}
+    journal.sh watchlist [open|update|archive|suggest|import]
+
+${BOLD}Commands:${RESET}
+    ${CYAN}open${RESET}             - Open notes/watchlist.md
+    ${CYAN}update${RESET}           - Refresh JustWatch statuses and archive watched items
+    ${CYAN}archive${RESET}          - Archive checked items without refreshing streaming data
+    ${CYAN}suggest [count]${RESET}  - Ask agy for suggestions and add them to the inbox
+    ${CYAN}import <file>${RESET}    - Add new titles from a JustWatch watchlist JSON export
+
+EOF
+            ;;
+        *)
+            log_error "Unknown watchlist command: ${subcmd}"
+            cmd_watchlist help
+            exit 1
+            ;;
+    esac
+}
+
+cmd_readlist() {
+    local subcmd="${1:-open}"
+    shift || true
+
+    case "${subcmd}" in
+        open)
+            if [[ -f "${READLIST_FILE}" ]]; then
+                launch_markdown_file "${READLIST_TITLE}" "${READLIST_FILE}"
+            else
+                log_error "Readlist file not found: ${READLIST_FILE}"
+                exit 1
+            fi
+            ;;
+        import)
+            log_info "Importing Audible library into readlist..."
+            "${READLIST_SCRIPT}" \
+                --readlist "${READLIST_FILE}" \
+                --archive-finished \
+                "$@"
+            ;;
+        sync)
+            log_info "Syncing Audible library against readlist..."
+            "${READLIST_SCRIPT}" \
+                --readlist "${READLIST_FILE}" \
+                --sync \
+                "$@"
+            ;;
+        archive)
+            log_info "Archiving checked readlist items..."
+            "${READLIST_SCRIPT}" \
+                --readlist "${READLIST_FILE}" \
+                --no-import \
+                --archive-finished \
+                "$@"
+            ;;
+        help|--help|-h)
+            cat << EOF
+${HEADER}Readlist Commands${RESET}
+
+${BOLD}Usage:${RESET}
+    journal.sh readlist [open|import|sync|archive]
+
+${BOLD}Commands:${RESET}
+    ${CYAN}open${RESET}             - Open notes/readlist.md
+    ${CYAN}import${RESET}           - Import titles from Audible HTML and archive checked items
+    ${CYAN}sync${RESET}             - Import, compare owned set (delta), and fill missing metadata
+    ${CYAN}archive${RESET}          - Archive checked read items without importing
+
+${BOLD}Examples:${RESET}
+    journal.sh readlist import --audible-html ~/Downloads/Audible\ Library.html
+    journal.sh readlist import --fetch-audible-browser --audible-domain www.audible.ca
+    journal.sh readlist sync --fetch-audible-browser --audible-domain www.audible.ca
+    journal.sh readlist import --fetch-audible-api --audible-cookie-file ~/Downloads/audible-cookies.txt --audible-cookie-file ~/Downloads/amazon-cookies.txt
+    journal.sh readlist archive
+
+EOF
+            ;;
+        *)
+            log_error "Unknown readlist command: ${subcmd}"
+            cmd_readlist help
+            exit 1
+            ;;
+    esac
 }
 
 # ===== Weekly Summary Command =====
@@ -1230,6 +1708,7 @@ update_dashboard() {
         echo "- [[diary/${TODAY}|Today]]"
         echo "- [[diary/index|All Entries]]"
         echo "- [[TODO|Main TODO List]]"
+        echo "- [[notes/tabs|Frozen Tabs (iced)]]"
         
     } > "$dashboard_file"
     
@@ -1293,6 +1772,10 @@ ${BOLD}Commands:${RESET}
     ${CYAN}surface-dashboard${RESET}      - Focus existing dashboard or open if not found
     ${CYAN}todo${RESET}                   - Open master TODO list
     ${CYAN}surface-todo${RESET}           - Focus existing TODO list or open if not found
+    ${CYAN}tabs${RESET}                   - Open frozen browser tabs (iced) list
+    ${CYAN}surface-tabs${RESET}           - Focus existing tabs list or open if not found
+    ${CYAN}watchlist${RESET}              - Open/update/archive/suggest watchlist items
+    ${CYAN}readlist${RESET}               - Open/import/archive readlist items
     ${CYAN}plan${RESET}                   - Generate today's daily plan
     ${CYAN}commits${RESET}                - Update today's diary with git commits
     ${CYAN}review${RESET}                 - Review outstanding TODOs
@@ -1308,6 +1791,11 @@ ${BOLD}Examples:${RESET}
     journal.sh surface       # Focus existing or open
     journal.sh surface-dashboard  # Focus dashboard or open
     journal.sh surface-todo  # Focus TODO list or open
+    journal.sh surface-tabs  # Focus frozen tabs (iced) list or open
+    journal.sh watchlist update  # Refresh streaming statuses and archive watched items
+    journal.sh watchlist suggest 5  # Ask agy for 5 reviewable suggestions
+    journal.sh readlist import --audible-html ~/Downloads/Audible\ Library.html
+    journal.sh readlist import --fetch-audible-browser --audible-domain www.audible.ca
     journal.sh plan          # Generate daily plan
     journal.sh commits       # Update today's git commit summary
     journal.sh review        # Show outstanding TODOs
@@ -1350,6 +1838,20 @@ main() {
             ;;
         surface-todo)
             cmd_surface_todo
+            ;;
+        tabs)
+            cmd_tabs
+            ;;
+        surface-tabs)
+            cmd_surface_tabs
+            ;;
+        watchlist)
+            shift
+            cmd_watchlist "$@"
+            ;;
+        readlist)
+            shift
+            cmd_readlist "$@"
             ;;
         plan)
             cmd_plan

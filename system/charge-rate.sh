@@ -87,18 +87,22 @@ sample(){
     [[ $name == BAT* ]] && continue
     local type=$(cat "$dev/type" 2>/dev/null || echo "?")
     local online=$(cat "$dev/online" 2>/dev/null || echo "")
-    local v=$(cat "$dev/voltage_now" 2>/dev/null || echo 0)
-    local c=$(cat "$dev/current_now" 2>/dev/null || echo 0)
-    local p=$(cat "$dev/power_now" 2>/dev/null || echo 0)
-    local Vsrc=$(awk -v vv=$v 'BEGIN{printf "%.2f", vv/1000000}')
-    local Asrc=$(awk -v cc=$c 'BEGIN{printf "%.3f", cc/1000000}')
-    local Wsrc
-    if [[ $p -gt 0 ]]; then
-      Wsrc=$(awk -v pp=$p 'BEGIN{printf "%.2f", pp/1000000}')
+    if [[ -f "$dev/voltage_now" || -f "$dev/current_now" || -f "$dev/power_now" ]]; then
+      local v=$(cat "$dev/voltage_now" 2>/dev/null || echo 0)
+      local c=$(cat "$dev/current_now" 2>/dev/null || echo 0)
+      local p=$(cat "$dev/power_now" 2>/dev/null || echo 0)
+      local Vsrc=$(awk -v vv=$v 'BEGIN{printf "%.2f", vv/1000000}')
+      local Asrc=$(awk -v cc=$c 'BEGIN{printf "%.3f", cc/1000000}')
+      local Wsrc
+      if [[ $p -gt 0 ]]; then
+        Wsrc=$(awk -v pp=$p 'BEGIN{printf "%.2f", pp/1000000}')
+      else
+        Wsrc=$(awk -v vv=$v -v cc=$c 'BEGIN{printf "%.2f", (vv*cc)/1e12}')
+      fi
+      sources[$name]="$type online=$online V=$Vsrc A=$Asrc W=$Wsrc"
     else
-      Wsrc=$(awk -v vv=$v -v cc=$c 'BEGIN{printf "%.2f", (vv*cc)/1e12}')
+      sources[$name]="$type online=$online"
     fi
-    sources[$name]="$type online=$online V=$Vsrc A=$Asrc W=$Wsrc"
   done
 
   if (( json )); then
@@ -125,7 +129,7 @@ sample(){
 samples_done=0
 while :; do
   sample
-  (( samples_done++ ))
+  samples_done=$(( samples_done + 1 ))
   if [[ $count -ne 0 && $samples_done -ge $count ]]; then
     break
   fi

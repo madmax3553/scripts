@@ -40,6 +40,7 @@ ERRORS_OCCURRED=0
 NPM_ERRORS=""
 PIP_ERRORS=""
 SYSTEM_ERRORS=""
+XMAKE_ERRORS=""
 NPM_REINSTALL_REQUIRED=0
 
 # Status helpers
@@ -59,10 +60,10 @@ header() {
     printf '\n%b%s%b\n' "${BOLD}${BLUE}" "$1" "${RESET}"
     printf '%s\n' "─────────────"
 }
-info()   { printf '%b==>%b %s ' "${BOLD}${BLUE}" "${RESET}" "$1"; }
-ok()     { printf '%b✓%b\n' "${BOLD}${GREEN}" "${RESET}"; }
-fail()   { printf '%b✗%b %s\n' "${BOLD}${RED}" "${RESET}" "$1"; }
-warn()   { printf '%b⚠%b %s\n' "${BOLD}${YELLOW}" "${RESET}" "$1"; }
+info() { printf '%b==>%b %s ' "${BOLD}${BLUE}" "${RESET}" "$1"; }
+ok() { printf '%b✓%b\n' "${BOLD}${GREEN}" "${RESET}"; }
+fail() { printf '%b✗%b %s\n' "${BOLD}${RED}" "${RESET}" "$1"; }
+warn() { printf '%b⚠%b %s\n' "${BOLD}${YELLOW}" "${RESET}" "$1"; }
 
 # Braille Spinner Helper
 run_with_spinner() {
@@ -71,14 +72,14 @@ run_with_spinner() {
     local pid
 
     # Run command in background, redirect output to log
-    ("$@") >> "$LOG_FILE" 2>&1 &
+    ("$@") >>"$LOG_FILE" 2>&1 &
     pid=$!
 
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     printf "%b==>%b %s " "${BOLD}${BLUE}" "${RESET}" "$msg"
 
     while kill -0 "$pid" 2>/dev/null; do
-        for (( i=0; i<${#frames}; i++ )); do
+        for ((i = 0; i < ${#frames}; i++)); do
             printf "%b%s%b" "${BOLD}${CYAN}" "${frames:$i:1}" "${RESET}"
             sleep 0.1
             printf "\b"
@@ -140,9 +141,9 @@ update_mirrors() {
 
     if find /etc/pacman.d/mirrorlist -mtime +7 | grep -q .; then
         run_with_spinner "Mirrorlist is old. Updating mirrors..." \
-            sudo reflector --country 'United States' --latest 20 --age 12 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
+            sudo reflector --country 'United States, Canada' --latest 20 --age 12 --protocol https --sort rate --save /etc/pacman.d/mirrorlist
     else
-        info "Mirrorlist is recent, skipping. Use 'update --mirrors' to force.\n"
+        info "Mirrorlist is recent, skipping. Use 'update --mirrors' to force."
     fi
 }
 
@@ -153,13 +154,14 @@ update_npm() {
     local packages
     info "Checking for outdated global packages... "
     local tmp_outdated=$(mktemp)
-    (npm outdated -g --json | jq -r 'keys[]' 2>/dev/null | grep -vE "^(npm|corepack)$" > "$tmp_outdated" || true) &
+    (npm outdated -g --json | jq -r 'keys[]' 2>/dev/null | grep -vE "^(npm|corepack)$" >"$tmp_outdated" || true) &
     local pid=$!
 
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     while kill -0 "$pid" 2>/dev/null; do
-        for (( i=0; i<${#frames}; i++ )); do
-            printf "%b%s%b\b" "${BOLD}${CYAN}" "${frames:$i:1}" "${RESET}"; sleep 0.1
+        for ((i = 0; i < ${#frames}; i++)); do
+            printf "%b%s%b\b" "${BOLD}${CYAN}" "${frames:$i:1}" "${RESET}"
+            sleep 0.1
         done
     done
     wait "$pid"
@@ -174,7 +176,7 @@ update_npm() {
 
     for pkg in $packages; do
         if pacman -Qo "/usr/lib/node_modules/$pkg" >/dev/null 2>&1; then
-            echo "Skipping pacman-managed npm package: $pkg" >> "$LOG_FILE"
+            echo "Skipping pacman-managed npm package: $pkg" >>"$LOG_FILE"
             continue
         fi
 
@@ -192,23 +194,28 @@ update_python() {
     local packages
     info "Checking for outdated user pip packages... "
     local tmp_pip=$(mktemp)
-    (python -m pip list --outdated --user --format=json | jq -r '.[].name' > "$tmp_pip" 2>/dev/null) &
+    (python -m pip list --outdated --user --format=json | jq -r '.[].name' >"$tmp_pip" 2>/dev/null) &
     local pid=$!
     local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
     while kill -0 "$pid" 2>/dev/null; do
-        for (( i=0; i<${#frames}; i++ )); do
-            printf "%b%s%b\b" "${BOLD}${CYAN}" "${frames:$i:1}" "${RESET}"; sleep 0.1
+        for ((i = 0; i < ${#frames}; i++)); do
+            printf "%b%s%b\b" "${BOLD}${CYAN}" "${frames:$i:1}" "${RESET}"
+            sleep 0.1
         done
     done
     wait "$pid"
     packages=$(cat "$tmp_pip")
     rm "$tmp_pip"
 
-    if [[ -z "$packages" ]]; then ok; printf "All user pip packages are up-to-date.\n"; return 0; fi
+    if [[ -z "$packages" ]]; then
+        ok
+        printf "All user pip packages are up-to-date.\n"
+        return 0
+    fi
     ok
 
     for pkg in $packages; do
-        run_with_spinner "Updating $pkg..." python -m pip install -U --user "$pkg" || \
+        run_with_spinner "Updating $pkg..." python -m pip install -U --user "$pkg" ||
             PIP_ERRORS="${PIP_ERRORS}Failed to update user pip package: $pkg\n"
     done
 }
@@ -217,6 +224,16 @@ update_rust() {
     header "Phase: Rust (rustup)"
     if command -v rustup >/dev/null 2>&1; then
         run_with_spinner "Updating rust toolchain..." rustup update
+    fi
+}
+
+update_xmake() {
+    header "Phase: Xmake Package Repositories"
+    if command -v xmake >/dev/null 2>&1; then
+        run_with_spinner "Updating xmake package repositories..." xmake repo -u || {
+            XMAKE_ERRORS="${XMAKE_ERRORS}xmake repo -u failed\n"
+            ERRORS_OCCURRED=1
+        }
     fi
 }
 
@@ -235,19 +252,36 @@ refresh_waybar() {
     fi
 }
 
+# Recover from damaged or stale repository database signatures without changing
+# pacman's signature policy or rebuilding the trusted keyring.
+repair_pacman_sync_databases() {
+    warn "Detected a pacman repository database signature error. Refreshing cached databases..."
+
+    if ! run_with_spinner "Removing cached pacman sync databases..." \
+        sudo find /var/lib/pacman/sync -maxdepth 1 -type f \
+        \( -name '*.db' -o -name '*.db.sig' \) -delete; then
+        return 1
+    fi
+
+    run_with_spinner "Forcing pacman database resync..." sudo pacman -Syy
+}
+
 # ------------------------------------------------------------------
 # Main Logic
 # ------------------------------------------------------------------
 
 main() {
-    echo -en "\n**** UPDATE START **** \n\n $(date)\n\n" >> "$LOG_FILE"
+    echo -en "\n**** UPDATE START **** \n\n $(date)\n\n" >>"$LOG_FILE"
     clear
     print_logo
     header "Groot System Update"
     printf "Distro: %s\n" "$DISTRO"
     printf "Log:    %s\n" "$LOG_FILE"
 
-    if ! acquire_lock; then fail "Update already running"; exit 1; fi
+    if ! acquire_lock; then
+        fail "Update already running"
+        exit 1
+    fi
     trap release_lock EXIT
 
     if [[ "${1:-}" == "--mirrors" ]]; then
@@ -264,14 +298,30 @@ main() {
         # Capture output to check for file conflicts while still showing it to the user
         if yay -Syu --noconfirm 2>&1 | tee "$YAY_LOG"; then
             ok
-            cat "$YAY_LOG" >> "$LOG_FILE"
+            cat "$YAY_LOG" >>"$LOG_FILE"
         else
-            cat "$YAY_LOG" >> "$LOG_FILE"
-            if grep -q "exists in filesystem" "$YAY_LOG"; then
+            cat "$YAY_LOG" >>"$LOG_FILE"
+            if grep -Eqi 'GPGME error: No data|invalid or corrupted database.*(PGP signature|signature)|failed to synchronize all databases' "$YAY_LOG"; then
+                fail "Repository database signature check failed."
+                if repair_pacman_sync_databases; then
+                    info "Retrying system update after repository database refresh..."
+                    if yay -Syu --noconfirm 2>&1 | tee -a "$LOG_FILE"; then
+                        ok
+                    else
+                        fail "System update failed after refreshing repository databases."
+                        SYSTEM_ERRORS="${SYSTEM_ERRORS}yay -Syu failed after pacman database signature repair\n"
+                        ERRORS_OCCURRED=1
+                    fi
+                else
+                    fail "Could not refresh pacman repository databases."
+                    SYSTEM_ERRORS="${SYSTEM_ERRORS}pacman database signature repair failed\n"
+                    ERRORS_OCCURRED=1
+                fi
+            elif grep -q "exists in filesystem" "$YAY_LOG"; then
                 fail "System update failed due to file conflicts."
                 local packages=$(grep "exists in filesystem" "$YAY_LOG" | cut -d: -f1 | sort -u | xargs)
                 warn "Conflicting packages: $packages"
-                
+
                 printf "${YELLOW}Would you like to retry with --overwrite '*'? [y/N] ${RESET}"
                 read -r response
                 if [[ "$response" =~ ^[Yy]$ ]]; then
@@ -298,6 +348,7 @@ main() {
 
     update_python
     update_rust
+    update_xmake
     update_flatpak
 
     header "Phase: Cleanup & Maintenance"
@@ -306,6 +357,7 @@ main() {
         run_with_spinner "Cleaning stale download directories..." sudo rm -rf /var/cache/pacman/pkg/download-* || true
         run_with_spinner "Cleaning pacman cache (keep latest 3)..." sudo paccache -r || true
         run_with_spinner "Cleaning yay cache..." yay -Sc --noconfirm || true
+        run_with_spinner "Purging trash older than 30 days (max 5GB)" autotrash -d 30 --trash_limit=5000 || true
     fi
 
     refresh_waybar
@@ -317,6 +369,7 @@ main() {
         printf '\n%b✗ Updates completed with issues:%b\n' "${BOLD}${RED}" "${RESET}"
         [[ -n "$NPM_ERRORS" ]] && printf '%bNPM:%b\n%b' "${BOLD}${YELLOW}" "${RESET}" "$NPM_ERRORS"
         [[ -n "$PIP_ERRORS" ]] && printf '%bPython/Pip:%b\n%b' "${BOLD}${YELLOW}" "${RESET}" "$PIP_ERRORS"
+        [[ -n "$XMAKE_ERRORS" ]] && printf '%bXmake:%b\n%b' "${BOLD}${YELLOW}" "${RESET}" "$XMAKE_ERRORS"
         [[ -n "$SYSTEM_ERRORS" ]] && printf '%bSystem:%b\n%b' "${BOLD}${YELLOW}" "${RESET}" "$SYSTEM_ERRORS"
         printf '\nCheck log: %s\n\n' "$LOG_FILE"
         [[ $ERRORS_OCCURRED -eq 1 ]] && exit 1

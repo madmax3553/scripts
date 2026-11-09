@@ -20,6 +20,7 @@ entries=(
     "  Files"
     "  Terminal"
     "  Browser"
+    "󰚩  Ask Antigravity"
     "  Messages"
     "  Clipboard"
     "  Screenshot"
@@ -56,6 +57,9 @@ case "$chosen" in
     *Browser)
         qutebrowser &
         ;;
+    *Ask\ Antigravity)
+        "$HOME/.local/bin/ask-antigravity.sh" &
+        ;;
     *Messages)
         ferdium &
         ;;
@@ -75,7 +79,7 @@ case "$chosen" in
         ~/.local/bin/journal.sh surface &
         ;;
     *Dashboard)
-        ~/.local/bin/tmux-dashboard-control surface &
+        ~/.local/bin/hypr/dashboard.sh surface &
         ;;
     *Colorscheme)
         "$HOME/.local/bin/system/colorscheme-menu.sh" &

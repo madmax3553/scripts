@@ -12,7 +12,7 @@
 # Purpose: Toggle CPU performance profiles for Ryzen 3500U
 # Dependencies: cpupower, bash, dialog
 # Author: groot
-# Modified: 2026-04-16
+# Modified: 2026-07-25
 
 set -e
 
@@ -116,9 +116,9 @@ set_mode() {
 
     case "$mode" in
         low)
-            # Temporarily stop competing services
-            systemctl stop auto-cpufreq tlp > /dev/null 2>&1 || true
-            
+            # Stop TLP so it does not re-apply AC/BAT policy over this override
+            systemctl stop tlp > /dev/null 2>&1 || true
+
             cpupower frequency-set -g "$LOW_GOVERNOR" > /dev/null
             write_boost 0
             cpupower frequency-set -u 1400MHz > /dev/null
@@ -128,8 +128,9 @@ set_mode() {
             cpupower frequency-set -g "$HIGH_GOVERNOR" > /dev/null
             write_boost 1
 
-            # Restart competing services to let them take over if needed
-            systemctl start auto-cpufreq tlp > /dev/null 2>&1 || true
+            # Hand policy back to TLP
+            systemctl start tlp > /dev/null 2>&1 || true
+            tlp start > /dev/null 2>&1 || true
             ;;
     esac
 }

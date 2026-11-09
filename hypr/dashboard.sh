@@ -8,28 +8,38 @@
 #  ░   ░   ░▒ ░ ▒░  ░ ▒ ▒░   ░ ▒ ▒░     ░
 #░ ░   ░   ░░   ░ ░ ░ ░ ▒  ░ ░ ░ ▒    ░
 #      ░    ░         ░ ░      ░ ░
-# Script: tmux-dashboard-control.sh
-# Purpose: Launch, surface, reload, or menu the tmux dashboard
-# Dependencies: tmux, ghostty, hyprctl, jq, fuzzel/rofi
+# Script: dashboard.sh
+# Purpose: Launch, surface, reload, or menu the desktop dashboard
+# Dependencies: dash-home-c, ghostty, hyprctl, jq, fuzzel or rofi
 # Author: groot
-# Modified: 2026-03-14
+# Modified: 2026-05-15
 
 set -euo pipefail
 
 source "/home/groot/projects/scripts/lib/common.sh"
 
-TITLE="Dashboard"
-SESSION_NAME="${TMUX_DASHBOARD_SESSION:-dashboard}"
-DASHBOARD_CMD="/home/groot/.local/bin/tmux-dashboard"
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+DASHBOARD_TITLE="${DASHBOARD_TITLE:-Dashboard}"
+DASHBOARD_CMD="${DASHBOARD_CMD:-/home/groot/projects/dash-home-c/dash-home-c}"
+DASHBOARD_TERMINAL="${DASHBOARD_TERMINAL:-ghostty}"
+DASHBOARD_WIDTH="${DASHBOARD_WIDTH:-180}"
+DASHBOARD_HEIGHT="${DASHBOARD_HEIGHT:-52}"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Window Control
+# ─────────────────────────────────────────────────────────────────────────────
 
 find_dashboard_window() {
     command -v hyprctl >/dev/null 2>&1 || return 1
     command -v jq >/dev/null 2>&1 || return 1
 
-    hyprctl -j clients | jq -r --arg title "$TITLE" '
+    hyprctl -j clients 2>/dev/null | jq -r --arg title "$DASHBOARD_TITLE" '
         map(select((.title // "") == $title or (.initialTitle // "") == $title)) |
         max_by(.focusHistoryID // 0) | .address // empty
-    '
+    ' 2>/dev/null
 }
 
 focus_dashboard_window() {
@@ -60,13 +70,21 @@ wait_for_window_close() {
 }
 
 launch_dashboard_window() {
-    setsid ghostty --title="$TITLE" --window-width=180 --window-height=52 -e "$DASHBOARD_CMD" >/dev/null 2>&1 &
+    require_command "$DASHBOARD_TERMINAL"
+    [[ -x "$DASHBOARD_CMD" ]] || die "Dashboard command is not executable: $DASHBOARD_CMD"
+
+    setsid "$DASHBOARD_TERMINAL" \
+        --title="$DASHBOARD_TITLE" \
+        --window-width="$DASHBOARD_WIDTH" \
+        --window-height="$DASHBOARD_HEIGHT" \
+        -e "$DASHBOARD_CMD" >/dev/null 2>&1 &
 }
 
 load_dashboard() {
-    if [[ -n "$(find_dashboard_window)" ]]; then
-        return 0
-    fi
+    local address=""
+    address="$(find_dashboard_window || true)"
+    [[ -n "$address" ]] && return 0
+
     launch_dashboard_window
 }
 
@@ -77,7 +95,8 @@ surface_dashboard() {
         focus_dashboard_window "$address"
         return 0
     fi
-    load_dashboard
+
+    launch_dashboard_window
 }
 
 reload_dashboard() {
@@ -85,7 +104,6 @@ reload_dashboard() {
     address="$(find_dashboard_window || true)"
     close_dashboard_window "$address"
     wait_for_window_close "$address" || true
-    tmux kill-session -t "$SESSION_NAME" >/dev/null 2>&1 || true
     launch_dashboard_window
 }
 
@@ -93,9 +111,15 @@ show_menu() {
     local choice=""
 
     if command -v fuzzel >/dev/null 2>&1; then
-        choice="$(printf '%s\n' 'Surface dashboard' 'Reload dashboard' 'Load dashboard' | fuzzel --dmenu --prompt 'Dashboard ' --lines 6 || true)"
+        choice="$(
+            printf '%s\n' 'Surface dashboard' 'Reload dashboard' 'Load dashboard' |
+                fuzzel --dmenu --prompt 'Dashboard ' --lines 6 || true
+        )"
     elif command -v rofi >/dev/null 2>&1; then
-        choice="$(printf '%s\n' 'Surface dashboard' 'Reload dashboard' 'Load dashboard' | rofi -dmenu -p 'Dashboard' || true)"
+        choice="$(
+            printf '%s\n' 'Surface dashboard' 'Reload dashboard' 'Load dashboard' |
+                rofi -dmenu -p 'Dashboard' || true
+        )"
     else
         die "Need fuzzel or rofi for dashboard menu"
     fi
@@ -107,6 +131,10 @@ show_menu() {
         *) return 0 ;;
     esac
 }
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
 
 case "${1:-surface}" in
     load)
