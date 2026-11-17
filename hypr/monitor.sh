@@ -100,7 +100,7 @@ list_external_hyprland() {
     local monitor
 
     while IFS= read -r monitor; do
-        if [[ -n "$monitor" && "$monitor" != "$MOBILE_MONITOR" ]]; then
+        if [[ -n "$monitor" && "$monitor" != "$MOBILE_MONITOR" && "$monitor" != "FALLBACK" && "$monitor" != HEADLESS-* ]]; then
             printf '%s\n' "$monitor"
         fi
     done <<< "$CONNECTED"
